@@ -3,3 +3,4 @@ pandas
 numpy
 pytz
 websocket-client
+setuptools
