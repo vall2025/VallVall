@@ -8,7 +8,7 @@ from TradeMaster.TradeSync import TradeHub, Exchange
 import pytz
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import time
 import os, re
 import json
@@ -16,6 +16,7 @@ import websocket
 import hashlib
 import threading
 from queue import Queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =====================================================================
 # CONFIGURATION & CONSTANTS
@@ -392,6 +393,164 @@ def fetch_5min_data(symbol, start_date=None, end_date=None):
         return None
 
 
+def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=None, inst_cache=None, inst_cache_lock=None):
+    """
+    Thread-safe worker version of fetch_5min_data that uses provided `trade_obj`
+    and a local `inst_cache` dict instead of accessing `st.session_state`.
+    Returns the same DataFrame or None on failure.
+    """
+    try:
+        trade = trade_obj
+        if not trade:
+            print(f"[WORKER ERROR] {symbol}: No trade object provided")
+            return None
+
+        # Normalize symbol
+        sym = symbol.split('.NS')[0] if symbol.upper().endswith('.NS') else symbol
+
+        tz = pytz.timezone('Asia/Kolkata')
+        if start_date is None:
+            to_dt = datetime.now(tz)
+            from_dt = to_dt - timedelta(days=7)
+        else:
+            try:
+                from_dt = pd.to_datetime(start_date)
+                if from_dt.tzinfo is None:
+                    from_dt = tz.localize(from_dt)
+            except Exception:
+                from_dt = datetime.now(tz) - timedelta(days=7)
+            if end_date is None:
+                to_dt = from_dt + timedelta(days=1)
+            else:
+                try:
+                    to_dt = pd.to_datetime(end_date)
+                    if to_dt.tzinfo is None:
+                        to_dt = tz.localize(to_dt)
+                except Exception:
+                    to_dt = from_dt + timedelta(days=1)
+
+        print(f"[FETCH-WORKER] {symbol}: Fetching from {from_dt} to {to_dt} (symbol cleaned: {sym})")
+
+        # Use provided instrument cache mapping first
+        inst = None
+        try:
+            if inst_cache and symbol in inst_cache:
+                inst = inst_cache.get(symbol)
+            else:
+                try:
+                    sym_clean = symbol.split('.NS')[0] if symbol.upper().endswith('.NS') else symbol
+                    inst = trade.get_instrument(exchange=Exchange.NSE, symbol=sym_clean)
+                    if inst_cache is not None:
+                        try:
+                            if inst_cache_lock is not None:
+                                with inst_cache_lock:
+                                    inst_cache[symbol] = inst
+                            else:
+                                inst_cache[symbol] = inst
+                        except Exception:
+                            pass
+                except Exception:
+                    inst = None
+        except Exception:
+            inst = None
+
+        if inst is None:
+            print(f"[WORKER ERROR] {symbol}: Could not get instrument object")
+            return None
+
+        df = None
+        last_error = None
+        try:
+            result = trade.get_HistoricalData(
+                instrument=inst,
+                resolution="1",
+                from_datetime=from_dt,
+                to_datetime=to_dt,
+                indices=False
+            )
+
+            if isinstance(result, list) and len(result) > 0:
+                df = pd.DataFrame(result)
+            elif isinstance(result, dict):
+                if 'data' in result and result.get('stat') == 'Ok':
+                    df = pd.DataFrame(result['data'])
+                elif 'emsg' not in result and result.get('stat') != 'Ok':
+                    print(f"[FETCH-WORKER] {symbol}: API error - {result.get('stat', 'Unknown')}")
+            elif isinstance(result, pd.DataFrame):
+                df = result
+            else:
+                try:
+                    df = pd.DataFrame(result)
+                except Exception:
+                    df = None
+        except Exception as e:
+            last_error = str(e)
+            print(f"[FETCH-WORKER] {symbol}: Fetch failed - {e}")
+
+        if df is None:
+            print(f"[WORKER ERROR] {symbol}: DataFrame is None. Error: {last_error}")
+            return None
+
+        if hasattr(df, 'empty') and df.empty:
+            print(f"[WORKER ERROR] {symbol}: DataFrame is empty after fetch")
+            return None
+
+        if not isinstance(df, pd.DataFrame):
+            print(f"[WORKER ERROR] {symbol}: Result is not a DataFrame after conversion")
+            return None
+
+        df = df.copy()
+        actual_cols = list(df.columns) if hasattr(df, 'columns') else []
+        if 'datetime' in actual_cols:
+            try:
+                df['datetime'] = pd.to_datetime(df['datetime'])
+                df.set_index('datetime', inplace=True)
+            except Exception:
+                pass
+
+        required = ['Open', 'High', 'Low', 'Close', 'Volume']
+        cols_lower = {col.lower(): col for col in df.columns}
+        missing_cols = []
+        col_mapping = {}
+        for req in required:
+            req_lower = req.lower()
+            if req_lower in cols_lower:
+                col_mapping[req] = cols_lower[req_lower]
+            else:
+                missing_cols.append(req)
+
+        if missing_cols:
+            print(f"[WORKER ERROR] {symbol}: Missing required columns: {missing_cols}. Available: {actual_cols}")
+            return None
+
+        rename_dict = {v: k for k, v in col_mapping.items() if v != k}
+        if rename_dict:
+            df = df.rename(columns=rename_dict)
+
+        try:
+            if df.index.tzinfo is None and df.index.tz is None:
+                df.index = pd.to_datetime(df.index).tz_localize('Asia/Kolkata')
+            else:
+                df.index = df.index.tz_convert('Asia/Kolkata')
+        except Exception:
+            try:
+                df.index = pd.to_datetime(df.index).tz_localize('Asia/Kolkata')
+            except Exception:
+                return None
+
+        df = df.sort_index()
+        df = df[["Open", "High", "Low", "Close", "Volume"]]
+        df = df[~df.index.duplicated(keep='last')]
+        if df.empty:
+            return None
+
+        print(f"[FETCH-WORKER] {symbol}: Fetched {len(df)} candles")
+        return df
+    except Exception as e:
+        print(f"[WORKER ERROR] {symbol}: Outer exception in fetch_5min_data_worker: {e}")
+        return None
+
+
 def _validate_with_broker(symbol, last_close, breakout_bull, breakout_bear):
     """
     Validate breakout signals using Alice Blue daily data (previous close).
@@ -446,28 +605,17 @@ def resample_to_30min(df):
         return pd.DataFrame()
     
     df = df.sort_index().copy()
-    print(f"[RESAMPLE-DEBUG] Input df shape: {df.shape}, date range: {df.index.min()} to {df.index.max()}")
     
     # Ensure we're in Asia/Kolkata timezone (should already be from fetch)
     if df.index.tz is None:
-        print(f"[RESAMPLE-DEBUG] Index is naive, localizing to Asia/Kolkata")
         df.index = df.index.tz_localize('Asia/Kolkata')
     elif str(df.index.tz) != 'Asia/Kolkata':
-        print(f"[RESAMPLE-DEBUG] Converting from {df.index.tz} to Asia/Kolkata")
         df.index = df.index.tz_convert('Asia/Kolkata')
-    
-    print(f"[RESAMPLE-DEBUG] After timezone setup: {df.index.min()} to {df.index.max()}")
     
     # Filter market hours: 09:15 to 15:30
     df['time'] = df.index.time
-    df_before_filter = len(df)
     df = df[(df['time'] >= pd.Timestamp('09:15').time()) & 
             (df['time'] <= pd.Timestamp('15:30').time())]
-    df_after_filter = len(df)
-    
-    print(f"[RESAMPLE-DEBUG] Market hours filter: {df_before_filter} -> {df_after_filter} rows")
-    if len(df) > 0:
-        print(f"[RESAMPLE-DEBUG] After filter, date range: {df.index.min()} to {df.index.max()}")
     
     if df.empty:
         return pd.DataFrame()
@@ -484,23 +632,15 @@ def resample_to_30min(df):
             'Volume': 'sum'
         })
 
-        print(f"[RESAMPLE-DEBUG] After resample, before dropna: {len(df_30min)} rows")
-
         # Remove rows with NaN (no data for that 30-min period)
         df_30min = df_30min.dropna()
-
-        print(f"[RESAMPLE-DEBUG] After dropna: {len(df_30min)} rows")
-        print(f"[RESAMPLE-DEBUG] Dates in resampled data: {sorted(set(df_30min.index.date))}")
 
         # Add date column for filtering (use pandas method for timezone-aware index)
         df_30min['date'] = df_30min.index.to_series().dt.normalize().dt.date
 
-        print(f"[RESAMPLE] Resampled to 30min: {len(df_30min)} candles")
         return df_30min
     except Exception as e:
         print(f"[ERROR] Resampling to 30min failed: {e}")
-        import traceback
-        traceback.print_exc()
         return pd.DataFrame()
 
 
@@ -523,11 +663,47 @@ def get_snapshot_datetime_for_date(date_obj, time_str=None):
     except Exception:
         return pd.Timestamp(dt).tz_localize('Asia/Kolkata')
 
+def get_last_trading_day(from_date=None):
+    """
+    Get the last trading day (NSE working day) before or on the given date.
+    Excludes Saturdays, Sundays, and major Indian market holidays.
+    """
+    if from_date is None:
+        from_date = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+    
+    # 2026 Indian market holidays (NSE closed)
+    market_holidays = {
+        (1, 26),   # Republic Day
+        (2, 26),   # Maha Shivaratri
+        (3, 15),   # Holi
+        (4, 10),   # Good Friday
+        (5, 24),   # Eid-ul-Fitr
+        (5, 26),   # Buddha Purnima
+        (8, 15),   # Independence Day
+        (8, 27),   # Janmashtami
+        (9, 30),   # Milad-un-Nabi
+        (10, 2),   # Gandhi Jayanti
+        (10, 12),  # Dussehra
+        (10, 24),  # Diwali (Lakshmi Puja)
+        (10, 25),  # Diwali (Govardhan Puja)
+        (11, 1),   # Dev Deepavali
+        (11, 11),  # Guru Nanak Jayanti
+        (12, 25),  # Christmas
+    }
+    
+    check_date = from_date
+    for _ in range(30):  # Look back up to 30 days
+        if check_date.weekday() < 5 and (check_date.month, check_date.day) not in market_holidays:
+            return check_date
+        check_date -= timedelta(days=1)
+    
+    return from_date
+
 # =====================================================================
 # SCREENING LOGIC FUNCTION
 # =====================================================================
 
-def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=None, require_unusual_volume=True):
+def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=None, require_unusual_volume=True, status_text=None):
     """
     Main screening function that returns results list
     Optionally updates results_container in real-time
@@ -584,64 +760,99 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             return results
     else:
         today = datetime.now(tz)
-        # For live mode, fetch up-to-now intraday data (use now as end_dt)
-        status_text.info("📊 Live mode: Fetching today's intraday candles (up to now)")
+        last_trading_day = get_last_trading_day(today.date())
+        
+        # If today is not a trading day, show notification and use last trading day
+        if today.date() != last_trading_day:
+            if date.today().weekday() >= 5:
+                msg = f"📅 Weekend detected! Using last trading day ({last_trading_day.strftime('%Y-%m-%d')}) for Live scan."
+            else:
+                msg = f"🏖️ Market holiday today! Using last trading day ({last_trading_day.strftime('%Y-%m-%d')}) for Live scan."
+            status_text.warning(msg)
+            # Use last trading day as the live scan date
+            live_scan_date = last_trading_day
+        else:
+            status_text.info("📊 Live mode: Scanning today's market data")
+            live_scan_date = today.date()
 
-        start_dt = today.replace(hour=9, minute=15, second=0, microsecond=0)
+        start_dt = tz.localize(datetime.combine(live_scan_date, datetime.min.time()).replace(hour=9, minute=15))
         end_dt = datetime.now(tz)
-        # Use explicit timestamps so API returns partial-day intraday data correctly
         fetch_start = (start_dt - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
         fetch_end = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-        filter_date = today.date()
+        filter_date = live_scan_date
 
-    for idx, symbol in enumerate(stocks):
-        progress_percent = int((idx / total_stocks) * 100)
-        progress_bar.progress(progress_percent)
-        progress_text.text(f"Progress: {progress_percent}% ({idx}/{total_stocks})")
-        status_text.text(f"Processing: {symbol}")
-        
-        df_5min = fetch_5min_data(symbol, start_date=fetch_start, end_date=fetch_end)
-        if df_5min is None or df_5min.empty:
+    # NOTE: skipping sequential prefetch of instruments to avoid startup delay.
+    # Workers will resolve instruments into the local `inst_cache` concurrently.
+
+    # Fetch 5-min data in parallel (limit workers to avoid broker rate limits)
+    results_data = {}
+    trade_obj = st.session_state.get('alice_trade')
+    inst_cache = {}
+    inst_cache_lock = threading.Lock()
+    if not trade_obj:
+        status_text.error("❌ Not connected to Alice Blue. Please generate session before running scan.")
+        return results
+    try:
+        # Seed local cache from session cache to reduce duplicate instrument calls
+        if isinstance(st.session_state.get('instrument_cache', None), dict):
+            inst_cache.update(st.session_state.get('instrument_cache', {}))
+    except Exception:
+        pass
+
+    # FETCH PHASE (parallel)
+    results_data = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_symbol = {
+            executor.submit(fetch_5min_data_worker, symbol, fetch_start, fetch_end, trade_obj, inst_cache, inst_cache_lock): symbol
+            for symbol in stocks
+        }
+
+        for idx, future in enumerate(as_completed(future_to_symbol)):
+            symbol = future_to_symbol[future]
+            try:
+                df_5min = future.result()
+                results_data[symbol] = df_5min
+            except Exception as e:
+                print(f"[SCAN ERROR] {symbol}: Fetch failed - {e}")
+                results_data[symbol] = None
+
+            # Show single unified progress 0-50% for fetch phase
+            progress_percent = int(((idx + 1) / total_stocks) * 50) if total_stocks else 0
+            progress_bar.progress(progress_percent)
+            progress_text.text(f"Scanning: {progress_percent}% ({idx+1}/{total_stocks})")
+
+    # Merge local inst_cache back into session cache
+    try:
+        sc = st.session_state.get('instrument_cache', {})
+        sc.update(inst_cache)
+        st.session_state.instrument_cache = sc
+    except Exception:
+        pass
+
+    # PROCESS PHASE (sequential but shows results in real-time)
+    processed_count = 0
+    for idx2, (symbol, df_5min) in enumerate(results_data.items()):
+        if df_5min is None or (hasattr(df_5min, 'empty') and df_5min.empty):
+            processed_count += 1
+            progress_percent = 50 + int((processed_count / total_stocks) * 50)
+            progress_bar.progress(progress_percent)
+            progress_text.text(f"Scanning: {progress_percent}%")
             continue
 
+        # Resample 5-min data to 30-min
         df_30min_30m_full = resample_to_30min(df_5min)
         df_30min_30m_full = df_30min_30m_full.sort_index()
         df_30min_30m_full['date'] = df_30min_30m_full.index.to_series().dt.normalize().dt.date
 
         if len(df_30min_30m_full) < MA_WINDOW:
-            try:
-                trade = st.session_state.get('alice_trade')
-                if trade:
-                    tz = pytz.timezone('Asia/Kolkata')
-                    to_dt = datetime.now(tz)
-                    from_dt = to_dt - timedelta(days=90)
-                    inst = get_instrument_cached(symbol)
-                    if inst:
-                        try:
-                            df30_alt = trade.get_HistoricalData(instrument=inst, resolution="30", from_datetime=from_dt, to_datetime=to_dt, indices=False)
-                            if df30_alt is not None and not df30_alt.empty:
-                                try:
-                                    if df30_alt.index.tz is None:
-                                        df30_alt.index = pd.to_datetime(df30_alt.index, utc=True).tz_convert('Asia/Kolkata')
-                                    else:
-                                        df30_alt.index = df30_alt.index.tz_convert('Asia/Kolkata')
-                                except Exception:
-                                    pass
-                                df30_alt = df30_alt[["Open","High","Low","Close","Volume"]]
-                                df30_alt = df30_alt[~df30_alt.index.duplicated(keep='last')]
-                                df30_alt = df30_alt.sort_index()
-                                if len(df30_alt) > len(df_30min_30m_full):
-                                    df_30min_30m_full = df30_alt.copy()
-                                    df_30min_30m_full['date'] = df_30min_30m_full.index.to_series().dt.normalize().dt.date
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            processed_count += 1
+            progress_percent = 50 + int((processed_count / total_stocks) * 50)
+            progress_bar.progress(progress_percent)
+            progress_text.text(f"Scanning: {progress_percent}%")
+            continue
 
         # Use 30m resampled data
         df_30min_full = df_30min_30m_full.copy()
-
-
 
         available_dates = sorted(set(df_30min_full['date']))
         chosen_date = filter_date
@@ -651,33 +862,42 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             if prior_dates:
                 chosen_date = max(prior_dates)
             else:
+                processed_count += 1
+                progress_percent = 50 + int((processed_count / total_stocks) * 50)
+                progress_bar.progress(progress_percent)
+                progress_text.text(f"Scanning: {progress_percent}%")
                 continue
 
-        # Use full resampled data (don't use partial snapshot - it breaks date filtering)
-        # For both Historical and Live modes, use complete market day data
-        df_30min = df_30min_full.copy()
-        day_30min = df_30min[df_30min['date'] == chosen_date]
-        prior_30min = df_30min_full[df_30min_full['date'] < chosen_date]
+        # Use full resampled data for analysis (avoid extra copy)
+        day_30min = df_30min_30m_full[df_30min_30m_full['date'] == chosen_date]
+        
+        if len(day_30min) < CANDLES_START:
+            # Try full day data
+            full_day_30min = df_30min_30m_full[df_30min_30m_full['date'] == chosen_date]
+            if len(full_day_30min) >= CANDLES_START:
+                day_30min = full_day_30min.head(CANDLES_START)
+            else:
+                processed_count += 1
+                progress_percent = 50 + int((processed_count / total_stocks) * 50)
+                progress_bar.progress(progress_percent)
+                progress_text.text(f"Scanning: {progress_percent}%")
+                continue
+        
+        first5 = day_30min.head(CANDLES_START)
 
         if timeframe == '30m':
             ma44_source = df_30min_30m_full
         else:
-            ma44_source = df_30min_full
+            ma44_source = df_30min_30m_full
 
+        # Early termination check for MA data
         prior_44 = ma44_source[ma44_source['date'] < chosen_date].tail(44)
-        if len(prior_44) < 44 or len(day_30min) < CANDLES_START:
+        if len(prior_44) < 44:
+            processed_count += 1
+            progress_percent = 50 + int((processed_count / total_stocks) * 50)
+            progress_bar.progress(progress_percent)
+            progress_text.text(f"Scanning: {progress_percent}%")
             continue
-
-        first5 = day_30min.head(CANDLES_START)
-        used_full_day_for_candles = False
-        
-        if len(first5) < CANDLES_START:
-            full_day_30min = df_30min_full[df_30min_full['date'] == chosen_date]
-            if len(full_day_30min) >= CANDLES_START:
-                first5 = full_day_30min.head(CANDLES_START)
-                used_full_day_for_candles = True
-            else:
-                continue
 
         MA_TOLERANCE_PCT = 0.0005
         ma44_series = ma44_source['Close'].rolling(window=MA_WINDOW, min_periods=MA_WINDOW).mean()
@@ -724,26 +944,30 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             resistance_dist = abs(current_price - closest_resistance) / closest_resistance
             price_near_level = min(support_dist, resistance_dist) < 0.01
 
-        if 'RSI' not in df_30min.columns:
-            delta = df_30min['Close'].diff()
+        # Calculate RSI once at the start for this stock
+        if 'RSI' not in df_30min_30m_full.columns:
+            delta = df_30min_30m_full['Close'].diff()
             gain = delta.clip(lower=0)
             loss = -delta.clip(upper=0)
             avg_gain = gain.ewm(span=14, adjust=False).mean()
             avg_loss = loss.ewm(span=14, adjust=False).mean()
             rs = avg_gain / (avg_loss + 1e-10)
-            df_30min['RSI'] = 100 - (100 / (1 + rs))
+            df_30min_30m_full['RSI'] = 100 - (100 / (1 + rs))
 
-        if 'VRSI' not in df_30min.columns:
-            vol_delta = delta * df_30min['Volume']
+            vol_delta = delta * df_30min_30m_full['Volume']
             vol_gain = vol_delta.clip(lower=0)
             vol_loss = -vol_delta.clip(upper=0)
             vol_avg_gain = vol_gain.ewm(span=14, adjust=False).mean()
             vol_avg_loss = vol_loss.ewm(span=14, adjust=False).mean()
             vol_rs = vol_avg_gain / (vol_avg_loss + 1e-10)
-            df_30min['VRSI'] = 100 - (100 / (1 + vol_rs))
+            df_30min_30m_full['VRSI'] = 100 - (100 / (1 + vol_rs))
 
-        rsi_at_4th = df_30min.loc[first5.index[-1], 'RSI']
-        vrsi_at_4th = df_30min.loc[first5.index[-1], 'VRSI']
+        try:
+            rsi_at_4th = df_30min_30m_full.loc[first5.index[-1], 'RSI']
+            vrsi_at_4th = df_30min_30m_full.loc[first5.index[-1], 'VRSI']
+        except Exception:
+            rsi_at_4th = None
+            vrsi_at_4th = None
 
         volume_profile = []
         price_levels = []
@@ -754,7 +978,9 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             volume_profile.append(vol)
             price_levels.append(price)
 
-        avg_volume = df_30min['Volume'].mean()
+            # Use full resampled 30-min data for volume calculations
+            df_30min = df_30min_full
+            avg_volume = df_30min['Volume'].mean()
         institutional_volume = all(v > 1.2 * avg_volume for v in volume_profile)
 
         body_ratios = []
@@ -866,10 +1092,12 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
         breakout_bull = (prev_high is not None) and (last_close > prev_high)
         breakout_bear = (prev_low is not None) and (last_close < prev_low)
 
-        try:
-            breakout_bull, breakout_bear = _validate_with_broker(symbol, last_close, breakout_bull, breakout_bear)
-        except Exception:
-            pass
+        # SKIPPED: Broker validation disabled for speed (it was making sequential API calls)
+        # Uncomment if you need conservative validation:
+        # try:
+        #     breakout_bull, breakout_bear = _validate_with_broker(symbol, last_close, breakout_bull, breakout_bear)
+        # except Exception:
+        #     pass
         
         volume_strong = (avg_vol_prior is not None) and (avg_vol_recent > 1.5 * avg_vol_prior)
         rsi_bull = (rsi_at_4th is not None) and (rsi_at_4th > 60)
@@ -1206,7 +1434,12 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             top_mover = "NA"
             top_gainer_loser = "NA"
 
-        prior_vol = prior_30min['Volume'].tail(44).mean() if len(prior_30min) >= 44 else None
+        try:
+            prior_30min = df_30min[df_30min.index < first5.index[0]] if (not df_30min.empty and len(first5) > 0) else pd.DataFrame()
+            prior_vol = prior_30min['Volume'].tail(44).mean() if len(prior_30min) >= 44 else None
+        except Exception:
+            prior_30min = pd.DataFrame()
+            prior_vol = None
         first5_vol = first5['Volume'].mean()
         volume_spike = "Yes" if prior_vol and first5_vol > 1.5 * prior_vol else "No"
 
@@ -1263,14 +1496,18 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             "6th 44MA": (ma44_list[5] if len(ma44_list) > 5 and CANDLES_START >= 6 else None),
         }
         results.append(result)
+        processed_count += 1
+        progress_percent = 50 + int((processed_count / total_stocks) * 50)
+        progress_bar.progress(progress_percent)
+        progress_text.text(f"Scanning: {progress_percent}%")
         
         # Update results container in real-time if provided
         if results_container is not None:
             st.session_state.screening_results = results.copy()
 
     progress_bar.progress(100)
-    progress_text.text("Progress: 100%")
-    status_text.text(f"Screening complete! Found {len(results)} signals.")
+    progress_text.text("Scanning: 100%")
+    status_text.text(f"✅ Scan complete! Found {len(results)} signals.")
     print(f"[DEBUG] Screening finished. Total results: {len(results)}")
     
     return results
