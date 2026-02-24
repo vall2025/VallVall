@@ -633,7 +633,9 @@ def resample_to_30min(df):
         })
 
         # Remove rows with NaN (no data for that 30-min period)
-        df_30min = df_30min.dropna()
+        # Keep partially formed candles that have a Close (avoid dropping valid partials)
+        # (Replaced dropna with explicit Close notna filter to preserve other fields)
+        df_30min = df_30min[df_30min['Close'].notna()]
 
         # Add date column for filtering (use pandas method for timezone-aware index)
         df_30min['date'] = df_30min.index.to_series().dt.normalize().dt.date
@@ -844,14 +846,15 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
         df_30min_30m_full = df_30min_30m_full.sort_index()
         df_30min_30m_full['date'] = df_30min_30m_full.index.to_series().dt.normalize().dt.date
 
-        if len(df_30min_30m_full) < MA_WINDOW:
+        # Relax early-session full-data length rejection: allow processing with >=30 resampled candles
+        if len(df_30min_30m_full) < 30:
             processed_count += 1
             progress_percent = 50 + int((processed_count / total_stocks) * 50)
             progress_bar.progress(progress_percent)
             progress_text.text(f"Scanning: {progress_percent}%")
             continue
 
-        # Use 30m resampled data
+        # Use 30m resampled data (full set prior to snapshot trimming)
         df_30min_full = df_30min_30m_full.copy()
 
         available_dates = sorted(set(df_30min_full['date']))
@@ -868,20 +871,30 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
                 progress_text.text(f"Scanning: {progress_percent}%")
                 continue
 
-        # Use full resampled data for analysis (avoid extra copy)
+        # Apply strict snapshot locking: only use data up to the snapshot datetime
+        # Determine snapshot_time from selected candle_count / SCAN_TIME
+        snapshot_time = SCAN_TIME if SCAN_TIME else ("11:45" if candle_count == "5C" else ("11:15" if candle_count=="4C" else "12:15"))
+        snapshot_dt = get_snapshot_datetime_for_date(chosen_date, snapshot_time)
+
+        # In Live mode, prevent using future (not-yet-completed) candles
+        if mode == "Live":
+            current_time = datetime.now(pytz.timezone('Asia/Kolkata'))
+            if snapshot_dt > current_time:
+                snapshot_dt = current_time
+
+        # Trim the full 30-min dataset strictly to the snapshot datetime BEFORE any selection/analysis
+        df_30min_30m_full = df_30min_30m_full[df_30min_30m_full.index <= snapshot_dt]
+
+        # Now select the day's 30-min candles (only those up to snapshot_dt)
         day_30min = df_30min_30m_full[df_30min_30m_full['date'] == chosen_date]
         
         if len(day_30min) < CANDLES_START:
-            # Try full day data
-            full_day_30min = df_30min_30m_full[df_30min_30m_full['date'] == chosen_date]
-            if len(full_day_30min) >= CANDLES_START:
-                day_30min = full_day_30min.head(CANDLES_START)
-            else:
-                processed_count += 1
-                progress_percent = 50 + int((processed_count / total_stocks) * 50)
-                progress_bar.progress(progress_percent)
-                progress_text.text(f"Scanning: {progress_percent}%")
-                continue
+            # If we don't have enough candles up to the snapshot, we cannot evaluate this symbol for the chosen candle_count
+            processed_count += 1
+            progress_percent = 50 + int((processed_count / total_stocks) * 50)
+            progress_bar.progress(progress_percent)
+            progress_text.text(f"Scanning: {progress_percent}%")
+            continue
         
         first5 = day_30min.head(CANDLES_START)
 
@@ -890,9 +903,9 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
         else:
             ma44_source = df_30min_30m_full
 
-        # Early termination check for MA data
+        # Early termination check for MA data (relaxed to 30 periods to allow early-session signals)
         prior_44 = ma44_source[ma44_source['date'] < chosen_date].tail(44)
-        if len(prior_44) < 44:
+        if len(prior_44) < 30:
             processed_count += 1
             progress_percent = 50 + int((processed_count / total_stocks) * 50)
             progress_bar.progress(progress_percent)
