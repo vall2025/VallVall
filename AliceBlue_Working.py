@@ -18,6 +18,23 @@ import threading
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Timezone safety: ensure Render/UTC servers use IST derived from UTC
+def get_ist_now():
+    """
+    Always return current IST time derived from UTC.
+    Safe for UTC servers like Render.
+    """
+    return datetime.utcnow().replace(tzinfo=pytz.utc).astimezone(
+        pytz.timezone("Asia/Kolkata")
+    )
+
+# Ensure TZ is set for process-wide operations (only set if not already set)
+try:
+    if not os.environ.get("TZ"):
+        os.environ["TZ"] = "Asia/Kolkata"
+except Exception:
+    pass
+
 # =====================================================================
 # CONFIGURATION & CONSTANTS
 # =====================================================================
@@ -119,7 +136,7 @@ def fetch_live_data_websocket(symbols, duration_minutes=2):
                         inst = trade.get_instrument(exchange=Exchange.NSE, symbol=sym_clean)
                         if inst and str(inst.token) == token:
                             tick = {
-                                'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),
+                                'timestamp': get_ist_now(),
                                 'ltp': float(feed_message.get('lp', 0) or 0),
                                 'volume': float(feed_message.get('v', 0) or 0),
                                 'open': float(feed_message.get('o', 0) or 0),
@@ -248,7 +265,7 @@ def fetch_5min_data(symbol, start_date=None, end_date=None):
         # Build datetime range
         tz = pytz.timezone('Asia/Kolkata')
         if start_date is None:
-            to_dt = datetime.now(tz)
+            to_dt = get_ist_now()
             from_dt = to_dt - timedelta(days=7)
         else:
             try:
@@ -257,7 +274,7 @@ def fetch_5min_data(symbol, start_date=None, end_date=None):
                     from_dt = tz.localize(from_dt)
             except Exception as e:
                 print(f"[ERROR] {symbol}: Failed to parse start_date {start_date}: {e}")
-                from_dt = datetime.now(tz) - timedelta(days=7)
+                from_dt = get_ist_now() - timedelta(days=7)
             if end_date is None:
                 to_dt = from_dt + timedelta(days=1)
             else:
@@ -410,7 +427,7 @@ def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=Non
 
         tz = pytz.timezone('Asia/Kolkata')
         if start_date is None:
-            to_dt = datetime.now(tz)
+            to_dt = get_ist_now()
             from_dt = to_dt - timedelta(days=7)
         else:
             try:
@@ -418,7 +435,7 @@ def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=Non
                 if from_dt.tzinfo is None:
                     from_dt = tz.localize(from_dt)
             except Exception:
-                from_dt = datetime.now(tz) - timedelta(days=7)
+                from_dt = get_ist_now() - timedelta(days=7)
             if end_date is None:
                 to_dt = from_dt + timedelta(days=1)
             else:
@@ -568,7 +585,7 @@ def _validate_with_broker(symbol, last_close, breakout_bull, breakout_bear):
             return breakout_bull, breakout_bear
 
         tz = pytz.timezone('Asia/Kolkata')
-        today = datetime.now(tz).date()
+        today = get_ist_now().date()
         prev_day = today - timedelta(days=1)
         from_dt = datetime.combine(prev_day, datetime.min.time())
         to_dt = datetime.combine(prev_day, datetime.max.time())
@@ -671,7 +688,7 @@ def get_last_trading_day(from_date=None):
     Excludes Saturdays, Sundays, and major Indian market holidays.
     """
     if from_date is None:
-        from_date = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+        from_date = get_ist_now().date()
     
     # 2026 Indian market holidays (NSE closed)
     market_holidays = {
@@ -736,7 +753,7 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
     if mode == "Historical":
         try:
             start_date = datetime.strptime(selected_date, "%Y-%m-%d")
-            today = datetime.now(tz)
+            today = get_ist_now()
             days_diff = (today.date() - start_date.date()).days
             if days_diff < 0 or days_diff > 30:
                 status_text.error("Historical intraday data is limited. Please select a recent weekday within the last 30 days.")
@@ -761,7 +778,7 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             status_text.error("Invalid date format. Please use YYYY-MM-DD.")
             return results
     else:
-        today = datetime.now(tz)
+        today = get_ist_now()
         last_trading_day = get_last_trading_day(today.date())
         
         # If today is not a trading day, show notification and use last trading day
@@ -778,7 +795,7 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             live_scan_date = today.date()
 
         start_dt = tz.localize(datetime.combine(live_scan_date, datetime.min.time()).replace(hour=9, minute=15))
-        end_dt = datetime.now(tz)
+        end_dt = get_ist_now()
         fetch_start = (start_dt - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
         fetch_end = end_dt.strftime("%Y-%m-%d %H:%M:%S")
         filter_date = live_scan_date
@@ -859,7 +876,7 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
 
         available_dates = sorted(set(df_30min_full['date']))
         chosen_date = filter_date
-        is_today = (filter_date == datetime.now(pytz.timezone('Asia/Kolkata')).date())
+        is_today = (filter_date == get_ist_now().date())
         if filter_date not in available_dates:
             prior_dates = [d for d in available_dates if d < filter_date]
             if prior_dates:
@@ -878,7 +895,7 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
 
         # In Live mode, prevent using future (not-yet-completed) candles
         if mode == "Live":
-            current_time = datetime.now(pytz.timezone('Asia/Kolkata'))
+            current_time = get_ist_now()
             if snapshot_dt > current_time:
                 snapshot_dt = current_time
 
