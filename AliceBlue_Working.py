@@ -18,23 +18,6 @@ import threading
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Timezone safety: ensure Render/UTC servers use IST derived from UTC
-def get_ist_now():
-    """
-    Always return current IST time derived from UTC.
-    Safe for UTC servers like Render.
-    """
-    return datetime.utcnow().replace(tzinfo=pytz.utc).astimezone(
-        pytz.timezone("Asia/Kolkata")
-    )
-
-# Ensure TZ is set for process-wide operations (only set if not already set)
-try:
-    if not os.environ.get("TZ"):
-        os.environ["TZ"] = "Asia/Kolkata"
-except Exception:
-    pass
-
 # =====================================================================
 # CONFIGURATION & CONSTANTS
 # =====================================================================
@@ -136,7 +119,7 @@ def fetch_live_data_websocket(symbols, duration_minutes=2):
                         inst = trade.get_instrument(exchange=Exchange.NSE, symbol=sym_clean)
                         if inst and str(inst.token) == token:
                             tick = {
-                                'timestamp': get_ist_now(),
+                                'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),
                                 'ltp': float(feed_message.get('lp', 0) or 0),
                                 'volume': float(feed_message.get('v', 0) or 0),
                                 'open': float(feed_message.get('o', 0) or 0),
@@ -265,7 +248,7 @@ def fetch_5min_data(symbol, start_date=None, end_date=None):
         # Build datetime range
         tz = pytz.timezone('Asia/Kolkata')
         if start_date is None:
-            to_dt = get_ist_now()
+            to_dt = datetime.now(tz)
             from_dt = to_dt - timedelta(days=7)
         else:
             try:
@@ -274,7 +257,7 @@ def fetch_5min_data(symbol, start_date=None, end_date=None):
                     from_dt = tz.localize(from_dt)
             except Exception as e:
                 print(f"[ERROR] {symbol}: Failed to parse start_date {start_date}: {e}")
-                from_dt = get_ist_now() - timedelta(days=7)
+                from_dt = datetime.now(tz) - timedelta(days=7)
             if end_date is None:
                 to_dt = from_dt + timedelta(days=1)
             else:
@@ -427,7 +410,7 @@ def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=Non
 
         tz = pytz.timezone('Asia/Kolkata')
         if start_date is None:
-            to_dt = get_ist_now()
+            to_dt = datetime.now(tz)
             from_dt = to_dt - timedelta(days=7)
         else:
             try:
@@ -435,7 +418,7 @@ def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=Non
                 if from_dt.tzinfo is None:
                     from_dt = tz.localize(from_dt)
             except Exception:
-                from_dt = get_ist_now() - timedelta(days=7)
+                from_dt = datetime.now(tz) - timedelta(days=7)
             if end_date is None:
                 to_dt = from_dt + timedelta(days=1)
             else:
@@ -585,7 +568,7 @@ def _validate_with_broker(symbol, last_close, breakout_bull, breakout_bear):
             return breakout_bull, breakout_bear
 
         tz = pytz.timezone('Asia/Kolkata')
-        today = get_ist_now().date()
+        today = datetime.now(tz).date()
         prev_day = today - timedelta(days=1)
         from_dt = datetime.combine(prev_day, datetime.min.time())
         to_dt = datetime.combine(prev_day, datetime.max.time())
@@ -688,7 +671,7 @@ def get_last_trading_day(from_date=None):
     Excludes Saturdays, Sundays, and major Indian market holidays.
     """
     if from_date is None:
-        from_date = get_ist_now().date()
+        from_date = datetime.now(pytz.timezone('Asia/Kolkata')).date()
     
     # 2026 Indian market holidays (NSE closed)
     market_holidays = {
@@ -722,180 +705,23 @@ def get_last_trading_day(from_date=None):
 # SCREENING LOGIC FUNCTION
 # =====================================================================
 
-def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=None, require_unusual_volume=True, status_text=None):
+def scan_stock(symbol, df_30min_30m_full, chosen_date, timeframe, candle_count, require_unusual_volume, use_ma44_filter, mode):
     """
-    Main screening function that returns results list
-    Optionally updates results_container in real-time
+    Analyze a single stock and return result dict or None if filtered out.
+    Per-stock analysis extracted to enable parallel processing.
     """
-    global CANDLES_START, SCAN_TIME
+    global CANDLES_START, SCAN_TIME, MA_WINDOW
     
-    # Map timeframe and candle count to settings (30m only)
-    if candle_count == "4C":
-        CANDLES_START = 4
-        SCAN_TIME = "11:15"
-    elif candle_count == "5C":
-        CANDLES_START = 5
-        SCAN_TIME = "11:45"
-    elif candle_count == "6C":
-        CANDLES_START = 6
-        SCAN_TIME = "12:15"
-    else:
-        CANDLES_START = 5
-        SCAN_TIME = "11:45"
-    
-    results = []
-    total_stocks = len(stocks)
-    progress_bar = st.progress(0)
-    progress_text = st.empty()
-    status_text = st.empty()
-    
-    tz = pytz.timezone('Asia/Kolkata')
-    if mode == "Historical":
-        try:
-            start_date = datetime.strptime(selected_date, "%Y-%m-%d")
-            today = get_ist_now()
-            days_diff = (today.date() - start_date.date()).days
-            if days_diff < 0 or days_diff > 30:
-                status_text.error("Historical intraday data is limited. Please select a recent weekday within the last 30 days.")
-                return results
-            if start_date.weekday() > 4:
-                prev_day = start_date
-                while prev_day.weekday() > 4:
-                    prev_day -= timedelta(days=1)
-                status_text.info(f"Selected date {start_date.date()} is weekend. Using previous working day {prev_day.date()} for screening.")
-                start_date = prev_day
-            # If selected date is today, fetch up to now
-            if start_date.date() == today.date():
-                start_dt = today.replace(hour=9, minute=15, second=0, microsecond=0)
-                end_dt = today
-            else:
-                start_dt = tz.localize(datetime.combine(start_date.date(), datetime.min.time()).replace(hour=9, minute=15))
-                end_dt = tz.localize(datetime.combine(start_date.date(), datetime.min.time()).replace(hour=15, minute=30))
-            fetch_start = (start_dt - timedelta(days=10)).strftime("%Y-%m-%d")
-            fetch_end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-            filter_date = start_date.date()
-        except ValueError:
-            status_text.error("Invalid date format. Please use YYYY-MM-DD.")
-            return results
-    else:
-        today = get_ist_now()
-        last_trading_day = get_last_trading_day(today.date())
-        
-        # If today is not a trading day, show notification and use last trading day
-        if today.date() != last_trading_day:
-            if date.today().weekday() >= 5:
-                msg = f"📅 Weekend detected! Using last trading day ({last_trading_day.strftime('%Y-%m-%d')}) for Live scan."
-            else:
-                msg = f"🏖️ Market holiday today! Using last trading day ({last_trading_day.strftime('%Y-%m-%d')}) for Live scan."
-            status_text.warning(msg)
-            # Use last trading day as the live scan date
-            live_scan_date = last_trading_day
-        else:
-            status_text.info("📊 Live mode: Scanning today's market data")
-            live_scan_date = today.date()
-
-        start_dt = tz.localize(datetime.combine(live_scan_date, datetime.min.time()).replace(hour=9, minute=15))
-        end_dt = get_ist_now()
-        fetch_start = (start_dt - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
-        fetch_end = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-        filter_date = live_scan_date
-
-    # NOTE: skipping sequential prefetch of instruments to avoid startup delay.
-    # Workers will resolve instruments into the local `inst_cache` concurrently.
-
-    # Fetch 5-min data in parallel (limit workers to avoid broker rate limits)
-    results_data = {}
-    trade_obj = st.session_state.get('alice_trade')
-    inst_cache = {}
-    inst_cache_lock = threading.Lock()
-    if not trade_obj:
-        status_text.error("❌ Not connected to Alice Blue. Please generate session before running scan.")
-        return results
     try:
-        # Seed local cache from session cache to reduce duplicate instrument calls
-        if isinstance(st.session_state.get('instrument_cache', None), dict):
-            inst_cache.update(st.session_state.get('instrument_cache', {}))
-    except Exception:
-        pass
-
-    # FETCH PHASE (parallel)
-    results_data = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_symbol = {
-            executor.submit(fetch_5min_data_worker, symbol, fetch_start, fetch_end, trade_obj, inst_cache, inst_cache_lock): symbol
-            for symbol in stocks
-        }
-
-        for idx, future in enumerate(as_completed(future_to_symbol)):
-            symbol = future_to_symbol[future]
-            try:
-                df_5min = future.result()
-                results_data[symbol] = df_5min
-            except Exception as e:
-                print(f"[SCAN ERROR] {symbol}: Fetch failed - {e}")
-                results_data[symbol] = None
-
-            # Show single unified progress 0-50% for fetch phase
-            progress_percent = int(((idx + 1) / total_stocks) * 50) if total_stocks else 0
-            progress_bar.progress(progress_percent)
-            progress_text.text(f"Scanning: {progress_percent}% ({idx+1}/{total_stocks})")
-
-    # Merge local inst_cache back into session cache
-    try:
-        sc = st.session_state.get('instrument_cache', {})
-        sc.update(inst_cache)
-        st.session_state.instrument_cache = sc
-    except Exception:
-        pass
-
-    # PROCESS PHASE (sequential but shows results in real-time)
-    processed_count = 0
-    for idx2, (symbol, df_5min) in enumerate(results_data.items()):
-        if df_5min is None or (hasattr(df_5min, 'empty') and df_5min.empty):
-            processed_count += 1
-            progress_percent = 50 + int((processed_count / total_stocks) * 50)
-            progress_bar.progress(progress_percent)
-            progress_text.text(f"Scanning: {progress_percent}%")
-            continue
-
-        # Resample 5-min data to 30-min
-        df_30min_30m_full = resample_to_30min(df_5min)
-        df_30min_30m_full = df_30min_30m_full.sort_index()
-        df_30min_30m_full['date'] = df_30min_30m_full.index.to_series().dt.normalize().dt.date
-
-        # Relax early-session full-data length rejection: allow processing with >=30 resampled candles
-        if len(df_30min_30m_full) < 30:
-            processed_count += 1
-            progress_percent = 50 + int((processed_count / total_stocks) * 50)
-            progress_bar.progress(progress_percent)
-            progress_text.text(f"Scanning: {progress_percent}%")
-            continue
-
-        # Use 30m resampled data (full set prior to snapshot trimming)
         df_30min_full = df_30min_30m_full.copy()
 
-        available_dates = sorted(set(df_30min_full['date']))
-        chosen_date = filter_date
-        is_today = (filter_date == get_ist_now().date())
-        if filter_date not in available_dates:
-            prior_dates = [d for d in available_dates if d < filter_date]
-            if prior_dates:
-                chosen_date = max(prior_dates)
-            else:
-                processed_count += 1
-                progress_percent = 50 + int((processed_count / total_stocks) * 50)
-                progress_bar.progress(progress_percent)
-                progress_text.text(f"Scanning: {progress_percent}%")
-                continue
-
         # Apply strict snapshot locking: only use data up to the snapshot datetime
-        # Determine snapshot_time from selected candle_count / SCAN_TIME
         snapshot_time = SCAN_TIME if SCAN_TIME else ("11:45" if candle_count == "5C" else ("11:15" if candle_count=="4C" else "12:15"))
         snapshot_dt = get_snapshot_datetime_for_date(chosen_date, snapshot_time)
 
         # In Live mode, prevent using future (not-yet-completed) candles
         if mode == "Live":
-            current_time = get_ist_now()
+            current_time = datetime.now(pytz.timezone('Asia/Kolkata'))
             if snapshot_dt > current_time:
                 snapshot_dt = current_time
 
@@ -906,12 +732,7 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
         day_30min = df_30min_30m_full[df_30min_30m_full['date'] == chosen_date]
         
         if len(day_30min) < CANDLES_START:
-            # If we don't have enough candles up to the snapshot, we cannot evaluate this symbol for the chosen candle_count
-            processed_count += 1
-            progress_percent = 50 + int((processed_count / total_stocks) * 50)
-            progress_bar.progress(progress_percent)
-            progress_text.text(f"Scanning: {progress_percent}%")
-            continue
+            return None
         
         first5 = day_30min.head(CANDLES_START)
 
@@ -923,11 +744,7 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
         # Early termination check for MA data (relaxed to 30 periods to allow early-session signals)
         prior_44 = ma44_source[ma44_source['date'] < chosen_date].tail(44)
         if len(prior_44) < 30:
-            processed_count += 1
-            progress_percent = 50 + int((processed_count / total_stocks) * 50)
-            progress_bar.progress(progress_percent)
-            progress_text.text(f"Scanning: {progress_percent}%")
-            continue
+            return None
 
         MA_TOLERANCE_PCT = 0.0005
         ma44_series = ma44_source['Close'].rolling(window=MA_WINDOW, min_periods=MA_WINDOW).mean()
@@ -1121,13 +938,6 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
         last_close = first5['Close'].iloc[-1]
         breakout_bull = (prev_high is not None) and (last_close > prev_high)
         breakout_bear = (prev_low is not None) and (last_close < prev_low)
-
-        # SKIPPED: Broker validation disabled for speed (it was making sequential API calls)
-        # Uncomment if you need conservative validation:
-        # try:
-        #     breakout_bull, breakout_bear = _validate_with_broker(symbol, last_close, breakout_bull, breakout_bear)
-        # except Exception:
-        #     pass
         
         volume_strong = (avg_vol_prior is not None) and (avg_vol_recent > 1.5 * avg_vol_prior)
         rsi_bull = (rsi_at_4th is not None) and (rsi_at_4th > 60)
@@ -1306,13 +1116,8 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
         except Exception:
             bearish_volume_confirmed = False
 
-        # If user opted NOT to consider unusual volume, override confirmations
-        try:
-            if not require_unusual_volume:
-                bullish_volume_confirmed = True
-                bearish_volume_confirmed = True
-        except Exception:
-            pass
+        # Always keep unusual volume logic; no checkbox filtering
+        # (Removed: if not require_unusual_volume override)
 
         ma1h_slope_ok_bull = ma20_1h_slope > 0
         ma1h_slope_ok_bear = ma20_1h_slope < 0
@@ -1445,6 +1250,15 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
         except Exception:
             pass
 
+        # Apply optional 44MA filter BEFORE appending result
+        if use_ma44_filter:
+            if signal.startswith("Bullish") and last_c is not None and ma44_list and ma44_list[-1] is not None:
+                if last_c <= ma44_list[-1]:
+                    return None  # Filtered out: Bullish but Close not > MA44
+            elif signal.startswith("Bearish") and last_c is not None and ma44_list and ma44_list[-1] is not None:
+                if last_c >= ma44_list[-1]:
+                    return None  # Filtered out: Bearish but Close not < MA44
+
         volume_status = "High" if first5['Volume'].mean() > df_30min['Volume'].mean() else "Low"
 
         first_open = first5.iloc[0]['Open']
@@ -1524,16 +1338,224 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             "4th 44MA": ma44_list[3] if len(ma44_list) > 3 else None,
             "5th 44MA": (ma44_list[4] if len(ma44_list) > 4 and CANDLES_START >= 5 else None),
             "6th 44MA": (ma44_list[5] if len(ma44_list) > 5 and CANDLES_START >= 6 else None),
+            "UnusualPriority": 1 if unusual_volume else 0,
+            "Score": bull_score if signal.startswith("Bullish") else bear_score if signal.startswith("Bearish") else 0,
         }
-        results.append(result)
-        processed_count += 1
-        progress_percent = 50 + int((processed_count / total_stocks) * 50)
-        progress_bar.progress(progress_percent)
-        progress_text.text(f"Scanning: {progress_percent}%")
+        return result
+    except Exception as e:
+        print(f"[SCAN ERROR] {symbol}: {e}")
+        return None
+
+
+def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=None, require_unusual_volume=True, use_ma44_filter=False, status_text=None):
+    """
+    Main screening function that returns results list
+    Optionally updates results_container in real-time
+    """
+    global CANDLES_START, SCAN_TIME
+    
+    # Map timeframe and candle count to settings (30m only)
+    if candle_count == "4C":
+        CANDLES_START = 4
+        SCAN_TIME = "11:15"
+    elif candle_count == "5C":
+        CANDLES_START = 5
+        SCAN_TIME = "11:45"
+    elif candle_count == "6C":
+        CANDLES_START = 6
+        SCAN_TIME = "12:15"
+    else:
+        CANDLES_START = 5
+        SCAN_TIME = "11:45"
+    
+    results = []
+    total_stocks = len(stocks)
+    progress_bar = st.progress(0)
+    progress_text = st.empty()
+    status_text = st.empty()
+    
+    tz = pytz.timezone('Asia/Kolkata')
+    if mode == "Historical":
+        try:
+            start_date = datetime.strptime(selected_date, "%Y-%m-%d")
+            today = datetime.now(tz)
+            days_diff = (today.date() - start_date.date()).days
+            if days_diff < 0 or days_diff > 30:
+                status_text.error("Historical intraday data is limited. Please select a recent weekday within the last 30 days.")
+                return results
+            if start_date.weekday() > 4:
+                prev_day = start_date
+                while prev_day.weekday() > 4:
+                    prev_day -= timedelta(days=1)
+                status_text.info(f"Selected date {start_date.date()} is weekend. Using previous working day {prev_day.date()} for screening.")
+                start_date = prev_day
+            # If selected date is today, fetch up to now
+            if start_date.date() == today.date():
+                start_dt = today.replace(hour=9, minute=15, second=0, microsecond=0)
+                end_dt = today
+            else:
+                start_dt = tz.localize(datetime.combine(start_date.date(), datetime.min.time()).replace(hour=9, minute=15))
+                end_dt = tz.localize(datetime.combine(start_date.date(), datetime.min.time()).replace(hour=15, minute=30))
+            fetch_start = (start_dt - timedelta(days=10)).strftime("%Y-%m-%d")
+            fetch_end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+            filter_date = start_date.date()
+        except ValueError:
+            status_text.error("Invalid date format. Please use YYYY-MM-DD.")
+            return results
+    else:
+        today = datetime.now(tz)
+        last_trading_day = get_last_trading_day(today.date())
         
-        # Update results container in real-time if provided
-        if results_container is not None:
-            st.session_state.screening_results = results.copy()
+        # If today is not a trading day, show notification and use last trading day
+        if today.date() != last_trading_day:
+            if date.today().weekday() >= 5:
+                msg = f"📅 Weekend detected! Using last trading day ({last_trading_day.strftime('%Y-%m-%d')}) for Live scan."
+            else:
+                msg = f"🏖️ Market holiday today! Using last trading day ({last_trading_day.strftime('%Y-%m-%d')}) for Live scan."
+            status_text.warning(msg)
+            # Use last trading day as the live scan date
+            live_scan_date = last_trading_day
+        else:
+            status_text.info("📊 Live mode: Scanning today's market data")
+            live_scan_date = today.date()
+
+        start_dt = tz.localize(datetime.combine(live_scan_date, datetime.min.time()).replace(hour=9, minute=15))
+        end_dt = datetime.now(tz)
+        fetch_start = (start_dt - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
+        fetch_end = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        filter_date = live_scan_date
+
+    # NOTE: skipping sequential prefetch of instruments to avoid startup delay.
+    # Workers will resolve instruments into the local `inst_cache` concurrently.
+
+    # Fetch 5-min data in parallel (limit workers to avoid broker rate limits)
+    results_data = {}
+    trade_obj = st.session_state.get('alice_trade')
+    inst_cache = {}
+    inst_cache_lock = threading.Lock()
+    if not trade_obj:
+        status_text.error("❌ Not connected to Alice Blue. Please generate session before running scan.")
+        return results
+    try:
+        # Seed local cache from session cache to reduce duplicate instrument calls
+        if isinstance(st.session_state.get('instrument_cache', None), dict):
+            inst_cache.update(st.session_state.get('instrument_cache', {}))
+    except Exception:
+        pass
+
+    # FETCH PHASE (parallel)
+    results_data = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_symbol = {
+            executor.submit(fetch_5min_data_worker, symbol, fetch_start, fetch_end, trade_obj, inst_cache, inst_cache_lock): symbol
+            for symbol in stocks
+        }
+
+        for idx, future in enumerate(as_completed(future_to_symbol)):
+            symbol = future_to_symbol[future]
+            try:
+                df_5min = future.result()
+                results_data[symbol] = df_5min
+            except Exception as e:
+                print(f"[SCAN ERROR] {symbol}: Fetch failed - {e}")
+                results_data[symbol] = None
+
+            # Show single unified progress 0-50% for fetch phase
+            progress_percent = int(((idx + 1) / total_stocks) * 50) if total_stocks else 0
+            progress_bar.progress(progress_percent)
+            progress_text.text(f"Scanning: {progress_percent}% ({idx+1}/{total_stocks})")
+
+    # Merge local inst_cache back into session cache
+    try:
+        sc = st.session_state.get('instrument_cache', {})
+        sc.update(inst_cache)
+        st.session_state.instrument_cache = sc
+    except Exception:
+        pass
+
+    # PROCESS PHASE (parallel with ThreadPoolExecutor for per-stock analysis)
+    processed_count = 0
+    resampled_data = {}
+    
+    # First pass: resample and pre-filter
+    for symbol, df_5min in results_data.items():
+        if df_5min is None or (hasattr(df_5min, 'empty') and df_5min.empty):
+            processed_count += 1
+            continue
+        try:
+            df_30min_30m_full = resample_to_30min(df_5min)
+            df_30min_30m_full = df_30min_30m_full.sort_index()
+            df_30min_30m_full['date'] = df_30min_30m_full.index.to_series().dt.normalize().dt.date
+            if len(df_30min_30m_full) >= 30:
+                available_dates = sorted(set(df_30min_30m_full['date']))
+                chosen_date = filter_date
+                if filter_date not in available_dates:
+                    prior_dates = [d for d in available_dates if d < filter_date]
+                    if prior_dates:
+                        chosen_date = max(prior_dates)
+                    else:
+                        processed_count += 1
+                        continue
+                resampled_data[symbol] = (df_30min_30m_full, df_5min, chosen_date)
+        except Exception as e:
+            print(f"[SCAN ERROR] {symbol}: Resample failed - {e}")
+        processed_count += 1
+        progress_percent = 50 + int((processed_count / total_stocks) * 25)
+        progress_bar.progress(progress_percent)
+
+    # Second pass: parallel per-stock analysis with ThreadPoolExecutor (10 workers)
+    results_lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures_scan = {
+            executor.submit(scan_stock, symbol, df_30min_30m_full, chosen_date, timeframe, candle_count, require_unusual_volume, use_ma44_filter, mode): symbol
+            for symbol, (df_30min_30m_full, df_5min, chosen_date) in resampled_data.items()
+        }
+        
+        scan_completed = 0
+        for future in as_completed(futures_scan):
+            symbol = futures_scan[future]
+            try:
+                result = future.result()
+                if result is not None:
+                    with results_lock:
+                        results.append(result)
+            except Exception as e:
+                print(f"[SCAN ERROR] {symbol}: Analysis failed - {e}")
+            scan_completed += 1
+            progress_percent = 75 + int((scan_completed / len(resampled_data)) * 20) if len(resampled_data) > 0 else 75
+            progress_bar.progress(progress_percent)
+
+    # POST-PROCESSING: Build DataFrame, apply SortPriority, sort results, convert back to list
+    if results:
+        try:
+            df_results = pd.DataFrame(results)
+            
+            # Assign SortPriority (1=Unusual+Bull, 2=Unusual+Bear, 3=Normal+Bull, 4=Normal+Bear)
+            df_results["SortPriority"] = 4  # Default to Normal+Bear
+            df_results.loc[
+                (df_results["Signal"].str.startswith("Bullish")) & (df_results["UnusualPriority"] == 1),
+                "SortPriority"
+            ] = 1  # Unusual+Bull
+            df_results.loc[
+                (df_results["Signal"].str.startswith("Bearish")) & (df_results["UnusualPriority"] == 1),
+                "SortPriority"
+            ] = 2  # Unusual+Bear
+            df_results.loc[
+                (df_results["Signal"].str.startswith("Bullish")) & (df_results["UnusualPriority"] == 0),
+                "SortPriority"
+            ] = 3  # Normal+Bull
+            
+            # Sort by SortPriority (ascending: 1→2→3→4) then by Score (descending: highest first)
+            df_results = df_results.sort_values(
+                by=["SortPriority", "Score"],
+                ascending=[True, False]
+            )
+            
+            # Convert back to list of dicts for display
+            results = df_results.to_dict('records')
+        except Exception as e:
+            print(f"[POST-PROCESSING ERROR] {e}")
+            # If DataFrame processing fails, keep results as-is (unsorted)
 
     progress_bar.progress(100)
     progress_text.text("Scanning: 100%")
@@ -1721,8 +1743,8 @@ def main():
     # Candle count for 30min timeframe
     candle_count = st.select_slider("Candle Count (30min)", options=["4C", "5C", "6C"], value="5C", label_visibility="collapsed")
 
-    # Option: consider unusual volume in logic
-    consider_unusual_volume = st.checkbox("Consider Unusual Volume (affects volume confirmations)", value=True, help="If unchecked, unusual-volume checks are ignored and volume confirmations are treated as passed.")
+    # Option: apply optional 44MA filter
+    use_ma44_filter = st.checkbox("Apply 44MA Filter", value=False, help="If checked, Bullish signals require Close > MA44 and Bearish require Close < MA44")
     
     st.divider()
     
@@ -1770,7 +1792,7 @@ def main():
     if run_button:
         st.session_state.screening_results = []
         st.session_state.scan_running = True
-        results = run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=True, require_unusual_volume=consider_unusual_volume)
+        results = run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=True, require_unusual_volume=True, use_ma44_filter=use_ma44_filter)
         st.session_state.screening_results = results
         st.session_state.scan_running = False
     
