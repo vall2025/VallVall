@@ -18,6 +18,46 @@ import threading
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ------------------------------------------------------------------
+# GLOBAL FLAGS / ENVIRONMENT FIXES
+# ------------------------------------------------------------------
+
+# debug flag controls verbose print output; set to False in production
+DEBUG = False
+
+# force timezone to Asia/Kolkata (required on UTC cloud servers)
+os.environ["TZ"] = "Asia/Kolkata"
+try:
+    time.tzset()
+except AttributeError:
+    # tzset may not be available on all platforms (Windows), ignore if so
+    pass
+
+# conditional print wrapper: only print when DEBUG=True or when an
+# error marker is present in the message to avoid flood in logs.
+_original_print = print
+
+def _conditional_print(*args, **kwargs):
+    if DEBUG:
+        _original_print(*args, **kwargs)
+        return
+    # if any argument looks like an error message, always print
+    for arg in args:
+        try:
+            if isinstance(arg, str):
+                low = arg.lower()
+                if "error" in low:
+                    _original_print(*args, **kwargs)
+                    return
+        except Exception:
+            pass
+    # otherwise suppress
+
+# monkey‑patch builtins.print
+import builtins
+builtins.print = _conditional_print
+
+
 # =====================================================================
 # CONFIGURATION & CONSTANTS
 # =====================================================================
@@ -229,12 +269,16 @@ def get_instrument_cached(symbol):
     except Exception:
         return None
 
-def fetch_5min_data(symbol, start_date=None, end_date=None):
+def fetch_5min_data(symbol, start_date=None, end_date=None, retry=False):
     """
     Fetch 5-minute OHLCV data using Alice Blue (Ant-A3) SDK only.
     Returns pandas DataFrame indexed by timezone-aware Asia/Kolkata DatetimeIndex
     with columns exactly: ['Open','High','Low','Close','Volume'].
     Returns None on failure.
+
+    Parameters:
+        retry (bool): internal flag to avoid infinite recursion when retrying
+            on small data sets. Should not be set by callers.
     """
     try:
         trade = st.session_state.get('alice_trade')
@@ -385,6 +429,14 @@ def fetch_5min_data(symbol, start_date=None, end_date=None):
             return None
         
         print(f"[FETCH] {symbol}: Fetched {len(df)} candles")
+
+        # ------------------------------------------------------
+        # FIX 6: retry once if dataset is suspiciously small
+        # ------------------------------------------------------
+        if (df is None or len(df) < 20) and not retry:
+            time.sleep(0.5)
+            return fetch_5min_data(symbol, start_date, end_date, retry=True)
+
         return df
     except Exception as e:
         print(f"[ERROR] {symbol}: Outer exception in fetch_5min_data: {e}")
@@ -393,11 +445,14 @@ def fetch_5min_data(symbol, start_date=None, end_date=None):
         return None
 
 
-def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=None, inst_cache=None, inst_cache_lock=None):
+def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=None, inst_cache=None, inst_cache_lock=None, retry=False):
     """
     Thread-safe worker version of fetch_5min_data that uses provided `trade_obj`
     and a local `inst_cache` dict instead of accessing `st.session_state`.
     Returns the same DataFrame or None on failure.
+
+    Parameters:
+        retry (bool): internal flag used when retrying on small datasets.
     """
     try:
         trade = trade_obj
@@ -545,6 +600,13 @@ def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=Non
             return None
 
         print(f"[FETCH-WORKER] {symbol}: Fetched {len(df)} candles")
+
+        # ------------------------------------------------------
+        # FIX 6 retry logic
+        if (df is None or len(df) < 20) and not retry:
+            time.sleep(0.5)
+            return fetch_5min_data_worker(symbol, start_date, end_date, trade_obj, inst_cache, inst_cache_lock, retry=True)
+
         return df
     except Exception as e:
         print(f"[WORKER ERROR] {symbol}: Outer exception in fetch_5min_data_worker: {e}")
@@ -705,7 +767,7 @@ def get_last_trading_day(from_date=None):
 # SCREENING LOGIC FUNCTION
 # =====================================================================
 
-def scan_stock(symbol, df_30min_30m_full, chosen_date, timeframe, candle_count, require_unusual_volume, use_ma44_filter, mode):
+def scan_stock(symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candle_count, require_unusual_volume, mode):
     """
     Analyze a single stock and return result dict or None if filtered out.
     Per-stock analysis extracted to enable parallel processing.
@@ -727,8 +789,9 @@ def scan_stock(symbol, df_30min_30m_full, chosen_date, timeframe, candle_count, 
 
         # Trim the full 30-min dataset strictly to the snapshot datetime BEFORE any selection/analysis
         df_30min_30m_full = df_30min_30m_full[df_30min_30m_full.index <= snapshot_dt]
-
-        # Now select the day's 30-min candles (only those up to snapshot_dt)
+        # update df_30min_full to match trimmed dataset so later code doesn't inadvertently
+        # operate on a full-day copy (FIX 3)
+        df_30min_full = df_30min_30m_full
         day_30min = df_30min_30m_full[df_30min_30m_full['date'] == chosen_date]
         
         if len(day_30min) < CANDLES_START:
@@ -970,9 +1033,12 @@ def scan_stock(symbol, df_30min_30m_full, chosen_date, timeframe, candle_count, 
             return total, breakdown
 
         try:
-            df_1h = df_5min.resample('60min', origin='start').agg({
-                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-            }).dropna()
+            if df_5min is not None and not df_5min.empty:
+                df_1h = df_5min.resample('60min', origin='start').agg({
+                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+                }).dropna()
+            else:
+                df_1h = pd.DataFrame()
             ma20_1h = df_1h['Close'].rolling(20).mean()
             df_1h = df_1h.loc[df_1h.index <= first5.index[-1]]
             if not df_1h.empty and len(ma20_1h.dropna()) >= 2:
@@ -1063,6 +1129,9 @@ def scan_stock(symbol, df_30min_30m_full, chosen_date, timeframe, candle_count, 
             unusual_volume = (avg_volume_20 is not None) and (current_vol is not None) and (current_vol >= 2.0 * avg_volume_20)
         except Exception:
             unusual_volume = False
+        # respect user choice: if unusual volume not required, treat as satisfied
+        if not require_unusual_volume:
+            unusual_volume = True
 
         try:
             vol_seq_ok = False
@@ -1116,8 +1185,8 @@ def scan_stock(symbol, df_30min_30m_full, chosen_date, timeframe, candle_count, 
         except Exception:
             bearish_volume_confirmed = False
 
-        # Always keep unusual volume logic; no checkbox filtering
-        # (Removed: if not require_unusual_volume override)
+        # Unusual volume condition is now controlled by `require_unusual_volume` flag
+        # if not required we force unusual_volume = True above so checks later pass.
 
         ma1h_slope_ok_bull = ma20_1h_slope > 0
         ma1h_slope_ok_bear = ma20_1h_slope < 0
@@ -1250,14 +1319,13 @@ def scan_stock(symbol, df_30min_30m_full, chosen_date, timeframe, candle_count, 
         except Exception:
             pass
 
-        # Apply optional 44MA filter BEFORE appending result
-        if use_ma44_filter:
-            if signal.startswith("Bullish") and last_c is not None and ma44_list and ma44_list[-1] is not None:
-                if last_c <= ma44_list[-1]:
-                    return None  # Filtered out: Bullish but Close not > MA44
-            elif signal.startswith("Bearish") and last_c is not None and ma44_list and ma44_list[-1] is not None:
-                if last_c >= ma44_list[-1]:
-                    return None  # Filtered out: Bearish but Close not < MA44
+        # always apply 44MA filter : candles must stay above/below MA44 for bullish/bearish
+        if signal.startswith("Bullish") and last_c is not None and ma44_list and ma44_list[-1] is not None:
+            if last_c <= ma44_list[-1]:
+                return None
+        elif signal.startswith("Bearish") and last_c is not None and ma44_list and ma44_list[-1] is not None:
+            if last_c >= ma44_list[-1]:
+                return None
 
         volume_status = "High" if first5['Volume'].mean() > df_30min['Volume'].mean() else "Low"
 
@@ -1347,7 +1415,7 @@ def scan_stock(symbol, df_30min_30m_full, chosen_date, timeframe, candle_count, 
         return None
 
 
-def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=None, require_unusual_volume=True, use_ma44_filter=False, status_text=None):
+def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=None, require_unusual_volume=True, status_text=None):
     """
     Main screening function that returns results list
     Optionally updates results_container in real-time
@@ -1396,8 +1464,9 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             else:
                 start_dt = tz.localize(datetime.combine(start_date.date(), datetime.min.time()).replace(hour=9, minute=15))
                 end_dt = tz.localize(datetime.combine(start_date.date(), datetime.min.time()).replace(hour=15, minute=30))
-            fetch_start = (start_dt - timedelta(days=10)).strftime("%Y-%m-%d")
-            fetch_end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+            # send raw datetime objects to fetch functions (avoid string formatting bug)
+            fetch_start = start_dt - timedelta(days=10)
+            fetch_end = end_dt + timedelta(days=1)
             filter_date = start_date.date()
         except ValueError:
             status_text.error("Invalid date format. Please use YYYY-MM-DD.")
@@ -1421,8 +1490,9 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
 
         start_dt = tz.localize(datetime.combine(live_scan_date, datetime.min.time()).replace(hour=9, minute=15))
         end_dt = datetime.now(tz)
-        fetch_start = (start_dt - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
-        fetch_end = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        # use datetime objects directly
+        fetch_start = start_dt - timedelta(days=10)
+        fetch_end = end_dt
         filter_date = live_scan_date
 
     # NOTE: skipping sequential prefetch of instruments to avoid startup delay.
@@ -1507,7 +1577,7 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
     results_lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures_scan = {
-            executor.submit(scan_stock, symbol, df_30min_30m_full, chosen_date, timeframe, candle_count, require_unusual_volume, use_ma44_filter, mode): symbol
+            executor.submit(scan_stock, symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candle_count, require_unusual_volume, mode): symbol
             for symbol, (df_30min_30m_full, df_5min, chosen_date) in resampled_data.items()
         }
         
@@ -1571,6 +1641,10 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
 def main():
     st.set_page_config(page_title="Stock Candle Screener", layout="wide")
     st.title("🔍 Stock Candle Screener 30Min 4C/5C/6C")
+    
+    # ensure instrument cache exists in session state (FIX 5)
+    if "instrument_cache" not in st.session_state:
+        st.session_state.instrument_cache = {}
     
     # Alice Blue Credentials UI
     st.markdown("### 🔐 Alice Blue Credentials")
@@ -1721,17 +1795,10 @@ def main():
     
     st.warning("💡 **TIP**: For best results, use **'Live' mode** to scan today's data in real-time. Historical mode requires complete trading day data (09:15-15:30).")
     
-    # Mode and Timeframe side-by-side
-    col1, col2 = st.columns(2, gap="small")
-    
-    with col1:
-        st.markdown("**1️⃣ Scan Mode**")
-        mode = st.radio("Select Mode", ["Live", "Historical"], label_visibility="collapsed", horizontal=True)
-    
-    with col2:
-        st.markdown("**2️⃣ Timeframe**")
-        timeframe = "30m"  # Only 30m mode supported
-        st.info("📊 Scanning in 30-minute interval mode")
+    # Scan mode selector
+    st.markdown("**1️⃣ Scan Mode**")
+    mode = st.radio("Select Mode", ["Live", "Historical"], label_visibility="collapsed", horizontal=True)
+    timeframe = "30m"  # fixed
     
     # Historical date selector
     if mode == "Historical":
@@ -1743,8 +1810,14 @@ def main():
     # Candle count for 30min timeframe
     candle_count = st.select_slider("Candle Count (30min)", options=["4C", "5C", "6C"], value="5C", label_visibility="collapsed")
 
-    # Option: apply optional 44MA filter
-    use_ma44_filter = st.checkbox("Apply 44MA Filter", value=False, help="If checked, Bullish signals require Close > MA44 and Bearish require Close < MA44")
+    # Option: require unusual volume condition
+    require_unusual_volume = st.checkbox(
+        "Require Unusual Volume",
+        value=True,
+        help="If checked, screening only considers candles with unusual volume (current >2x avg). "
+             "Uncheck to ignore unusual-volume requirement."
+    )
+    # timeframe is fixed to 30m, no user choice
     
     st.divider()
     
@@ -1792,7 +1865,15 @@ def main():
     if run_button:
         st.session_state.screening_results = []
         st.session_state.scan_running = True
-        results = run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=True, require_unusual_volume=True, use_ma44_filter=use_ma44_filter)
+        results = run_screening(
+            stocks,
+            mode,
+            selected_date,
+            timeframe,
+            candle_count,
+            results_container=True,
+            require_unusual_volume=require_unusual_volume
+        )
         st.session_state.screening_results = results
         st.session_state.scan_running = False
     
