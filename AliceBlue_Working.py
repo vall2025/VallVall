@@ -1,9 +1,19 @@
 # File: Stock Candle Screener 30Min 4C/5C - Streamlit Version
 
+# prevent Streamlit watcher race condition by disabling the file watcher
+# this mirrors setting server.fileWatcherType=none in config or cli
+import os
+os.environ['STREAMLIT_SERVER_FILEWATCHERTYPE'] = 'none'
+
 import warnings
 warnings.filterwarnings('ignore')
 
 import streamlit as st
+# also apply via runtime option in case config is already loaded
+try:
+    st.set_option('server.fileWatcherType', 'none')
+except Exception:
+    pass
 from TradeMaster.TradeSync import TradeHub, Exchange
 import pytz
 import pandas as pd
@@ -543,6 +553,12 @@ def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=Non
             print(f"[FETCH-WORKER] {symbol}: Fetch failed - {e}")
 
         if df is None:
+            # frequently the API returns unexpected format (e.g. error message) causing
+            # DataFrame conversion to fail with pandas KeyError like:
+            # "None of [Index([...]) are in the [columns]]".  These are benign and
+            # don't need to flood the log unless DEBUG is enabled.
+            if last_error and "None of [Index" in str(last_error) and not DEBUG:
+                return None
             print(f"[WORKER ERROR] {symbol}: DataFrame is None. Error: {last_error}")
             return None
 
@@ -1129,9 +1145,6 @@ def scan_stock(symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candl
             unusual_volume = (avg_volume_20 is not None) and (current_vol is not None) and (current_vol >= 2.0 * avg_volume_20)
         except Exception:
             unusual_volume = False
-        # respect user choice: if unusual volume not required, treat as satisfied
-        if not require_unusual_volume:
-            unusual_volume = True
 
         try:
             vol_seq_ok = False
@@ -1185,8 +1198,13 @@ def scan_stock(symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candl
         except Exception:
             bearish_volume_confirmed = False
 
-        # Unusual volume condition is now controlled by `require_unusual_volume` flag
-        # if not required we force unusual_volume = True above so checks later pass.
+        # If user opted NOT to consider unusual volume, override confirmations
+        try:
+            if not require_unusual_volume:
+                bullish_volume_confirmed = True
+                bearish_volume_confirmed = True
+        except Exception:
+            pass
 
         ma1h_slope_ok_bull = ma20_1h_slope > 0
         ma1h_slope_ok_bear = ma20_1h_slope < 0
@@ -1210,20 +1228,6 @@ def scan_stock(symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candl
         volume_ok = first5['Volume'].iloc[-1] > 1.2 * avg_vol_recent
         rsi_ok = (30 <= rsi.iloc[-1] <= 70) if not rsi.empty else False
 
-        bull_score, bull_breakdown = calculate_signal_score({
-            'candle_pattern': bullish_candle_pattern,
-            'trend': bullish_trend,
-            'volume': volume_ok,
-            'technical': rsi_ok
-        }, is_bull=True)
-
-        bear_score, bear_breakdown = calculate_signal_score({
-            'candle_pattern': bearish_candle_pattern,
-            'trend': bearish_trend,
-            'volume': volume_ok,
-            'technical': rsi_ok
-        }, is_bull=False)
-
         bullish_conditions = {
             'strong_bodies': strong_bodies and all(r > 0.65 for r in body_ratios),
             'clean_shadows': all(s < 0.25 for s in shadows_ratios),
@@ -1238,10 +1242,10 @@ def scan_stock(symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candl
             'strong_volume': volume_strong,
             'inst_buying': institutional_volume,
             'above_vwap': vwap_trend,
-            'vol_trend_aligned': vrsi_at_4th > 60,
+            'vol_trend_aligned': vrsi_at_4th > 60 if vrsi_at_4th is not None else False,
             'momentum': strong_momentum,
             'acceleration': accelerating_momentum,
-            'rsi_strong': rsi_bull and (rsi_at_4th < 80),
+            'rsi_strong': rsi_bull and (rsi_at_4th < 80) if rsi_at_4th is not None else False,
             'volatility_good': 0.8 < volatility_ratio < 2.0
         }
 
@@ -1259,10 +1263,10 @@ def scan_stock(symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candl
             'strong_volume': volume_strong,
             'inst_selling': institutional_volume,
             'below_vwap': not vwap_trend,
-            'vol_trend_aligned': vrsi_at_4th < 40,
+            'vol_trend_aligned': vrsi_at_4th < 40 if vrsi_at_4th is not None else False,
             'momentum': strong_momentum,
             'acceleration': accelerating_momentum,
-            'rsi_weak': rsi_bear and (rsi_at_4th > 20),
+            'rsi_weak': rsi_bear and (rsi_at_4th > 20) if rsi_at_4th is not None else False,
             'volatility_good': 0.8 < volatility_ratio < 2.0
         }
 
