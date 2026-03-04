@@ -18,9 +18,9 @@ from TradeMaster.TradeSync import TradeHub, Exchange
 import pytz
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dt_time
 import time
-import os, re
+import re
 import json
 import websocket
 import hashlib
@@ -85,23 +85,28 @@ CREDS_FILE = os.path.join(os.path.expanduser('~'), 'alice_creds.json')
 # WEBSOCKET LIVE DATA FETCHING
 # =====================================================================
 
-def fetch_live_data_websocket(symbols, duration_minutes=2):
+def fetch_live_data_websocket(symbols, duration_minutes=2, trade_obj=None):
     """
     Fetch live streaming data for symbols using WebSocket.
     Returns OHLCV data aggregated into 1-minute candles.
     Works for individual traders via Alice Blue API.
-    
+
     Args:
         symbols: List of symbols (e.g., ['ETERNAL.NS', 'INFY.NS'])
         duration_minutes: How many minutes of data to collect (default 2 for quick test)
-    
+        trade_obj: optional Alice Blue TradeHub object; if provided this is
+            used instead of looking in :data:`st.session_state`.  This makes the
+            function safe to call from background threads.
+
     Returns:
         Dict with {symbol: DataFrame} containing Open, High, Low, Close, Volume
     """
     try:
-        trade = st.session_state.get('alice_trade')
+        # prefer explicit object, fall back to session state (for backwards
+        # compatibility with callers that don't supply trade_obj)
+        trade = trade_obj if trade_obj is not None else st.session_state.get('alice_trade')
         if not trade:
-            print("[ERROR] No trade object in session state")
+            print("[ERROR] No trade object available")
             return {}
         
         # Get session ID
@@ -254,27 +259,43 @@ def fetch_live_data_websocket(symbols, duration_minutes=2):
 # DATA FETCHING FUNCTIONS
 # =====================================================================
 
-def get_instrument_cached(symbol):
+def get_instrument_cached(symbol, trade_obj=None, inst_cache=None, inst_cache_lock=None):
     """
     Get instrument with caching to avoid repeated API calls.
+    Thread-safe when trade_obj and inst_cache are provided.
+    Falls back to session_state when called from main thread.
     """
     try:
-        trade = st.session_state.get('alice_trade')
+        # Use provided trade object or fall back to session state
+        trade = trade_obj if trade_obj is not None else st.session_state.get('alice_trade')
         if not trade:
             return None
         
         # Check cache first
-        cache = st.session_state.get('instrument_cache', {})
-        if symbol in cache:
-            return cache[symbol]
+        if inst_cache is not None and symbol in inst_cache:
+            return inst_cache[symbol]
+        if inst_cache is None:
+            cache = st.session_state.get('instrument_cache', {})
+            if symbol in cache:
+                return cache[symbol]
+        else:
+            cache = inst_cache
         
         # Clean symbol and try to fetch
         sym_clean = symbol.split('.NS')[0] if symbol.upper().endswith('.NS') else symbol
         inst = trade.get_instrument(exchange=Exchange.NSE, symbol=sym_clean)
         
         if inst:
-            cache[symbol] = inst
-            st.session_state.instrument_cache = cache
+            # Update cache (thread-safe if lock provided)
+            if inst_cache is not None:
+                if inst_cache_lock is not None:
+                    with inst_cache_lock:
+                        inst_cache[symbol] = inst
+                else:
+                    inst_cache[symbol] = inst
+            else:
+                cache[symbol] = inst
+                st.session_state.instrument_cache = cache
         return inst
     except Exception:
         return None
@@ -443,8 +464,9 @@ def fetch_5min_data(symbol, start_date=None, end_date=None, retry=False):
         # ------------------------------------------------------
         # FIX 6: retry once if dataset is suspiciously small
         # ------------------------------------------------------
-        if (df is None or len(df) < 20) and not retry:
-            time.sleep(0.5)
+        # use lower threshold (10) for safety as per requirements
+        if (df is None or len(df) < 10) and not retry:
+            time.sleep(0.3)
             return fetch_5min_data(symbol, start_date, end_date, retry=True)
 
         return df
@@ -619,8 +641,9 @@ def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=Non
 
         # ------------------------------------------------------
         # FIX 6 retry logic
-        if (df is None or len(df) < 20) and not retry:
-            time.sleep(0.5)
+        # lower threshold to 10 and shorten sleep
+        if (df is None or len(df) < 10) and not retry:
+            time.sleep(0.3)
             return fetch_5min_data_worker(symbol, start_date, end_date, trade_obj, inst_cache, inst_cache_lock, retry=True)
 
         return df
@@ -629,19 +652,20 @@ def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=Non
         return None
 
 
-def _validate_with_broker(symbol, last_close, breakout_bull, breakout_bear):
+def _validate_with_broker(symbol, last_close, breakout_bull, breakout_bear, trade_obj=None, inst_cache=None, inst_cache_lock=None):
     """
     Validate breakout signals using Alice Blue daily data (previous close).
     Conservative: only suppress a breakout if broker data clearly contradicts it.
     Returns (breakout_bull, breakout_bear).
+    Thread-safe when trade_obj and inst_cache are provided.
     """
     try:
-        trade = st.session_state.get('alice_trade')
+        trade = trade_obj if trade_obj is not None else st.session_state.get('alice_trade')
         if not trade:
             return breakout_bull, breakout_bear
 
         sym = symbol.split('.NS')[0] if symbol.upper().endswith('.NS') else symbol
-        inst = get_instrument_cached(symbol)
+        inst = get_instrument_cached(symbol, trade_obj=trade_obj, inst_cache=inst_cache, inst_cache_lock=inst_cache_lock)
         if not inst:
             return breakout_bull, breakout_bear
 
@@ -783,42 +807,35 @@ def get_last_trading_day(from_date=None):
 # SCREENING LOGIC FUNCTION
 # =====================================================================
 
-def scan_stock(symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candle_count, require_unusual_volume, mode):
+def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, trade_obj=None, inst_cache=None, inst_cache_lock=None):
     """
     Analyze a single stock and return result dict or None if filtered out.
-    Per-stock analysis extracted to enable parallel processing.
+    df_30min is expected to be a 30‑minute resampled, snapshot‑filtered
+    DataFrame with a 'date' column already present.
+    This function no longer performs any slicing; that is handled by
+    the caller (process_symbol).
     """
     global CANDLES_START, SCAN_TIME, MA_WINDOW
     
     try:
-        df_30min_full = df_30min_30m_full.copy()
+        # df_30min already contains only candles up to the snapshot datetime
+        if df_30min is None or df_30min.empty:
+            return None
 
-        # Apply strict snapshot locking: only use data up to the snapshot datetime
-        snapshot_time = SCAN_TIME if SCAN_TIME else ("11:45" if candle_count == "5C" else ("11:15" if candle_count=="4C" else "12:15"))
-        snapshot_dt = get_snapshot_datetime_for_date(chosen_date, snapshot_time)
+        # make a local copy to avoid mutating caller data
+        df_30min = df_30min.copy()
+        # ensure date column exists
+        if 'date' not in df_30min.columns:
+            df_30min['date'] = df_30min.index.to_series().dt.normalize().dt.date
 
-        # In Live mode, prevent using future (not-yet-completed) candles
-        if mode == "Live":
-            current_time = datetime.now(pytz.timezone('Asia/Kolkata'))
-            if snapshot_dt > current_time:
-                snapshot_dt = current_time
-
-        # Trim the full 30-min dataset strictly to the snapshot datetime BEFORE any selection/analysis
-        df_30min_30m_full = df_30min_30m_full[df_30min_30m_full.index <= snapshot_dt]
-        # update df_30min_full to match trimmed dataset so later code doesn't inadvertently
-        # operate on a full-day copy (FIX 3)
-        df_30min_full = df_30min_30m_full
-        day_30min = df_30min_30m_full[df_30min_30m_full['date'] == chosen_date]
-        
+        day_30min = df_30min[df_30min['date'] == chosen_date]
         if len(day_30min) < CANDLES_START:
             return None
-        
+
         first5 = day_30min.head(CANDLES_START)
 
-        if timeframe == '30m':
-            ma44_source = df_30min_30m_full
-        else:
-            ma44_source = df_30min_30m_full
+        # after snapshot slicing we only use df_30min for everything
+        ma44_source = df_30min
 
         # Early termination check for MA data (relaxed to 30 periods to allow early-session signals)
         prior_44 = ma44_source[ma44_source['date'] < chosen_date].tail(44)
@@ -850,7 +867,7 @@ def scan_stock(symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candl
             ma44_list.append(ma44_val)
 
         # --- ANALYSIS LOGIC (UNCHANGED) ---
-        prior_data = df_30min_full[df_30min_full.index < first5.index[0]].tail(44)
+        prior_data = df_30min[df_30min.index < first5.index[0]].tail(44)
         supports = []
         for i in range(1, len(prior_data)-1):
             if (prior_data['Low'].iloc[i] < prior_data['Low'].iloc[i-1] and 
@@ -870,27 +887,27 @@ def scan_stock(symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candl
             resistance_dist = abs(current_price - closest_resistance) / closest_resistance
             price_near_level = min(support_dist, resistance_dist) < 0.01
 
-        # Calculate RSI once at the start for this stock
-        if 'RSI' not in df_30min_30m_full.columns:
-            delta = df_30min_30m_full['Close'].diff()
+        # Calculate RSI once at the start for this stock on the filtered 30-min data
+        if 'RSI' not in df_30min.columns:
+            delta = df_30min['Close'].diff()
             gain = delta.clip(lower=0)
             loss = -delta.clip(upper=0)
             avg_gain = gain.ewm(span=14, adjust=False).mean()
             avg_loss = loss.ewm(span=14, adjust=False).mean()
             rs = avg_gain / (avg_loss + 1e-10)
-            df_30min_30m_full['RSI'] = 100 - (100 / (1 + rs))
+            df_30min['RSI'] = 100 - (100 / (1 + rs))
 
-            vol_delta = delta * df_30min_30m_full['Volume']
+            vol_delta = delta * df_30min['Volume']
             vol_gain = vol_delta.clip(lower=0)
             vol_loss = -vol_delta.clip(upper=0)
             vol_avg_gain = vol_gain.ewm(span=14, adjust=False).mean()
             vol_avg_loss = vol_loss.ewm(span=14, adjust=False).mean()
             vol_rs = vol_avg_gain / (vol_avg_loss + 1e-10)
-            df_30min_30m_full['VRSI'] = 100 - (100 / (1 + vol_rs))
+            df_30min['VRSI'] = 100 - (100 / (1 + vol_rs))
 
         try:
-            rsi_at_4th = df_30min_30m_full.loc[first5.index[-1], 'RSI']
-            vrsi_at_4th = df_30min_30m_full.loc[first5.index[-1], 'VRSI']
+            rsi_at_4th = df_30min.loc[first5.index[-1], 'RSI']
+            vrsi_at_4th = df_30min.loc[first5.index[-1], 'VRSI']
         except Exception:
             rsi_at_4th = None
             vrsi_at_4th = None
@@ -904,8 +921,7 @@ def scan_stock(symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candl
             volume_profile.append(vol)
             price_levels.append(price)
 
-            # Use full resampled 30-min data for volume calculations
-            df_30min = df_30min_full
+            # Use the snapshot-filtered 30-min data for volume calculations
             avg_volume = df_30min['Volume'].mean()
         institutional_volume = all(v > 1.2 * avg_volume for v in volume_profile)
 
@@ -1499,105 +1515,112 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
         fetch_end = end_dt
         filter_date = live_scan_date
 
+    # =====================================================================
+    # HARD SNAPSHOT ISOLATION: Calculate snapshot time and limit fetch_end
+    # =====================================================================
+    snapshot_time_map = {
+        "4C": dt_time(11, 15),
+        "5C": dt_time(11, 45),
+        "6C": dt_time(12, 15)
+    }
+    snapshot_time = snapshot_time_map.get(candle_count, dt_time(11, 45))
+    snapshot_dt = datetime.combine(filter_date, snapshot_time)
+    snapshot_dt = tz.localize(snapshot_dt)
+    
+    # CRITICAL: System behaves like script ran exactly at snapshot_time
+    # Never fetch data beyond the snapshot point
+    if mode == "Live":
+        snapshot_dt = min(snapshot_dt, datetime.now(tz))
+    fetch_end = min(snapshot_dt, fetch_end)
+
     # NOTE: skipping sequential prefetch of instruments to avoid startup delay.
     # Workers will resolve instruments into the local `inst_cache` concurrently.
 
     # Fetch 5-min data in parallel (limit workers to avoid broker rate limits)
-    results_data = {}
+    # make sure cache exists
+    if "instrument_cache" not in st.session_state:
+        st.session_state.instrument_cache = {}
+
+    # grab broker connection *before* launching any workers; streamlit context
+    # is not available inside spawned threads, so we must capture the object now.
     trade_obj = st.session_state.get('alice_trade')
+    if not trade_obj:
+        status_text.error("❌ Not connected to Alice Blue. Please authenticate before running the screener.")
+        return results
+
+    # local copy of cache for workers
     inst_cache = {}
     inst_cache_lock = threading.Lock()
-    if not trade_obj:
-        status_text.error("❌ Not connected to Alice Blue. Please generate session before running scan.")
-        return results
     try:
-        # Seed local cache from session cache to reduce duplicate instrument calls
         if isinstance(st.session_state.get('instrument_cache', None), dict):
             inst_cache.update(st.session_state.get('instrument_cache', {}))
     except Exception:
         pass
 
-    # FETCH PHASE (parallel)
-    results_data = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_symbol = {
-            executor.submit(fetch_5min_data_worker, symbol, fetch_start, fetch_end, trade_obj, inst_cache, inst_cache_lock): symbol
-            for symbol in stocks
-        }
+    # nested processing function handles fetch/resample/snapshot and then calls scan_stock
+    def process_symbol(symbol):
+        try:
+            # use the thread‑safe worker variant which accepts an explicit trade
+            # object and a shared instrument cache.  This avoids touching
+            # st.session_state from within a ThreadPoolExecutor worker, which
+            # triggers Streamlit warnings and causes `None` to be returned.
+            df_5min = fetch_5min_data_worker(
+                symbol,
+                fetch_start,
+                fetch_end,
+                trade_obj=trade_obj,
+                inst_cache=inst_cache,
+                inst_cache_lock=inst_cache_lock,
+            )
+            # EARLY SKIP: If not enough 5min data, skip this symbol
+            if df_5min is None or (hasattr(df_5min, 'empty') and df_5min.empty) or len(df_5min) < 30:
+                return None
 
-        for idx, future in enumerate(as_completed(future_to_symbol)):
-            symbol = future_to_symbol[future]
+            df_30min_full = resample_to_30min(df_5min)
+            if df_30min_full is None or df_30min_full.empty:
+                return None
+            df_30min_full = df_30min_full.sort_index()
+            df_30min_full['date'] = df_30min_full.index.to_series().dt.normalize().dt.date
+
+            # HARD SNAPSHOT ISOLATION: Slice and immediately delete full version
+            df_30min = df_30min_full[df_30min_full.index <= snapshot_dt]
+            del df_30min_full  # Free memory, ensure no accidental use of full data
+
+            required_count = int(candle_count[0])
+            day_df = df_30min[df_30min['date'] == filter_date]
+            if len(day_df) < required_count:
+                return None
+
+            return scan_stock(symbol, df_30min, df_5min, filter_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, trade_obj, inst_cache, inst_cache_lock)
+        except Exception as e:
+            print(f"[PROCESS ERROR] {symbol}: {e}")
+            return None
+
+    # execute symbols in parallel using optimized thread pool
+    max_workers = min(16, (os.cpu_count() or 4) * 2)  # OPTIMIZED: 16 workers max
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_symbol, s): s for s in stocks}
+        for future in as_completed(futures):
+            sym = futures[future]
             try:
-                df_5min = future.result()
-                results_data[symbol] = df_5min
+                res = future.result()
+                if res is not None:
+                    results.append(res)
             except Exception as e:
-                print(f"[SCAN ERROR] {symbol}: Fetch failed - {e}")
-                results_data[symbol] = None
+                print(f"[SCAN ERROR] {sym}: {e}")
+            completed += 1
+            prog = int((completed / total_stocks) * 100) if total_stocks else 100
+            progress_bar.progress(prog)
+            progress_text.text(f"Scanning: {prog}% ({completed}/{total_stocks})")
 
-            # Show single unified progress 0-50% for fetch phase
-            progress_percent = int(((idx + 1) / total_stocks) * 50) if total_stocks else 0
-            progress_bar.progress(progress_percent)
-            progress_text.text(f"Scanning: {progress_percent}% ({idx+1}/{total_stocks})")
-
-    # Merge local inst_cache back into session cache
+    # merge cache back
     try:
         sc = st.session_state.get('instrument_cache', {})
         sc.update(inst_cache)
         st.session_state.instrument_cache = sc
     except Exception:
         pass
-
-    # PROCESS PHASE (parallel with ThreadPoolExecutor for per-stock analysis)
-    processed_count = 0
-    resampled_data = {}
-    
-    # First pass: resample and pre-filter
-    for symbol, df_5min in results_data.items():
-        if df_5min is None or (hasattr(df_5min, 'empty') and df_5min.empty):
-            processed_count += 1
-            continue
-        try:
-            df_30min_30m_full = resample_to_30min(df_5min)
-            df_30min_30m_full = df_30min_30m_full.sort_index()
-            df_30min_30m_full['date'] = df_30min_30m_full.index.to_series().dt.normalize().dt.date
-            if len(df_30min_30m_full) >= 30:
-                available_dates = sorted(set(df_30min_30m_full['date']))
-                chosen_date = filter_date
-                if filter_date not in available_dates:
-                    prior_dates = [d for d in available_dates if d < filter_date]
-                    if prior_dates:
-                        chosen_date = max(prior_dates)
-                    else:
-                        processed_count += 1
-                        continue
-                resampled_data[symbol] = (df_30min_30m_full, df_5min, chosen_date)
-        except Exception as e:
-            print(f"[SCAN ERROR] {symbol}: Resample failed - {e}")
-        processed_count += 1
-        progress_percent = 50 + int((processed_count / total_stocks) * 25)
-        progress_bar.progress(progress_percent)
-
-    # Second pass: parallel per-stock analysis with ThreadPoolExecutor (10 workers)
-    results_lock = threading.Lock()
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures_scan = {
-            executor.submit(scan_stock, symbol, df_30min_30m_full, df_5min, chosen_date, timeframe, candle_count, require_unusual_volume, mode): symbol
-            for symbol, (df_30min_30m_full, df_5min, chosen_date) in resampled_data.items()
-        }
-        
-        scan_completed = 0
-        for future in as_completed(futures_scan):
-            symbol = futures_scan[future]
-            try:
-                result = future.result()
-                if result is not None:
-                    with results_lock:
-                        results.append(result)
-            except Exception as e:
-                print(f"[SCAN ERROR] {symbol}: Analysis failed - {e}")
-            scan_completed += 1
-            progress_percent = 75 + int((scan_completed / len(resampled_data)) * 20) if len(resampled_data) > 0 else 75
-            progress_bar.progress(progress_percent)
 
     # POST-PROCESSING: Build DataFrame, apply SortPriority, sort results, convert back to list
     if results:
