@@ -27,6 +27,7 @@ import hashlib
 import threading
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc  # memory management
 
 # ------------------------------------------------------------------
 # GLOBAL FLAGS / ENVIRONMENT FIXES
@@ -807,7 +808,7 @@ def get_last_trading_day(from_date=None):
 # SCREENING LOGIC FUNCTION
 # =====================================================================
 
-def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, trade_obj=None, inst_cache=None, inst_cache_lock=None):
+def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, confirm_trend=False, trade_obj=None, inst_cache=None, inst_cache_lock=None):
     """
     Analyze a single stock and return result dict or None if filtered out.
     df_30min is expected to be a 30‑minute resampled, snapshot‑filtered
@@ -1326,6 +1327,44 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
         else:
             signal = "Bullish" if conditions_bullish else "Bearish" if conditions_bearish else "No Signal"
 
+        # PART 4: Apply optional strong trend confirmation filter (if enabled)
+        if confirm_trend and signal != "No Signal":
+            try:
+                last_close = first5['Close'].iloc[-1]
+                last_open = first5['Open'].iloc[-1]
+                last_high = first5['High'].iloc[-1]
+                last_low = first5['Low'].iloc[-1]
+                
+                # Calculate candle body % of range (50% threshold)
+                body = abs(last_close - last_open)
+                candle_range = last_high - last_low
+                strong_body = body > (candle_range * 0.5) if candle_range > 0 else False
+                
+                # Volume above 20-candle average
+                avg_volume_20 = df_30min['Volume'].tail(20).mean()
+                last_volume = first5['Volume'].iloc[-1]
+                volume_confirm = last_volume > avg_volume_20 if avg_volume_20 > 0 else False
+                
+                # MA44 confirmation
+                if ma44_list and ma44_list[-1] is not None:
+                    ma44_last = ma44_list[-1]
+                    bullish_ma_confirm = last_close > ma44_last
+                    bearish_ma_confirm = last_close < ma44_last
+                else:
+                    bullish_ma_confirm = False
+                    bearish_ma_confirm = False
+                
+                # Apply filter: if bullish signal but conditions not met, downgrade
+                if signal.startswith("Bullish"):
+                    if not (bullish_ma_confirm and strong_body and volume_confirm):
+                        signal = "No Signal"
+                # Apply filter: if bearish signal but conditions not met, downgrade
+                elif signal.startswith("Bearish"):
+                    if not (bearish_ma_confirm and strong_body and volume_confirm):
+                        signal = "No Signal"
+            except Exception:
+                pass
+
         try:
             if signal == "Sure Bullish" and not bullish_volume_confirmed:
                 signal = "Bullish"
@@ -1435,7 +1474,7 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
         return None
 
 
-def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=None, require_unusual_volume=True, status_text=None):
+def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=None, require_unusual_volume=True, confirm_trend=False, status_text=None):
     """
     Main screening function that returns results list
     Optionally updates results_container in real-time
@@ -1460,6 +1499,7 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
     total_stocks = len(stocks)
     progress_bar = st.progress(0)
     progress_text = st.empty()
+    scan_status = st.empty()  # show current symbol
     status_text = st.empty()
     
     tz = pytz.timezone('Asia/Kolkata')
@@ -1564,20 +1604,33 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             # object and a shared instrument cache.  This avoids touching
             # st.session_state from within a ThreadPoolExecutor worker, which
             # triggers Streamlit warnings and causes `None` to be returned.
-            df_5min = fetch_5min_data_worker(
-                symbol,
-                fetch_start,
-                fetch_end,
-                trade_obj=trade_obj,
-                inst_cache=inst_cache,
-                inst_cache_lock=inst_cache_lock,
-            )
+            df_5min = None
+            # retry loop for robustness against transient API glitches
+            for attempt in range(3):
+                df_5min = fetch_5min_data_worker(
+                    symbol,
+                    fetch_start,
+                    fetch_end,
+                    trade_obj=trade_obj,
+                    inst_cache=inst_cache,
+                    inst_cache_lock=inst_cache_lock,
+                )
+                # validation
+                if df_5min is not None and not (hasattr(df_5min, 'empty') and df_5min.empty):
+                    df_5min = df_5min[~df_5min.index.duplicated(keep="last")]
+                    df_5min = df_5min.sort_index()
+                    df_5min = df_5min.dropna(subset=["Open","High","Low","Close"])
+                    df_5min = df_5min[df_5min["High"] >= df_5min["Low"]]
+                    if len(df_5min) >= 50:
+                        break
+                time.sleep(0.2)
             # EARLY SKIP: If not enough 5min data, skip this symbol
-            if df_5min is None or (hasattr(df_5min, 'empty') and df_5min.empty) or len(df_5min) < 30:
+            if df_5min is None or (hasattr(df_5min, 'empty') and df_5min.empty) or len(df_5min) < 50:
                 return None
 
             df_30min_full = resample_to_30min(df_5min)
             if df_30min_full is None or df_30min_full.empty:
+                del df_5min
                 return None
             df_30min_full = df_30min_full.sort_index()
             df_30min_full['date'] = df_30min_full.index.to_series().dt.normalize().dt.date
@@ -1589,15 +1642,28 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             required_count = int(candle_count[0])
             day_df = df_30min[df_30min['date'] == filter_date]
             if len(day_df) < required_count:
+                del df_5min
+                del df_30min
                 return None
 
-            return scan_stock(symbol, df_30min, df_5min, filter_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, trade_obj, inst_cache, inst_cache_lock)
+            result = scan_stock(symbol, df_30min, df_5min, filter_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, confirm_trend, trade_obj, inst_cache, inst_cache_lock)
+            # memory cleanup
+            try:
+                del df_5min
+            except Exception:
+                pass
+            try:
+                del df_30min
+            except Exception:
+                pass
+            return result
         except Exception as e:
             print(f"[PROCESS ERROR] {symbol}: {e}")
             return None
 
     # execute symbols in parallel using optimized thread pool
-    max_workers = min(16, (os.cpu_count() or 4) * 2)  # OPTIMIZED: 16 workers max
+    # follow recommended formula: CPUs*3 capped at 20
+    max_workers = min(20, (os.cpu_count() or 4) * 3)
     completed = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_symbol, s): s for s in stocks}
@@ -1613,6 +1679,9 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             prog = int((completed / total_stocks) * 100) if total_stocks else 100
             progress_bar.progress(prog)
             progress_text.text(f"Scanning: {prog}% ({completed}/{total_stocks})")
+            # periodically collect garbage to free memory
+            if completed % 10 == 0:
+                gc.collect()
 
     # merge cache back
     try:
@@ -1844,6 +1913,15 @@ def main():
         help="If checked, screening only considers candles with unusual volume (current >2x avg). "
              "Uncheck to ignore unusual-volume requirement."
     )
+    
+    # New: Option for strong trend confirmation filter  
+    confirm_trend = st.checkbox(
+        "Enable Strong Trend Filter",
+        value=False,
+        help="If enabled, applies additional confirmation: price must be above/below MA44, "
+             "strong candle body (>50% range), and volume above 20-candle average. "
+             "Improves signal reliability. Disabled = original strategy behavior."
+    )
     # timeframe is fixed to 30m, no user choice
     
     st.divider()
@@ -1899,7 +1977,8 @@ def main():
             timeframe,
             candle_count,
             results_container=True,
-            require_unusual_volume=require_unusual_volume
+            require_unusual_volume=require_unusual_volume,
+            confirm_trend=confirm_trend
         )
         st.session_state.screening_results = results
         st.session_state.scan_running = False
