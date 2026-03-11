@@ -36,6 +36,10 @@ import gc  # memory management
 # debug flag controls verbose print output; set to False in production
 DEBUG = False
 
+# simple cache for daily data (ema and dataframe) to avoid repeated API calls
+# key: symbol -> {'ema200': float, 'df': DataFrame}
+daily_cache = {}
+
 # force timezone to Asia/Kolkata (required on UTC cloud servers)
 os.environ["TZ"] = "Asia/Kolkata"
 try:
@@ -805,10 +809,108 @@ def get_last_trading_day(from_date=None):
     return from_date
 
 # =====================================================================
+# DAILY DATA HELPER FUNCTION
+# =====================================================================
+
+def fetch_daily_data(symbol, trade_obj=None, inst_cache=None, inst_cache_lock=None):
+    """
+    Fetch the last 250 daily candles and calculate the latest EMA200.
+    Returns the EMA200 value (float) or None if unable to fetch data.
+    Caches results in :data:`daily_cache` to avoid repeated API calls.  Also
+    stores the raw DataFrame under the same cache entry for later use.
+    Thread-safe when trade_obj and inst_cache are provided.
+    """
+    global daily_cache
+    try:
+        # return cached value if available
+        if symbol in daily_cache and 'ema200' in daily_cache[symbol]:
+            return daily_cache[symbol]['ema200']
+
+        trade = trade_obj if trade_obj is not None else st.session_state.get('alice_trade')
+        if not trade:
+            return None
+        
+        sym = symbol.split('.NS')[0] if symbol.upper().endswith('.NS') else symbol
+        
+        # Get instrument
+        inst = get_instrument_cached(symbol, trade_obj=trade, inst_cache=inst_cache, inst_cache_lock=inst_cache_lock)
+        if inst is None:
+            return None
+        
+        # Fetch last 250 daily candles
+        tz = pytz.timezone('Asia/Kolkata')
+        to_dt = datetime.now(tz)
+        from_dt = to_dt - timedelta(days=365)  # Go back ~1 year to get 250 business days
+        
+        try:
+            df = trade.get_HistoricalData(
+                instrument=inst,
+                resolution="D",
+                from_datetime=from_dt,
+                to_datetime=to_dt,
+                indices=False
+            )
+        except Exception as e:
+            print(f"[DAILY] {symbol}: Failed to fetch daily data - {e}")
+            return None
+        
+        if df is None or isinstance(df, dict) and 'emsg' in df:
+            return None
+        
+        # Handle different response formats
+        if isinstance(df, dict) and 'data' in df:
+            df = pd.DataFrame(df['data'])
+        elif isinstance(df, list):
+            df = pd.DataFrame(df)
+        elif not isinstance(df, pd.DataFrame):
+            try:
+                df = pd.DataFrame(df)
+            except Exception:
+                return None
+        
+        if df.empty or len(df) < 20:
+            return None
+        
+        # Handle datetime column
+        if 'datetime' in df.columns:
+            try:
+                df['datetime'] = pd.to_datetime(df['datetime'])
+                df.set_index('datetime', inplace=True)
+            except Exception:
+                pass
+        
+        # Ensure we have Close column
+        if 'Close' not in df.columns:
+            cols_lower = {col.lower(): col for col in df.columns}
+            if 'close' in cols_lower:
+                df = df.rename(columns={cols_lower['close']: 'Close'})
+            else:
+                return None
+        
+        # Calculate EMA200
+        try:
+            ema200 = df['Close'].ewm(span=200, adjust=False).mean()
+            latest_ema200 = ema200.iloc[-1]
+            
+            if pd.isna(latest_ema200) or latest_ema200 <= 0:
+                return None
+            
+            # cache both the value and dataframe for downstream use
+            daily_cache[symbol] = {'ema200': float(latest_ema200), 'df': df}
+            return float(latest_ema200)
+        except Exception as e:
+            print(f"[DAILY] {symbol}: Failed to calculate EMA200 - {e}")
+            return None
+    
+    except Exception as e:
+        print(f"[DAILY] {symbol}: Error in fetch_daily_data - {e}")
+        return None
+
+# =====================================================================
 # SCREENING LOGIC FUNCTION
 # =====================================================================
 
-def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, confirm_trend=False, trade_obj=None, inst_cache=None, inst_cache_lock=None):
+def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, confirm_trend=False, daily_trend_filter=False, trade_obj=None, inst_cache=None, inst_cache_lock=None):
     """
     Analyze a single stock and return result dict or None if filtered out.
     df_30min is expected to be a 30‑minute resampled, snapshot‑filtered
@@ -835,6 +937,22 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
 
         first5 = day_30min.head(CANDLES_START)
 
+        # =====================================================================
+        # TRUE CANDLE SNAPSHOT LOGIC - Use only selected candle count
+        # =====================================================================
+        # Convert candle_count to number (e.g., "5C" -> 5)
+        selected_candles = int(candle_count[0]) if candle_count and candle_count[0].isdigit() else 5
+        
+        # Safety check: ensure we have enough candles
+        if len(day_30min) < selected_candles:
+            return None
+        
+        # Create snapshot dataframe with exactly selected_candles
+        snapshot_df = day_30min.head(selected_candles).copy()
+        
+        # All subsequent calculations must use snapshot_df instead of df_30min
+        # =====================================================================
+
         # after snapshot slicing we only use df_30min for everything
         ma44_source = df_30min
 
@@ -853,7 +971,7 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
                 pass
         
         ma44_list = []
-        for ma_idx in first5.index:
+        for ma_idx in snapshot_df.index:
             try:
                 if ma_idx in ma44_series.index:
                     ma44_val = ma44_series.loc[ma_idx]
@@ -868,7 +986,7 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             ma44_list.append(ma44_val)
 
         # --- ANALYSIS LOGIC (UNCHANGED) ---
-        prior_data = df_30min[df_30min.index < first5.index[0]].tail(44)
+        prior_data = df_30min[df_30min.index < snapshot_df.index[0]].tail(44)
         supports = []
         for i in range(1, len(prior_data)-1):
             if (prior_data['Low'].iloc[i] < prior_data['Low'].iloc[i-1] and 
@@ -879,7 +997,7 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             if (prior_data['High'].iloc[i] > prior_data['High'].iloc[i-1] and 
                 prior_data['High'].iloc[i] > prior_data['High'].iloc[i+1]):
                 resistances.append(prior_data['High'].iloc[i])
-        current_price = first5['Close'].iloc[-1]
+        current_price = snapshot_df['Close'].iloc[-1]
         closest_support = min(supports, key=lambda x: abs(x - current_price)) if supports else None
         closest_resistance = min(resistances, key=lambda x: abs(x - current_price)) if resistances else None
         price_near_level = False
@@ -907,32 +1025,32 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             df_30min['VRSI'] = 100 - (100 / (1 + vol_rs))
 
         try:
-            rsi_at_4th = df_30min.loc[first5.index[-1], 'RSI']
-            vrsi_at_4th = df_30min.loc[first5.index[-1], 'VRSI']
+            rsi_at_4th = df_30min.loc[snapshot_df.index[-1], 'RSI']
+            vrsi_at_4th = df_30min.loc[snapshot_df.index[-1], 'VRSI']
         except Exception:
             rsi_at_4th = None
             vrsi_at_4th = None
 
         volume_profile = []
         price_levels = []
-        for i in range(CANDLES_START):
-            candle = first5.iloc[i]
+        for i in range(len(snapshot_df)):
+            candle = snapshot_df.iloc[i]
             vol = candle['Volume']
             price = (candle['High'] + candle['Low']) / 2
             volume_profile.append(vol)
             price_levels.append(price)
 
             # Use the snapshot-filtered 30-min data for volume calculations
-            avg_volume = df_30min['Volume'].mean()
+            avg_volume = snapshot_df['Volume'].mean()
         institutional_volume = all(v > 1.2 * avg_volume for v in volume_profile)
 
         body_ratios = []
         shadows_ratios = []
-        for i in range(CANDLES_START):
-            o = first5['Open'].iloc[i]
-            c = first5['Close'].iloc[i]
-            h = first5['High'].iloc[i]
-            l = first5['Low'].iloc[i]
+        for i in range(len(snapshot_df)):
+            o = snapshot_df['Open'].iloc[i]
+            c = snapshot_df['Close'].iloc[i]
+            h = snapshot_df['High'].iloc[i]
+            l = snapshot_df['Low'].iloc[i]
             body = abs(c - o)
             rng = h - l
             body_ratio = (body / rng) if rng > 0 else 0
@@ -946,22 +1064,22 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             body_ratios.append(body_ratio)
             shadows_ratios.append(shadow_ratio)
 
-        price_gaps = [abs(first5['Close'].iloc[i] - first5['Open'].iloc[i+1])/first5['Close'].iloc[i] 
-                     for i in range(CANDLES_START-1)]
+        price_gaps = [abs(snapshot_df['Close'].iloc[i] - snapshot_df['Open'].iloc[i+1])/snapshot_df['Close'].iloc[i] 
+                     for i in range(len(snapshot_df)-1)]
         no_gaps = all(gap < 0.003 for gap in price_gaps)
 
-        price_range = abs(first5['Close'].iloc[-1] - first5['Close'].iloc[0])
-        avg_candle_size = (first5['High'] - first5['Low']).mean()
-        current_volatility = first5['High'].sub(first5['Low']).std()
+        price_range = abs(snapshot_df['Close'].iloc[-1] - snapshot_df['Close'].iloc[0])
+        avg_candle_size = (snapshot_df['High'] - snapshot_df['Low']).mean()
+        current_volatility = snapshot_df['High'].sub(snapshot_df['Low']).std()
         historical_volatility = prior_data['High'].sub(prior_data['Low']).std()
         volatility_ratio = current_volatility / historical_volatility if historical_volatility > 0 else 1
         price_acceleration = [
-            first5['Close'].iloc[i] - first5['Close'].iloc[i-1] for i in range(1, CANDLES_START)
+            snapshot_df['Close'].iloc[i] - snapshot_df['Close'].iloc[i-1] for i in range(1, len(snapshot_df))
         ]
         accelerating_momentum = all(price_acceleration[i] >= price_acceleration[i-1] 
                                  for i in range(1, len(price_acceleration)))
-        vwap = (first5['Close'] * first5['Volume']).sum() / first5['Volume'].sum()
-        vwap_trend = first5['Close'].iloc[-1] > vwap
+        vwap = (snapshot_df['Close'] * snapshot_df['Volume']).sum() / snapshot_df['Volume'].sum()
+        vwap_trend = snapshot_df['Close'].iloc[-1] > vwap
         adx = 0.0
         if len(prior_data) >= 20:
             adx_window = 14
@@ -977,10 +1095,14 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             pos_di = 100 * (pos_dm.rolling(adx_window).mean() / atr)
             neg_di = 100 * (neg_dm.rolling(adx_window).mean() / atr)
             dx = 100 * np.abs(pos_di - neg_di) / (pos_di + neg_di + 1e-10)
-            adx = dx.rolling(adx_window).mean().iloc[-1]
+            adx_series = dx.rolling(adx_window).mean()  # Keep series for rising check
+            adx = adx_series.iloc[-1]
+            previous_adx = adx_series.iloc[-2] if len(adx_series) >= 2 else adx
             strong_trend = adx > 25
         else:
             strong_trend = True
+            adx_series = None
+            previous_adx = None
 
         strong_momentum = (
             price_range > (2 * avg_candle_size) and
@@ -993,34 +1115,36 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             (price_near_level or vwap_trend)
         )
 
-        short_ma = df_30min['Close'].rolling(5).mean()
-        medium_ma = df_30min['Close'].rolling(10).mean()
-        long_ma = df_30min['Close'].rolling(20).mean()
-        last_idx = df_30min.index.get_loc(first5.index[-1])
+        df_ma = df_30min[df_30min.index <= snapshot_df.index[-1]]
+
+        short_ma = df_ma['Close'].rolling(5).mean()
+        medium_ma = df_ma['Close'].rolling(10).mean()
+        long_ma = df_ma['Close'].rolling(20).mean()
+        last_idx = short_ma.index.get_loc(snapshot_df.index[-1])
         ma_alignment_bull = (short_ma.iloc[last_idx] > medium_ma.iloc[last_idx] > long_ma.iloc[last_idx])
         ma_alignment_bear = (short_ma.iloc[last_idx] < medium_ma.iloc[last_idx] < long_ma.iloc[last_idx])
-        closes_increasing = all(first5['Close'].iloc[i] > first5['Close'].iloc[i-1] for i in range(1, CANDLES_START))
-        closes_decreasing = all(first5['Close'].iloc[i] < first5['Close'].iloc[i-1] for i in range(1, CANDLES_START))
+        closes_increasing = all(snapshot_df['Close'].iloc[i] > snapshot_df['Close'].iloc[i-1] for i in range(1, len(snapshot_df)))
+        closes_decreasing = all(snapshot_df['Close'].iloc[i] < snapshot_df['Close'].iloc[i-1] for i in range(1, len(snapshot_df)))
         
         tol = MA_TOLERANCE_PCT
         bullish_ma = all(
             (ma44_list[i] is not None) and
-            (first5['Open'].iloc[i] > ma44_list[i] * (1 + tol)) and
-            (first5['High'].iloc[i] > ma44_list[i] * (1 + tol)) and
-            (first5['Low'].iloc[i] > ma44_list[i] * (1 + tol)) and
-            (first5['Close'].iloc[i] > ma44_list[i] * (1 + tol))
-            for i in range(CANDLES_START)
+            (snapshot_df['Open'].iloc[i] > ma44_list[i] * (1 + tol)) and
+            (snapshot_df['High'].iloc[i] > ma44_list[i] * (1 + tol)) and
+            (snapshot_df['Low'].iloc[i] > ma44_list[i] * (1 + tol)) and
+            (snapshot_df['Close'].iloc[i] > ma44_list[i] * (1 + tol))
+            for i in range(len(snapshot_df))
         )
         bearish_ma = all(
             (ma44_list[i] is not None) and
-            (first5['Open'].iloc[i] < ma44_list[i] * (1 - tol)) and
-            (first5['High'].iloc[i] < ma44_list[i] * (1 - tol)) and
-            (first5['Low'].iloc[i] < ma44_list[i] * (1 - tol)) and
-            (first5['Close'].iloc[i] < ma44_list[i] * (1 - tol))
-            for i in range(CANDLES_START)
+            (snapshot_df['Open'].iloc[i] < ma44_list[i] * (1 - tol)) and
+            (snapshot_df['High'].iloc[i] < ma44_list[i] * (1 - tol)) and
+            (snapshot_df['Low'].iloc[i] < ma44_list[i] * (1 - tol)) and
+            (snapshot_df['Close'].iloc[i] < ma44_list[i] * (1 - tol))
+            for i in range(len(snapshot_df))
         )
         
-        avg_vol_recent = first5['Volume'].mean()
+        avg_vol_recent = snapshot_df['Volume'].mean()
         avg_vol_prior = df_30min[df_30min['date'] < chosen_date].tail(44)['Volume'].mean()
         strong_volume = avg_vol_recent > 1.5 * avg_vol_prior
         strong_bodies = all(r > 0.6 for r in body_ratios)
@@ -1031,7 +1155,7 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
         prev_day_data = df_30min[df_30min['date'] < chosen_date].tail(13)
         prev_high = prev_day_data['High'].max() if not prev_day_data.empty else None
         prev_low = prev_day_data['Low'].min() if not prev_day_data.empty else None
-        last_close = first5['Close'].iloc[-1]
+        last_close = snapshot_df['Close'].iloc[-1]
         breakout_bull = (prev_high is not None) and (last_close > prev_high)
         breakout_bear = (prev_low is not None) and (last_close < prev_low)
         
@@ -1073,7 +1197,7 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             else:
                 df_1h = pd.DataFrame()
             ma20_1h = df_1h['Close'].rolling(20).mean()
-            df_1h = df_1h.loc[df_1h.index <= first5.index[-1]]
+            df_1h = df_1h.loc[df_1h.index <= snapshot_df.index[-1]]
             if not df_1h.empty and len(ma20_1h.dropna()) >= 2:
                 ma20_1h_last = ma20_1h.loc[df_1h.index[-1]]
                 ma20_1h_prev = ma20_1h.loc[df_1h.index[-2]] if len(ma20_1h.dropna()) >= 2 else ma20_1h_last
@@ -1085,20 +1209,20 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             ma20_1h_last = None
             ma20_1h_slope = 0
 
-        ma1h_confirmation_bull = ma20_1h_last is not None and first5['Close'].iloc[-1] > ma20_1h_last
-        ma1h_confirmation_bear = ma20_1h_last is not None and first5['Close'].iloc[-1] < ma20_1h_last
+        ma1h_confirmation_bull = ma20_1h_last is not None and snapshot_df['Close'].iloc[-1] > ma20_1h_last
+        ma1h_confirmation_bear = ma20_1h_last is not None and snapshot_df['Close'].iloc[-1] < ma20_1h_last
 
         breakout_retest_bull = False
         breakout_retest_bear = False
         if prev_high is not None:
             try:
-                prior_lows = first5['Low'].iloc[:-1]
+                prior_lows = snapshot_df['Low'].iloc[:-1]
                 breakout_retest_bull = breakout_bull and (prior_lows.min() < prev_high)
             except Exception:
                 breakout_retest_bull = breakout_bull
         if prev_low is not None:
             try:
-                prior_highs = first5['High'].iloc[:-1]
+                prior_highs = snapshot_df['High'].iloc[:-1]
                 breakout_retest_bear = breakout_bear and (prior_highs.max() > prev_low)
             except Exception:
                 breakout_retest_bear = breakout_bear
@@ -1136,25 +1260,25 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
         atr_ok = (atr_pct is not None) and (0.4 <= atr_pct <= 3.5)
 
         try:
-            last_range = first5['High'].iloc[-1] - first5['Low'].iloc[-1]
-            avg_range = (first5['High'] - first5['Low']).mean()
+            last_range = snapshot_df['High'].iloc[-1] - snapshot_df['Low'].iloc[-1]
+            avg_range = (snapshot_df['High'] - snapshot_df['Low']).mean()
             range_expansion = last_range > 1.2 * avg_range
         except Exception:
             range_expansion = False
         try:
-            volume_expansion = first5['Volume'].iloc[-1] > 1.8 * avg_vol_recent
+            volume_expansion = snapshot_df['Volume'].iloc[-1] > 1.8 * avg_vol_recent
         except Exception:
             volume_expansion = False
 
         # --- VOLUME LOGIC (CORE) ---
         try:
-            prior_for_avg = ma44_source[ma44_source.index < first5.index[0]]
+            prior_for_avg = ma44_source[ma44_source.index < snapshot_df.index[0]]
             avg_volume_20 = prior_for_avg['Volume'].tail(20).mean() if not prior_for_avg.empty else None
         except Exception:
             avg_volume_20 = None
 
         try:
-            current_vol = float(first5['Volume'].iloc[-1])
+            current_vol = float(snapshot_df['Volume'].iloc[-1])
         except Exception:
             current_vol = None
 
@@ -1167,10 +1291,10 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             vol_seq_ok = False
             pos = None
             try:
-                pos = df_30min.index.get_loc(first5.index[-1])
+                pos = df_30min.index.get_loc(snapshot_df.index[-1])
             except Exception:
                 try:
-                    pos = df_30min.index.get_indexer_for([first5.index[-1]])[0]
+                    pos = df_30min.index.get_indexer_for([snapshot_df.index[-1]])[0]
                 except Exception:
                     pos = None
 
@@ -1179,9 +1303,9 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
                 v_prev2 = float(df_30min['Volume'].iloc[pos-2])
                 vol_seq_ok = (current_vol is not None) and (current_vol > v_prev) and (v_prev > v_prev2)
             else:
-                if len(first5) >= 3:
-                    v_prev = float(first5['Volume'].iloc[-2])
-                    v_prev2 = float(first5['Volume'].iloc[-3])
+                if len(snapshot_df) >= 3:
+                    v_prev = float(snapshot_df['Volume'].iloc[-2])
+                    v_prev2 = float(snapshot_df['Volume'].iloc[-3])
                     vol_seq_ok = (current_vol is not None) and (current_vol > v_prev) and (v_prev > v_prev2)
         except Exception:
             vol_seq_ok = False
@@ -1192,10 +1316,10 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             volume_confirmed = False
 
         try:
-            last_o = first5['Open'].iloc[-1]
-            last_h = first5['High'].iloc[-1]
-            last_l = first5['Low'].iloc[-1]
-            last_c = first5['Close'].iloc[-1]
+            last_o = snapshot_df['Open'].iloc[-1]
+            last_h = snapshot_df['High'].iloc[-1]
+            last_l = snapshot_df['Low'].iloc[-1]
+            last_c = snapshot_df['Close'].iloc[-1]
         except Exception:
             last_o = last_h = last_l = last_c = None
 
@@ -1233,22 +1357,22 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
         rsi = 100 - (100 / (1 + rs))
 
         bullish_candle_pattern = (body_ratios[-1] > 0.6 and 
-                                first5['Close'].iloc[-1] > first5['Open'].iloc[-1] and
-                                first5['Close'].iloc[-1] > first5['Close'].iloc[-2])
+                                snapshot_df['Close'].iloc[-1] > snapshot_df['Open'].iloc[-1] and
+                                snapshot_df['Close'].iloc[-1] > snapshot_df['Close'].iloc[-2])
 
         bearish_candle_pattern = (body_ratios[-1] > 0.6 and 
-                                first5['Close'].iloc[-1] < first5['Open'].iloc[-1] and
-                                first5['Close'].iloc[-1] < first5['Close'].iloc[-2])
+                                snapshot_df['Close'].iloc[-1] < snapshot_df['Open'].iloc[-1] and
+                                snapshot_df['Close'].iloc[-1] < snapshot_df['Close'].iloc[-2])
 
         bullish_trend = all(ma44_list[i] < ma44_list[i+1] for i in range(len(ma44_list)-1))
         bearish_trend = all(ma44_list[i] > ma44_list[i+1] for i in range(len(ma44_list)-1))
-        volume_ok = first5['Volume'].iloc[-1] > 1.2 * avg_vol_recent
+        volume_ok = snapshot_df['Volume'].iloc[-1] > 1.2 * avg_vol_recent
         rsi_ok = (30 <= rsi.iloc[-1] <= 70) if not rsi.empty else False
 
         bullish_conditions = {
             'strong_bodies': strong_bodies and all(r > 0.65 for r in body_ratios),
             'clean_shadows': all(s < 0.25 for s in shadows_ratios),
-            'bullish_candles': all(first5['Close'] > first5['Open']),
+            'bullish_candles': all(snapshot_df['Close'] > snapshot_df['Open']),
             'higher_highs': closes_increasing,
             'above_ma': bullish_ma_touch,
             'resistance_break': breakout_bull,
@@ -1269,7 +1393,7 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
         bearish_conditions = {
             'strong_bodies': strong_bodies and all(r > 0.65 for r in body_ratios),
             'clean_shadows': all(s < 0.25 for s in shadows_ratios),
-            'bearish_candles': all(first5['Close'] < first5['Open']),
+            'bearish_candles': all(snapshot_df['Close'] < snapshot_df['Open']),
             'lower_lows': closes_decreasing,
             'below_ma': bearish_ma_touch,
             'support_break': breakout_bear,
@@ -1312,11 +1436,11 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
         sure_bearish = (bear_score >= SURE_THRESHOLD) and bear_essential
 
         conditions_bullish = (
-            all(first5['Close'] > first5['Open']) and
+            all(snapshot_df['Close'] > snapshot_df['Open']) and
             bullish_ma
         )
         conditions_bearish = (
-            all(first5['Close'] < first5['Open']) and
+            all(snapshot_df['Close'] < snapshot_df['Open']) and
             bearish_ma
         )
 
@@ -1327,13 +1451,152 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
         else:
             signal = "Bullish" if conditions_bullish else "Bearish" if conditions_bearish else "No Signal"
 
+        # =====================================================================
+        # HARD GATE CONFIRMATIONS - Applied before final signal decision
+        # =====================================================================
+        
+        # Gate 1: Multi-Timeframe Confirmation (Daily EMA200)
+        # Calculate BOTH bullish and bearish trend conditions independently
+        daily_ema200 = None
+        bullish_daily_trend = False
+        bearish_daily_trend = False
+        try:
+            daily_ema200 = fetch_daily_data(symbol, trade_obj=trade_obj, inst_cache=inst_cache, inst_cache_lock=inst_cache_lock)
+            if daily_ema200 is not None:
+                bullish_daily_trend = (last_close > daily_ema200)
+                bearish_daily_trend = (last_close < daily_ema200)
+        except Exception as e:
+            print(f"[GATE-EMA200] {symbol}: {e}")
+            bullish_daily_trend = False
+            bearish_daily_trend = False
+        
+        # Gate 2: Strong Candle Body Filter (>75% of candle range)
+        strong_body_candle = False
+        try:
+            last_o = snapshot_df['Open'].iloc[-1]
+            last_c = snapshot_df['Close'].iloc[-1]
+            last_h = snapshot_df['High'].iloc[-1]
+            last_l = snapshot_df['Low'].iloc[-1]
+            body = abs(last_c - last_o)
+            candle_range = last_h - last_l
+            if candle_range > 0:
+                body_ratio = body / candle_range
+                strong_body_candle = body_ratio > 0.75
+            else:
+                body_ratio = 0.0
+                strong_body_candle = False
+        except Exception:
+            body_ratio = 0.0
+            strong_body_candle = False
+        
+        # Gate 3: Volume Pressure Filter (>=2.0x average volume)
+        volume_pressure_confirmed = False
+        try:
+            if avg_volume_20 is not None and current_vol is not None:
+                volume_pressure_confirmed = (current_vol >= 2.0 * avg_volume_20)
+        except Exception:
+            volume_pressure_confirmed = False
+        
+        # Gate 4: ADX Trend Confirmation (ADX > 25 and ADX rising)
+        adx_strong = False
+        adx_rising = False
+        try:
+            if adx is not None and adx > 0:
+                adx_strong = (adx > 25)
+                # Check if ADX is rising by comparing current to previous
+                if previous_adx is not None:
+                    adx_rising = (adx > previous_adx)
+                else:
+                    adx_rising = False
+        except Exception:
+            adx_strong = False
+            adx_rising = False
+        
+        # Gate 5: VWAP Confirmation (price above/below VWAP) - calculate independently
+        vwap_bullish = False
+        vwap_bearish = False
+        try:
+            vwap_bullish = (last_close > vwap)
+            vwap_bearish = (last_close < vwap)
+        except Exception:
+            vwap_bullish = False
+            vwap_bearish = False
+        
+        # Gate 6: Overextension Filter (distance from MA44)
+        # NOTE: Overextension only relabels the signal, does NOT block it in hard gates
+        distance_from_ma = 0.0
+        is_overextended = False
+        try:
+            if ma44_list and len(ma44_list) >= CANDLES_START and ma44_list[CANDLES_START-1]:
+                ma44_value = ma44_list[CANDLES_START-1]
+                if ma44_value > 0:
+                    distance_from_ma = abs(last_close - ma44_value) / ma44_value * 100
+                    is_overextended = (distance_from_ma > 2.5)
+        except Exception:
+            distance_from_ma = 0.0
+            is_overextended = False
+        
+        # Gate 7: Apply Overextension Relabeling (relabel only, does NOT block signal)
+        if is_overextended and signal.startswith("Sure"):
+            if signal == "Sure Bullish":
+                signal = "Overextended Bullish"
+            elif signal == "Sure Bearish":
+                signal = "Overextended Bearish"
+        
+        # Gate 8: Hard Gate Logic for "Sure" Signals
+        # All required gates must pass for "Sure Bullish" or "Sure Bearish" to remain
+        # NOTE: is_overextended is NOT included in the gates (only relabels)
+        if signal == "Sure Bullish":
+            all_gates_pass = all([
+                bullish_daily_trend,       # Must be above Daily EMA200
+                strong_body_candle,        # Must have body > 75% of range
+                volume_pressure_confirmed, # Must have 2x volume
+                adx_strong,                # Must have ADX > 25
+                adx_rising,                # Must have ADX rising
+                vwap_bullish               # Must be above VWAP
+            ])
+            if not all_gates_pass:
+                signal = "Bullish"  # Downgrade to regular Bullish
+        
+        elif signal == "Sure Bearish":
+            all_gates_pass = all([
+                bearish_daily_trend,       # Must be below Daily EMA200
+                strong_body_candle,        # Must have body > 75% of range
+                volume_pressure_confirmed, # Must have 2x volume
+                adx_strong,                # Must have ADX > 25
+                adx_rising,                # Must have ADX rising
+                vwap_bearish               # Must be below VWAP
+            ])
+            if not all_gates_pass:
+                signal = "Bearish"  # Downgrade to regular Bearish
+        
+        # Debug Dictionary - Verify all hard gate conditions
+        hard_gate_debug = {
+            "daily_ema_bull": bullish_daily_trend,
+            "daily_ema_bear": bearish_daily_trend,
+            "body_ratio": float(body_ratio),
+            "body_ratio_check": strong_body_candle,
+            "volume": volume_pressure_confirmed,
+            "adx_strong": adx_strong,
+            "adx_rising": adx_rising,
+            "vwap_bull": vwap_bullish,
+            "vwap_bear": vwap_bearish,
+            "overextended": is_overextended,
+            "distance_from_ma": float(distance_from_ma),
+            "final_signal": signal
+        }
+        
+        # Only print debug data if it's a Sure signal (for verification)
+        if signal.startswith("Sure") or signal.startswith("Overextended"):
+            print(f"[HARD-GATE] {symbol}: {hard_gate_debug}")
+        
         # PART 4: Apply optional strong trend confirmation filter (if enabled)
         if confirm_trend and signal != "No Signal":
             try:
-                last_close = first5['Close'].iloc[-1]
-                last_open = first5['Open'].iloc[-1]
-                last_high = first5['High'].iloc[-1]
-                last_low = first5['Low'].iloc[-1]
+                last_close = snapshot_df['Close'].iloc[-1]
+                last_open = snapshot_df['Open'].iloc[-1]
+                last_high = snapshot_df['High'].iloc[-1]
+                last_low = snapshot_df['Low'].iloc[-1]
                 
                 # Calculate candle body % of range (50% threshold)
                 body = abs(last_close - last_open)
@@ -1341,8 +1604,8 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
                 strong_body = body > (candle_range * 0.5) if candle_range > 0 else False
                 
                 # Volume above 20-candle average
-                avg_volume_20 = df_30min['Volume'].tail(20).mean()
-                last_volume = first5['Volume'].iloc[-1]
+                avg_volume_20 = snapshot_df['Volume'].tail(20).mean()
+                last_volume = snapshot_df['Volume'].iloc[-1]
                 volume_confirm = last_volume > avg_volume_20 if avg_volume_20 > 0 else False
                 
                 # MA44 confirmation
@@ -1378,6 +1641,67 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
         except Exception:
             pass
 
+        # -------------------------------------------------------
+        # DAILY TREND FILTER (optional)
+        # -------------------------------------------------------
+        daily_ma44 = None
+        daily_ma200 = None
+        daily_close = None
+        daily_bullish_trend = False
+        daily_bearish_trend = False
+        if daily_trend_filter:
+            # ensure daily data is cached
+            if symbol not in daily_cache or 'df' not in daily_cache[symbol]:
+                # this call will populate cache
+                _ = fetch_daily_data(symbol, trade_obj=trade_obj, inst_cache=inst_cache, inst_cache_lock=inst_cache_lock)
+            df_daily = daily_cache.get(symbol, {}).get('df')
+            if df_daily is not None and not df_daily.empty:
+                try:
+                    df_local = df_daily.copy()
+                    df_local['daily_ma44'] = df_local['Close'].rolling(44).mean()
+                    df_local['daily_ma200'] = df_local['Close'].rolling(200).mean()
+                    daily_ma44 = df_local['daily_ma44'].iloc[-1]
+                    daily_ma200 = df_local['daily_ma200'].iloc[-1]
+                    daily_close = df_local['Close'].iloc[-1]
+                except Exception:
+                    daily_ma44 = None
+                    daily_ma200 = None
+                    daily_close = None
+            # intraday 30-min trend
+            try:
+                last_candles = df_30min.tail(6)
+                green_candles = all(last_candles['Close'] > last_candles['Open'])
+                red_candles = all(last_candles['Close'] < last_candles['Open'])
+                ma44_last = ma44_list[CANDLES_START-1] if ma44_list and len(ma44_list) >= CANDLES_START else None
+                above_ma44 = all(last_candles['Close'] > ma44_last) if ma44_last is not None else False
+                below_ma44 = all(last_candles['Close'] < ma44_last) if ma44_last is not None else False
+
+                daily_bullish_trend = (
+                    daily_ma44 is not None and daily_ma200 is not None and daily_close is not None and
+                    (daily_ma44 > daily_ma200) and
+                    (daily_close > daily_ma44) and
+                    (daily_close > daily_ma200) and
+                    green_candles and above_ma44
+                )
+                daily_bearish_trend = (
+                    daily_ma44 is not None and daily_ma200 is not None and daily_close is not None and
+                    (daily_ma44 < daily_ma200) and
+                    (daily_close < daily_ma44) and
+                    (daily_close < daily_ma200) and
+                    red_candles and below_ma44
+                )
+
+            except Exception:
+                daily_bullish_trend = False
+                daily_bearish_trend = False
+
+            # apply filter to final signal
+            if signal in ["Bullish", "Sure Bullish"] and not daily_bullish_trend:
+                signal = "No Signal"
+            if signal in ["Bearish", "Sure Bearish"] and not daily_bearish_trend:
+                signal = "No Signal"
+        # -------------------------------------------------------
+
         # always apply 44MA filter : candles must stay above/below MA44 for bullish/bearish
         if signal.startswith("Bullish") and last_c is not None and ma44_list and ma44_list[-1] is not None:
             if last_c <= ma44_list[-1]:
@@ -1386,10 +1710,10 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             if last_c >= ma44_list[-1]:
                 return None
 
-        volume_status = "High" if first5['Volume'].mean() > df_30min['Volume'].mean() else "Low"
+        volume_status = "High" if snapshot_df['Volume'].mean() > df_30min['Volume'].mean() else "Low"
 
-        first_open = first5.iloc[0]['Open']
-        last_close = first5.iloc[len(first5) - 1]['Close']
+        first_open = snapshot_df.iloc[0]['Open']
+        last_close = snapshot_df.iloc[len(snapshot_df) - 1]['Close']
         if first_open and last_close:
             move_pct = ((last_close - first_open) / first_open) * 100
             if move_pct > 0.5:
@@ -1406,26 +1730,26 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             top_gainer_loser = "NA"
 
         try:
-            prior_30min = df_30min[df_30min.index < first5.index[0]] if (not df_30min.empty and len(first5) > 0) else pd.DataFrame()
+            prior_30min = df_30min[df_30min.index < snapshot_df.index[0]] if (not df_30min.empty and len(snapshot_df) > 0) else pd.DataFrame()
             prior_vol = prior_30min['Volume'].tail(44).mean() if len(prior_30min) >= 44 else None
         except Exception:
             prior_30min = pd.DataFrame()
             prior_vol = None
-        first5_vol = first5['Volume'].mean()
-        volume_spike = "Yes" if prior_vol and first5_vol > 1.5 * prior_vol else "No"
+        snapshot_vol = snapshot_df['Volume'].mean()
+        volume_spike = "Yes" if prior_vol and snapshot_vol > 1.5 * prior_vol else "No"
 
         ma_distance = "NA"
         try:
-            if ma44_list and len(ma44_list) >= CANDLES_START and ma44_list[CANDLES_START-1] and len(first5) >= CANDLES_START and first5.iloc[CANDLES_START-1]['Close']:
-                ma_distance_val = ((first5.iloc[CANDLES_START-1]['Close'] - ma44_list[CANDLES_START-1]) / ma44_list[CANDLES_START-1]) * 100
+            if ma44_list and len(ma44_list) >= len(snapshot_df) and ma44_list[len(snapshot_df)-1] and len(snapshot_df) >= len(snapshot_df) and snapshot_df.iloc[len(snapshot_df)-1]['Close']:
+                ma_distance_val = ((snapshot_df.iloc[len(snapshot_df)-1]['Close'] - ma44_list[len(snapshot_df)-1]) / ma44_list[len(snapshot_df)-1]) * 100
                 ma_distance = f"{ma_distance_val:.2f}%"
         except Exception:
             ma_distance = "NA"
 
         strength_score = 0
-        if all(first5['Close'] > first5['Open']):
+        if all(snapshot_df['Close'] > snapshot_df['Open']):
             strength_score += 2
-        elif all(first5['Close'] < first5['Open']):
+        elif all(snapshot_df['Close'] < snapshot_df['Open']):
             strength_score -= 2
         if volume_spike == "Yes":
             strength_score += 1 if signal == "Bullish" else -1
@@ -1434,6 +1758,12 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
                 strength_score += 1 if signal == "Bullish" else -1
         except:
             pass
+
+        # Ensure daily MA values always exist for result display
+        if daily_ma44 is None:
+            daily_ma44 = "NA"
+        if daily_ma200 is None:
+            daily_ma200 = "NA"
 
         result = {
             "Symbol": symbol,
@@ -1447,18 +1777,20 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
             "Top": top_gainer_loser,
             "Volume Spike": volume_spike,
             "MA Distance": ma_distance,
-            "1st Open": first5.iloc[0]['Open'] if len(first5) > 0 else None,
-            "1st Close": first5.iloc[0]['Close'] if len(first5) > 0 else None,
-            "2nd Open": first5.iloc[1]['Open'] if len(first5) > 1 else None,
-            "2nd Close": first5.iloc[1]['Close'] if len(first5) > 1 else None,
-            "3rd Open": first5.iloc[2]['Open'] if len(first5) > 2 else None,
-            "3rd Close": first5.iloc[2]['Close'] if len(first5) > 2 else None,
-            "4th Open": first5.iloc[3]['Open'] if len(first5) > 3 else None,
-            "4th Close": first5.iloc[3]['Close'] if len(first5) > 3 else None,
-            "5th Open": first5.iloc[4]['Open'] if len(first5) > 4 else None,
-            "5th Close": first5.iloc[4]['Close'] if len(first5) > 4 else None,
-            "6th Open": first5.iloc[5]['Open'] if len(first5) > 5 else None,
-            "6th Close": first5.iloc[5]['Close'] if len(first5) > 5 else None,
+            "Daily_MA44": daily_ma44,
+            "Daily_MA200": daily_ma200,
+            "1st Open": snapshot_df.iloc[0]['Open'] if len(snapshot_df) > 0 else None,
+            "1st Close": snapshot_df.iloc[0]['Close'] if len(snapshot_df) > 0 else None,
+            "2nd Open": snapshot_df.iloc[1]['Open'] if len(snapshot_df) > 1 else None,
+            "2nd Close": snapshot_df.iloc[1]['Close'] if len(snapshot_df) > 1 else None,
+            "3rd Open": snapshot_df.iloc[2]['Open'] if len(snapshot_df) > 2 else None,
+            "3rd Close": snapshot_df.iloc[2]['Close'] if len(snapshot_df) > 2 else None,
+            "4th Open": snapshot_df.iloc[3]['Open'] if len(snapshot_df) > 3 else None,
+            "4th Close": snapshot_df.iloc[3]['Close'] if len(snapshot_df) > 3 else None,
+            "5th Open": snapshot_df.iloc[4]['Open'] if len(snapshot_df) > 4 else None,
+            "5th Close": snapshot_df.iloc[4]['Close'] if len(snapshot_df) > 4 else None,
+            "6th Open": snapshot_df.iloc[5]['Open'] if len(snapshot_df) > 5 else None,
+            "6th Close": snapshot_df.iloc[5]['Close'] if len(snapshot_df) > 5 else None,
             "1st 44MA": ma44_list[0] if len(ma44_list) > 0 else None,
             "2nd 44MA": ma44_list[1] if len(ma44_list) > 1 else None,
             "3rd 44MA": ma44_list[2] if len(ma44_list) > 2 else None,
@@ -1474,7 +1806,7 @@ def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, 
         return None
 
 
-def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=None, require_unusual_volume=True, confirm_trend=False, status_text=None):
+def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=None, require_unusual_volume=True, confirm_trend=False, daily_trend_filter=False, status_text=None):
     """
     Main screening function that returns results list
     Optionally updates results_container in real-time
@@ -1646,7 +1978,7 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
                 del df_30min
                 return None
 
-            result = scan_stock(symbol, df_30min, df_5min, filter_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, confirm_trend, trade_obj, inst_cache, inst_cache_lock)
+            result = scan_stock(symbol, df_30min, df_5min, filter_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, confirm_trend, daily_trend_filter, trade_obj, inst_cache, inst_cache_lock)
             # memory cleanup
             try:
                 del df_5min
@@ -1678,7 +2010,8 @@ def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_
             completed += 1
             prog = int((completed / total_stocks) * 100) if total_stocks else 100
             progress_bar.progress(prog)
-            progress_text.text(f"Scanning: {prog}% ({completed}/{total_stocks})")
+            # show current symbol alongside count
+            progress_text.text(f"Scanning {completed}/{total_stocks} : {sym}")
             # periodically collect garbage to free memory
             if completed % 10 == 0:
                 gc.collect()
@@ -1922,6 +2255,14 @@ def main():
              "strong candle body (>50% range), and volume above 20-candle average. "
              "Improves signal reliability. Disabled = original strategy behavior."
     )
+
+    # New feature: daily trend filter toggle
+    daily_trend_filter = st.checkbox(
+        "Daily Trend Check",
+        value=False,
+        help="Enable additional daily timeframe trend validation (requires MA data)."
+    )
+
     # timeframe is fixed to 30m, no user choice
     
     st.divider()
@@ -1978,7 +2319,8 @@ def main():
             candle_count,
             results_container=True,
             require_unusual_volume=require_unusual_volume,
-            confirm_trend=confirm_trend
+            confirm_trend=confirm_trend,
+            daily_trend_filter=daily_trend_filter
         )
         st.session_state.screening_results = results
         st.session_state.scan_running = False
