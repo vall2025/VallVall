@@ -1,2543 +1,1213 @@
-# File: Stock Candle Screener 30Min 4C/5C - Streamlit Version
+# =============================================================================
+# TREND MASTER — Alice Blue | NSE F&O
+# =============================================================================
+# Finds stocks that trend continuously from 9:15 AM to EOD.
+#
+# TWO PATTERNS DETECTED:
+#
+# PATTERN A — GAP & TREND (most reliable)
+#   Stock gaps up/down significantly at open.
+#   After the gap, it CONTINUES in the same direction all morning.
+#   Example: OFSS gapped up on results, then sold off all day → BEARISH
+#   Example: Stock gaps down, then bounces all day → BULLISH
+#
+# PATTERN B — MOMENTUM TREND (no gap)
+#   No significant gap at open.
+#   But from 9:15 AM every candle moves in same direction with rising volume.
+#   Example: Stock flat opens, then climbs every 15 min → BULLISH
+#
+# HOW DIRECTION IS CONFIRMED (must pass ALL checks):
+#
+#   CHECK 1 — FIRST CANDLE SETS DIRECTION
+#     The very first 15-min candle (9:15-9:30) must be strongly
+#     green (bull) or red (bear). Body must be > 60% of range.
+#     This tells us institutions entered immediately at open.
+#
+#   CHECK 2 — CANDLES CONTINUE IN SAME DIRECTION
+#     From 9:15 to scan time, closing prices must move in same direction.
+#     Bull: each close >= previous close (1 exception allowed)
+#     Bear: each close <= previous close (1 exception allowed)
+#
+#   CHECK 3 — NO PRICE RECOVERY (most important)
+#     Bull: current price must be HIGHER than the 9:15 open
+#     Bear: current price must be LOWER than the 9:15 open
+#     If price recovered back to open level → trend is weak, skip.
+#
+#   CHECK 4 — VOLUME CONFIRMS DIRECTION
+#     Volume in each candle must be above the stock's average.
+#     Sustained volume = institutions driving it all day.
+#     Volume must be >= 1.5x the 5-day average morning volume.
+#
+#   CHECK 5 — VWAP CONFIRMS DIRECTION
+#     Bull: price must be above VWAP (buyers in control)
+#     Bear: price must be below VWAP (sellers in control)
+#     If price is near VWAP → contested, no clear trend.
+#
+#   CHECK 6 — ADX CONFIRMS STRENGTH
+#     ADX >= 20: real trend, not choppy sideways movement
+#     +DI > -DI for bull, -DI > +DI for bear
+#
+#   CHECK 7 — TOTAL MOVE SIZE QUALIFIES
+#     Bull: price must be up at least 1% from yesterday's close
+#     Bear: price must be down at least 1% from yesterday's close
+#     Less than 1% = too small to capture meaningful points
+#
+# ENTRY / SL / TARGET:
+#   Entry  = price at scan time (11:00 or 11:30 AM)
+#   SL     = lowest low of morning candles (bull) / highest high (bear)
+#   Target = Entry ± 2R
+#   Hard exit: 3:00 PM
+# =============================================================================
 
-# prevent Streamlit watcher race condition by disabling the file watcher
-# this mirrors setting server.fileWatcherType=none in config or cli
-import os
+import os, gc, json, threading, time, warnings
 os.environ['STREAMLIT_SERVER_FILEWATCHERTYPE'] = 'none'
-
-import warnings
 warnings.filterwarnings('ignore')
 
 import streamlit as st
-# also apply via runtime option in case config is already loaded
 try:
     st.set_option('server.fileWatcherType', 'none')
 except Exception:
     pass
+
 from TradeMaster.TradeSync import TradeHub, Exchange
-import pytz
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta, date, time as dt_time
-import time
-import re
-import json
-import websocket
-import hashlib
-import threading
-from queue import Queue
+import pytz, pandas as pd, numpy as np
+from datetime import datetime, timedelta, time as dt_time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import gc  # memory management
 
-# ------------------------------------------------------------------
-# GLOBAL FLAGS / ENVIRONMENT FIXES
-# ------------------------------------------------------------------
+# =============================================================================
+# CONFIG
+# =============================================================================
+CREDS_FILE  = os.path.join(os.path.expanduser('~'), 'alice_creds.json')
+TOP_N       = 10
+RR          = 2.0
+MAX_WORKERS = 8
+DEBUG       = False
 
-# debug flag controls verbose print output; set to False in production
-DEBUG = False
+SCAN_OPTIONS = {
+    "11:00 AM (6 candles)":  (11,  0, 6),
+    "11:30 AM (7 candles)":  (11, 30, 7),
+}
 
-# simple cache for daily data (ema and dataframe) to avoid repeated API calls
-# key: symbol -> {'ema200': float, 'df': DataFrame}
-daily_cache = {}
+# Thresholds
+MIN_MOVE_PCT     = 1.0    # minimum % move from yesterday close
+VOL_MULT         = 1.5    # volume must be >= 1.5x 5-day avg
+ADX_MIN          = 20     # ADX trend strength threshold
+FIRST_BODY_MIN   = 0.55   # first candle body must be >= 55% of range
+VWAP_MIN_SEP     = 0.002  # price must be >= 0.2% away from VWAP
+MAX_REVERSALS    = 1      # max reversal candles allowed
 
-# force timezone to Asia/Kolkata (required on UTC cloud servers)
 os.environ["TZ"] = "Asia/Kolkata"
 try:
     time.tzset()
 except AttributeError:
-    # tzset may not be available on all platforms (Windows), ignore if so
     pass
 
-# conditional print wrapper: only print when DEBUG=True or when an
-# error marker is present in the message to avoid flood in logs.
-_original_print = print
-
-def _conditional_print(*args, **kwargs):
-    if DEBUG:
-        _original_print(*args, **kwargs)
-        return
-    # if any argument looks like an error message, always print
-    for arg in args:
-        try:
-            if isinstance(arg, str):
-                low = arg.lower()
-                if "error" in low:
-                    _original_print(*args, **kwargs)
-                    return
-        except Exception:
-            pass
-    # otherwise suppress
-
-# monkey‑patch builtins.print
-import builtins
-builtins.print = _conditional_print
-
-
-# =====================================================================
-# CONFIGURATION & CONSTANTS
-# =====================================================================
-
-MA_WINDOW = 44
-CANDLES_BEFORE = 50
-CANDLES_START = 5
-SCAN_TIME = "11:45"
-
-# Local credentials persistence file (keeps creds across app restarts)
-# Use a single well-known credentials file in the user's home directory
-CREDS_FILE = os.path.join(os.path.expanduser('~'), 'alice_creds.json')
-
-# =====================================================================
-# WEBSOCKET LIVE DATA FETCHING
-# =====================================================================
-
-def fetch_live_data_websocket(symbols, duration_minutes=2, trade_obj=None):
-    """
-    Fetch live streaming data for symbols using WebSocket.
-    Returns OHLCV data aggregated into 1-minute candles.
-    Works for individual traders via Alice Blue API.
-
-    Args:
-        symbols: List of symbols (e.g., ['ETERNAL.NS', 'INFY.NS'])
-        duration_minutes: How many minutes of data to collect (default 2 for quick test)
-        trade_obj: optional Alice Blue TradeHub object; if provided this is
-            used instead of looking in :data:`st.session_state`.  This makes the
-            function safe to call from background threads.
-
-    Returns:
-        Dict with {symbol: DataFrame} containing Open, High, Low, Close, Volume
-    """
-    try:
-        # prefer explicit object, fall back to session state (for backwards
-        # compatibility with callers that don't supply trade_obj)
-        trade = trade_obj if trade_obj is not None else st.session_state.get('alice_trade')
-        if not trade:
-            print("[ERROR] No trade object available")
-            return {}
-        
-        # Get session ID
-        session_id = trade.get_session_id()
-        if not session_id or 'Not_ok' in str(session_id):
-            print(f"[ERROR] Could not get valid session ID: {session_id}")
-            return {}
-        
-        client_id = str(trade.client_id) if hasattr(trade, 'client_id') else "801426"
-        print(f"[WEBSOCKET] Session ID obtained, Client ID: {client_id}")
-        
-        # Generate WebSocket token (SHA-256 encrypted session ID, twice)
-        sha1 = hashlib.sha256(str(session_id).encode()).hexdigest()
-        susertoken = hashlib.sha256(sha1.encode()).hexdigest()
-        
-        print(f"[WEBSOCKET] WebSocket token generated")
-        print(f"[WEBSOCKET] Connecting to wss://ws1.aliceblueonline.com/NorenWS")
-        
-        # Use SDK websocket helpers (recommended by Alice Blue support)
-        tick_data = {sym: [] for sym in symbols}
-        socket_opened = False
-        subscribe_flag = False
-        subscribe_list = []
-
-        def socket_open():
-            nonlocal socket_opened, subscribe_flag
-            print("[WEBSOCKET] Connected")
-            socket_opened = True
-            if subscribe_flag and subscribe_list:
-                try:
-                    trade.subscribe(subscribe_list)
-                    print("[WEBSOCKET] Resubscribed after reconnect")
-                except Exception as e:
-                    print(f"[WEBSOCKET] Resubscribe failed: {e}")
-
-        def socket_close():
-            nonlocal socket_opened
-            socket_opened = False
-            print("[WEBSOCKET] Closed")
-
-        def socket_error(message):
-            print(f"[WEBSOCKET] Error : {message}")
-
-        def feed_data(message):
-            nonlocal subscribe_flag
-            try:
-                feed_message = json.loads(message)
-            except Exception:
-                return
-            t = feed_message.get('t', '')
-            if t in ('ck', 'cf'):
-                # connection ack
-                print(f"[WEBSOCKET] Connection Ack: {feed_message.get('s', feed_message)}")
-                subscribe_flag = True
-                return
-            if t == 'tk':
-                print(f"[WEBSOCKET] Token Ack: {feed_message}")
-                return
-            # tick feed
-            if t in ('tf', 'df') or 'lp' in feed_message:
-                token = str(feed_message.get('tk', ''))
-                for symbol in symbols:
-                    try:
-                        sym_clean = symbol.split('.NS')[0]
-                        inst = trade.get_instrument(exchange=Exchange.NSE, symbol=sym_clean)
-                        if inst and str(inst.token) == token:
-                            tick = {
-                                'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),
-                                'ltp': float(feed_message.get('lp', 0) or 0),
-                                'volume': float(feed_message.get('v', 0) or 0),
-                                'open': float(feed_message.get('o', 0) or 0),
-                                'high': float(feed_message.get('h', 0) or 0),
-                                'low': float(feed_message.get('l', 0) or 0),
-                                'close': float(feed_message.get('c', 0) or 0),
-                            }
-                            tick_data[symbol].append(tick)
-                    except Exception:
-                        continue
-
-        # Build subscribe_list using instrument tokens
-        for sym in symbols:
-            try:
-                sym_clean = sym.split('.NS')[0]
-                inst = trade.get_instrument(exchange=Exchange.NSE, symbol=sym_clean)
-                if inst:
-                    # SDK accepts instrument objects for subscribe
-                    subscribe_list.append(inst)
-            except Exception as e:
-                print(f"[WEBSOCKET] Failed to get instrument for subscribe {sym}: {e}")
-
-        # Start websocket using SDK
-        try:
-            trade.start_websocket(socket_open_callback=socket_open,
-                                  socket_close_callback=socket_close,
-                                  socket_error_callback=socket_error,
-                                  subscription_callback=feed_data,
-                                  run_in_background=True,
-                                  market_depth=False)
-        except Exception as e:
-            print(f"[WEBSOCKET] start_websocket failed: {e}")
-            return {}
-
-        # Wait until socket opened
-        start_time = time.time()
-        while not socket_opened and (time.time() - start_time) < 15:
-            time.sleep(0.1)
-
-        # Subscribe
-        try:
-            if subscribe_list:
-                trade.subscribe(subscribe_list)
-                print(f"[WEBSOCKET] Subscribed to {len(subscribe_list)} instruments")
-        except Exception as e:
-            print(f"[WEBSOCKET] subscribe call failed: {e}")
-
-        # Collect data for duration
-        time.sleep(duration_minutes * 60)
-
-        # Stop websocket
-        try:
-            trade.stop_websocket()
-        except Exception as e:
-            print(f"[WEBSOCKET] stop_websocket error: {e}")
-
-        # Aggregate ticks into 1-minute candles
-        result = {}
-        for symbol, ticks in tick_data.items():
-            if not ticks:
-                print(f"[WEBSOCKET] No ticks for {symbol}")
-                continue
-            df = pd.DataFrame(ticks)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df.set_index('timestamp', inplace=True)
-            candles = df.resample('1min').agg({
-                'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum', 'ltp': 'last'
-            }).dropna()
-            if len(candles) > 0:
-                candles.columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'LTP']
-                result[symbol] = candles
-                print(f"[WEBSOCKET] {symbol}: Collected {len(candles)} candles")
-        return result
-        
-    except Exception as e:
-        print(f"[WEBSOCKET] ❌ Critical Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return {}
-
-# =====================================================================
-# DATA FETCHING FUNCTIONS
-# =====================================================================
-
-def get_instrument_cached(symbol, trade_obj=None, inst_cache=None, inst_cache_lock=None):
-    """
-    Get instrument with caching to avoid repeated API calls.
-    Thread-safe when trade_obj and inst_cache are provided.
-    Falls back to session_state when called from main thread.
-    """
-    try:
-        # Use provided trade object or fall back to session state
-        trade = trade_obj if trade_obj is not None else st.session_state.get('alice_trade')
-        if not trade:
-            return None
-        
-        # Check cache first
-        if inst_cache is not None and symbol in inst_cache:
-            return inst_cache[symbol]
-        if inst_cache is None:
-            cache = st.session_state.get('instrument_cache', {})
-            if symbol in cache:
-                return cache[symbol]
-        else:
-            cache = inst_cache
-        
-        # Clean symbol and try to fetch
-        sym_clean = symbol.split('.NS')[0] if symbol.upper().endswith('.NS') else symbol
-        inst = trade.get_instrument(exchange=Exchange.NSE, symbol=sym_clean)
-        
-        if inst:
-            # Update cache (thread-safe if lock provided)
-            if inst_cache is not None:
-                if inst_cache_lock is not None:
-                    with inst_cache_lock:
-                        inst_cache[symbol] = inst
-                else:
-                    inst_cache[symbol] = inst
-            else:
-                cache[symbol] = inst
-                st.session_state.instrument_cache = cache
-        return inst
-    except Exception:
-        return None
-
-def fetch_5min_data(symbol, start_date=None, end_date=None, retry=False):
-    """
-    Fetch 5-minute OHLCV data using Alice Blue (Ant-A3) SDK only.
-    Returns pandas DataFrame indexed by timezone-aware Asia/Kolkata DatetimeIndex
-    with columns exactly: ['Open','High','Low','Close','Volume'].
-    Returns None on failure.
-
-    Parameters:
-        retry (bool): internal flag to avoid infinite recursion when retrying
-            on small data sets. Should not be set by callers.
-    """
-    try:
-        trade = st.session_state.get('alice_trade')
-        if not trade:
-            print(f"[ERROR] {symbol}: No trade object in session state")
-            return None
-
-        # Normalize symbol (remove .NS suffix if present)
-        sym = symbol.split('.NS')[0] if symbol.upper().endswith('.NS') else symbol
-
-        # Build datetime range
-        tz = pytz.timezone('Asia/Kolkata')
-        if start_date is None:
-            to_dt = datetime.now(tz)
-            from_dt = to_dt - timedelta(days=7)
-        else:
-            try:
-                from_dt = pd.to_datetime(start_date)
-                if from_dt.tzinfo is None:
-                    from_dt = tz.localize(from_dt)
-            except Exception as e:
-                print(f"[ERROR] {symbol}: Failed to parse start_date {start_date}: {e}")
-                from_dt = datetime.now(tz) - timedelta(days=7)
-            if end_date is None:
-                to_dt = from_dt + timedelta(days=1)
-            else:
-                try:
-                    to_dt = pd.to_datetime(end_date)
-                    if to_dt.tzinfo is None:
-                        to_dt = tz.localize(to_dt)
-                except Exception as e:
-                    print(f"[ERROR] {symbol}: Failed to parse end_date {end_date}: {e}")
-                    to_dt = from_dt + timedelta(days=1)
-
-        print(f"[FETCH] {symbol}: Fetching from {from_dt} to {to_dt} (symbol cleaned: {sym})")
-
-        inst = get_instrument_cached(symbol)
-        if inst is None:
-            print(f"[ERROR] {symbol}: Could not get instrument object")
-            return None
-
-        df = None
-        last_error = None
-        
-        # Resolution "1" works reliably - use only that for speed
-        try:
-            result = trade.get_HistoricalData(
-                instrument=inst,
-                resolution="1",
-                from_datetime=from_dt,
-                to_datetime=to_dt,
-                indices=False
-            )
-            
-            # Handle list response (most common)
-            if isinstance(result, list) and len(result) > 0:
-                df = pd.DataFrame(result)
-            # Handle dict response
-            elif isinstance(result, dict):
-                if 'data' in result and result.get('stat') == 'Ok':
-                    df = pd.DataFrame(result['data'])
-                elif 'emsg' not in result and result.get('stat') != 'Ok':
-                    print(f"[FETCH] {symbol}: API error - {result.get('stat', 'Unknown')}")
-            # Handle DataFrame-like object
-            elif isinstance(result, pd.DataFrame):
-                df = result
-            else:
-                try:
-                    df = pd.DataFrame(result)
-                except Exception:
-                    df = None
-                    
-        except Exception as e:
-            last_error = str(e)
-            print(f"[FETCH] {symbol}: Fetch failed - {e}")
-        
-        if df is None:
-            print(f"[ERROR] {symbol}: DataFrame is None. Error: {last_error}")
-            return None
-        
-        if hasattr(df, 'empty') and df.empty:
-            print(f"[ERROR] {symbol}: DataFrame is empty after fetch")
-            return None
-
-        # Ensure we have a proper DataFrame
-        if not isinstance(df, pd.DataFrame):
-            print(f"[ERROR] {symbol}: Result is not a DataFrame after conversion")
-            return None
-
-        df = df.copy()
-        
-        # Print actual columns for debugging
-        actual_cols = list(df.columns) if hasattr(df, 'columns') else []
-        print(f"[FETCH] {symbol}: Actual dataframe columns: {actual_cols}")
-        
-        # Handle datetime column if present (Alice Blue returns 'datetime' column)
-        if 'datetime' in actual_cols:
-            print(f"[FETCH] {symbol}: Found 'datetime' column, setting as index...")
-            try:
-                df['datetime'] = pd.to_datetime(df['datetime'])
-                df.set_index('datetime', inplace=True)
-            except Exception as e:
-                print(f"[ERROR] {symbol}: Failed to set datetime as index: {e}")
-        
-        # Check for required columns (case-insensitive)
-        required = ['Open', 'High', 'Low', 'Close', 'Volume']
-        cols_lower = {col.lower(): col for col in df.columns}
-        missing_cols = []
-        col_mapping = {}
-        
-        for req in required:
-            req_lower = req.lower()
-            if req_lower in cols_lower:
-                col_mapping[req] = cols_lower[req_lower]
-            else:
-                missing_cols.append(req)
-        
-        if missing_cols:
-            print(f"[ERROR] {symbol}: Missing required columns: {missing_cols}. Available: {actual_cols}")
-            return None
-        
-        # Rename columns to standard names if needed
-        rename_dict = {v: k for k, v in col_mapping.items() if v != k}
-        if rename_dict:
-            print(f"[FETCH] {symbol}: Renaming columns: {rename_dict}")
-            df = df.rename(columns=rename_dict)
-
-        try:
-            if df.index.tzinfo is None and df.index.tz is None:
-                # API returns naive IST times - localize directly without UTC conversion
-                df.index = pd.to_datetime(df.index).tz_localize('Asia/Kolkata')
-            else:
-                df.index = df.index.tz_convert('Asia/Kolkata')
-        except Exception as e:
-            print(f"[ERROR] {symbol}: Timezone conversion failed: {e}")
-            try:
-                # Fallback: try direct localization
-                df.index = pd.to_datetime(df.index).tz_localize('Asia/Kolkata')
-            except Exception as e2:
-                print(f"[ERROR] {symbol}: Timezone conversion failed (retry): {e2}")
-                return None
-
-        df = df.sort_index()
-        df = df[["Open", "High", "Low", "Close", "Volume"]]
-        df = df[~df.index.duplicated(keep='last')]
-        if df.empty:
-            print(f"[ERROR] {symbol}: DataFrame became empty after processing")
-            return None
-        
-        print(f"[FETCH] {symbol}: Fetched {len(df)} candles")
-
-        # ------------------------------------------------------
-        # FIX 6: retry once if dataset is suspiciously small
-        # ------------------------------------------------------
-        # use lower threshold (10) for safety as per requirements
-        if (df is None or len(df) < 10) and not retry:
-            time.sleep(0.3)
-            return fetch_5min_data(symbol, start_date, end_date, retry=True)
-
-        return df
-    except Exception as e:
-        print(f"[ERROR] {symbol}: Outer exception in fetch_5min_data: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-
-def fetch_5min_data_worker(symbol, start_date=None, end_date=None, trade_obj=None, inst_cache=None, inst_cache_lock=None, retry=False):
-    """
-    Thread-safe worker version of fetch_5min_data that uses provided `trade_obj`
-    and a local `inst_cache` dict instead of accessing `st.session_state`.
-    Returns the same DataFrame or None on failure.
-
-    Parameters:
-        retry (bool): internal flag used when retrying on small datasets.
-    """
-    try:
-        trade = trade_obj
-        if not trade:
-            print(f"[WORKER ERROR] {symbol}: No trade object provided")
-            return None
-
-        # Normalize symbol
-        sym = symbol.split('.NS')[0] if symbol.upper().endswith('.NS') else symbol
-
-        tz = pytz.timezone('Asia/Kolkata')
-        if start_date is None:
-            to_dt = datetime.now(tz)
-            from_dt = to_dt - timedelta(days=7)
-        else:
-            try:
-                from_dt = pd.to_datetime(start_date)
-                if from_dt.tzinfo is None:
-                    from_dt = tz.localize(from_dt)
-            except Exception:
-                from_dt = datetime.now(tz) - timedelta(days=7)
-            if end_date is None:
-                to_dt = from_dt + timedelta(days=1)
-            else:
-                try:
-                    to_dt = pd.to_datetime(end_date)
-                    if to_dt.tzinfo is None:
-                        to_dt = tz.localize(to_dt)
-                except Exception:
-                    to_dt = from_dt + timedelta(days=1)
-
-        print(f"[FETCH-WORKER] {symbol}: Fetching from {from_dt} to {to_dt} (symbol cleaned: {sym})")
-
-        # Use provided instrument cache mapping first
-        inst = None
-        try:
-            if inst_cache and symbol in inst_cache:
-                inst = inst_cache.get(symbol)
-            else:
-                try:
-                    sym_clean = symbol.split('.NS')[0] if symbol.upper().endswith('.NS') else symbol
-                    inst = trade.get_instrument(exchange=Exchange.NSE, symbol=sym_clean)
-                    if inst_cache is not None:
-                        try:
-                            if inst_cache_lock is not None:
-                                with inst_cache_lock:
-                                    inst_cache[symbol] = inst
-                            else:
-                                inst_cache[symbol] = inst
-                        except Exception:
-                            pass
-                except Exception:
-                    inst = None
-        except Exception:
-            inst = None
-
-        if inst is None:
-            print(f"[WORKER ERROR] {symbol}: Could not get instrument object")
-            return None
-
-        df = None
-        last_error = None
-        try:
-            result = trade.get_HistoricalData(
-                instrument=inst,
-                resolution="1",
-                from_datetime=from_dt,
-                to_datetime=to_dt,
-                indices=False
-            )
-
-            if isinstance(result, list) and len(result) > 0:
-                df = pd.DataFrame(result)
-            elif isinstance(result, dict):
-                if 'data' in result and result.get('stat') == 'Ok':
-                    df = pd.DataFrame(result['data'])
-                elif 'emsg' not in result and result.get('stat') != 'Ok':
-                    print(f"[FETCH-WORKER] {symbol}: API error - {result.get('stat', 'Unknown')}")
-            elif isinstance(result, pd.DataFrame):
-                df = result
-            else:
-                try:
-                    df = pd.DataFrame(result)
-                except Exception:
-                    df = None
-        except Exception as e:
-            last_error = str(e)
-            print(f"[FETCH-WORKER] {symbol}: Fetch failed - {e}")
-
-        if df is None:
-            # frequently the API returns unexpected format (e.g. error message) causing
-            # DataFrame conversion to fail with pandas KeyError like:
-            # "None of [Index([...]) are in the [columns]]".  These are benign and
-            # don't need to flood the log unless DEBUG is enabled.
-            if last_error and "None of [Index" in str(last_error) and not DEBUG:
-                return None
-            print(f"[WORKER ERROR] {symbol}: DataFrame is None. Error: {last_error}")
-            return None
-
-        if hasattr(df, 'empty') and df.empty:
-            print(f"[WORKER ERROR] {symbol}: DataFrame is empty after fetch")
-            return None
-
-        if not isinstance(df, pd.DataFrame):
-            print(f"[WORKER ERROR] {symbol}: Result is not a DataFrame after conversion")
-            return None
-
-        df = df.copy()
-        actual_cols = list(df.columns) if hasattr(df, 'columns') else []
-        if 'datetime' in actual_cols:
-            try:
-                df['datetime'] = pd.to_datetime(df['datetime'])
-                df.set_index('datetime', inplace=True)
-            except Exception:
-                pass
-
-        required = ['Open', 'High', 'Low', 'Close', 'Volume']
-        cols_lower = {col.lower(): col for col in df.columns}
-        missing_cols = []
-        col_mapping = {}
-        for req in required:
-            req_lower = req.lower()
-            if req_lower in cols_lower:
-                col_mapping[req] = cols_lower[req_lower]
-            else:
-                missing_cols.append(req)
-
-        if missing_cols:
-            print(f"[WORKER ERROR] {symbol}: Missing required columns: {missing_cols}. Available: {actual_cols}")
-            return None
-
-        rename_dict = {v: k for k, v in col_mapping.items() if v != k}
-        if rename_dict:
-            df = df.rename(columns=rename_dict)
-
-        try:
-            if df.index.tzinfo is None and df.index.tz is None:
-                df.index = pd.to_datetime(df.index).tz_localize('Asia/Kolkata')
-            else:
-                df.index = df.index.tz_convert('Asia/Kolkata')
-        except Exception:
-            try:
-                df.index = pd.to_datetime(df.index).tz_localize('Asia/Kolkata')
-            except Exception:
-                return None
-
-        df = df.sort_index()
-        df = df[["Open", "High", "Low", "Close", "Volume"]]
-        df = df[~df.index.duplicated(keep='last')]
-        if df.empty:
-            return None
-
-        print(f"[FETCH-WORKER] {symbol}: Fetched {len(df)} candles")
-
-        # ------------------------------------------------------
-        # FIX 6 retry logic
-        # lower threshold to 10 and shorten sleep
-        if (df is None or len(df) < 10) and not retry:
-            time.sleep(0.3)
-            return fetch_5min_data_worker(symbol, start_date, end_date, trade_obj, inst_cache, inst_cache_lock, retry=True)
-
-        return df
-    except Exception as e:
-        print(f"[WORKER ERROR] {symbol}: Outer exception in fetch_5min_data_worker: {e}")
-        return None
-
-
-def _validate_with_broker(symbol, last_close, breakout_bull, breakout_bear, trade_obj=None, inst_cache=None, inst_cache_lock=None):
-    """
-    Validate breakout signals using Alice Blue daily data (previous close).
-    Conservative: only suppress a breakout if broker data clearly contradicts it.
-    Returns (breakout_bull, breakout_bear).
-    Thread-safe when trade_obj and inst_cache are provided.
-    """
-    try:
-        trade = trade_obj if trade_obj is not None else st.session_state.get('alice_trade')
-        if not trade:
-            return breakout_bull, breakout_bear
-
-        sym = symbol.split('.NS')[0] if symbol.upper().endswith('.NS') else symbol
-        inst = get_instrument_cached(symbol, trade_obj=trade_obj, inst_cache=inst_cache, inst_cache_lock=inst_cache_lock)
-        if not inst:
-            return breakout_bull, breakout_bear
-
-        tz = pytz.timezone('Asia/Kolkata')
-        today = datetime.now(tz).date()
-        prev_day = today - timedelta(days=1)
-        from_dt = datetime.combine(prev_day, datetime.min.time())
-        to_dt = datetime.combine(prev_day, datetime.max.time())
-        from_dt = tz.localize(from_dt)
-        to_dt = tz.localize(to_dt)
-
-        try:
-            df = trade.get_HistoricalData(instrument=inst, resolution="D", from_datetime=from_dt, to_datetime=to_dt, indices=False)
-        except Exception:
-            df = None
-
-        if df is None or df.empty:
-            return breakout_bull, breakout_bear
-
-        try:
-            prev_close = float(df['Close'].iloc[-1])
-            if breakout_bull and last_close <= prev_close:
-                breakout_bull = False
-            if breakout_bear and last_close >= prev_close:
-                breakout_bear = False
-        except Exception:
-            pass
-        return breakout_bull, breakout_bear
-    except Exception:
-        return breakout_bull, breakout_bear
-
-
-def resample_to_30min(df):
-    """
-    Resample the 1-minute data to 30-minute intervals using pandas resampling.
-    Anchor to 09:15 market open.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-    
-    df = df.sort_index().copy()
-    
-    # Ensure we're in Asia/Kolkata timezone (should already be from fetch)
-    if df.index.tz is None:
-        df.index = df.index.tz_localize('Asia/Kolkata')
-    elif str(df.index.tz) != 'Asia/Kolkata':
-        df.index = df.index.tz_convert('Asia/Kolkata')
-    
-    # Filter market hours: 09:15 to 15:30
-    df['time'] = df.index.time
-    df = df[(df['time'] >= pd.Timestamp('09:15').time()) & 
-            (df['time'] <= pd.Timestamp('15:30').time())]
-    
-    if df.empty:
-        return pd.DataFrame()
-    
-    # Use pandas native resampling, anchored to 09:15
-    try:
-        df_30min = df[['Open', 'High', 'Low', 'Close', 'Volume']].resample(
-            '30min', origin='start_day', offset='9h15min', label='left', closed='left'
-        ).agg({
-            'Open': 'first',
-            'High': 'max',
-            'Low': 'min',
-            'Close': 'last',
-            'Volume': 'sum'
-        })
-
-        # Remove rows with NaN (no data for that 30-min period)
-        # Keep partially formed candles that have a Close (avoid dropping valid partials)
-        # (Replaced dropna with explicit Close notna filter to preserve other fields)
-        df_30min = df_30min[df_30min['Close'].notna()]
-
-        # Add date column for filtering (use pandas method for timezone-aware index)
-        df_30min['date'] = df_30min.index.to_series().dt.normalize().dt.date
-
-        return df_30min
-    except Exception as e:
-        print(f"[ERROR] Resampling to 30min failed: {e}")
-        return pd.DataFrame()
-
-
-def get_snapshot_datetime_for_date(date_obj, time_str=None):
-    """
-    Return a timezone-aware `Asia/Kolkata` datetime for a given `date_obj` and time string `HH:MM`.
-    """
-    if time_str is None:
-        time_str = '11:45'
-    
-    try:
-        hh, mm = [int(x) for x in time_str.split(":")]
-    except Exception:
-        hh, mm = 11, 45
-    dt = datetime.combine(date_obj, datetime.min.time()).replace(hour=hh, minute=mm, second=0, microsecond=0)
-    try:
-        import pytz
-        tz = pytz.timezone('Asia/Kolkata')
-        return tz.localize(dt)
-    except Exception:
-        return pd.Timestamp(dt).tz_localize('Asia/Kolkata')
-
-def get_last_trading_day(from_date=None):
-    """
-    Get the last trading day (NSE working day) before or on the given date.
-    Excludes Saturdays, Sundays, and major Indian market holidays.
-    """
-    if from_date is None:
-        from_date = datetime.now(pytz.timezone('Asia/Kolkata')).date()
-    
-    # 2026 Indian market holidays (NSE closed)
-    market_holidays = {
-        (1, 26),   # Republic Day
-        (2, 26),   # Maha Shivaratri
-        (3, 15),   # Holi
-        (4, 10),   # Good Friday
-        (5, 24),   # Eid-ul-Fitr
-        (5, 26),   # Buddha Purnima
-        (8, 15),   # Independence Day
-        (8, 27),   # Janmashtami
-        (9, 30),   # Milad-un-Nabi
-        (10, 2),   # Gandhi Jayanti
-        (10, 12),  # Dussehra
-        (10, 24),  # Diwali (Lakshmi Puja)
-        (10, 25),  # Diwali (Govardhan Puja)
-        (11, 1),   # Dev Deepavali
-        (11, 11),  # Guru Nanak Jayanti
-        (12, 25),  # Christmas
-    }
-    
-    check_date = from_date
-    for _ in range(30):  # Look back up to 30 days
-        if check_date.weekday() < 5 and (check_date.month, check_date.day) not in market_holidays:
-            return check_date
-        check_date -= timedelta(days=1)
-    
-    return from_date
-
-# =====================================================================
-# DAILY DATA HELPER FUNCTION
-# =====================================================================
-
-def fetch_daily_data(symbol, trade_obj=None, inst_cache=None, inst_cache_lock=None):
-    """
-    Fetch the last 250 daily candles and calculate the latest EMA200.
-    Returns the EMA200 value (float) or None if unable to fetch data.
-    Caches results in :data:`daily_cache` to avoid repeated API calls.  Also
-    stores the raw DataFrame under the same cache entry for later use.
-    Thread-safe when trade_obj and inst_cache are provided.
-    """
-    global daily_cache
-    try:
-        # return cached value if available
-        if symbol in daily_cache and 'ema200' in daily_cache[symbol]:
-            return daily_cache[symbol]['ema200']
-
-        trade = trade_obj if trade_obj is not None else st.session_state.get('alice_trade')
-        if not trade:
-            return None
-        
-        sym = symbol.split('.NS')[0] if symbol.upper().endswith('.NS') else symbol
-        
-        # Get instrument
-        inst = get_instrument_cached(symbol, trade_obj=trade, inst_cache=inst_cache, inst_cache_lock=inst_cache_lock)
-        if inst is None:
-            return None
-        
-        # Fetch last 250 daily candles
-        tz = pytz.timezone('Asia/Kolkata')
-        to_dt = datetime.now(tz)
-        from_dt = to_dt - timedelta(days=365)  # Go back ~1 year to get 250 business days
-        
-        try:
-            df = trade.get_HistoricalData(
-                instrument=inst,
-                resolution="D",
-                from_datetime=from_dt,
-                to_datetime=to_dt,
-                indices=False
-            )
-        except Exception as e:
-            print(f"[DAILY] {symbol}: Failed to fetch daily data - {e}")
-            return None
-        
-        if df is None or isinstance(df, dict) and 'emsg' in df:
-            return None
-        
-        # Handle different response formats
-        if isinstance(df, dict) and 'data' in df:
-            df = pd.DataFrame(df['data'])
-        elif isinstance(df, list):
-            df = pd.DataFrame(df)
-        elif not isinstance(df, pd.DataFrame):
-            try:
-                df = pd.DataFrame(df)
-            except Exception:
-                return None
-        
-        if df.empty or len(df) < 20:
-            return None
-        
-        # Handle datetime column
-        if 'datetime' in df.columns:
-            try:
-                df['datetime'] = pd.to_datetime(df['datetime'])
-                df.set_index('datetime', inplace=True)
-            except Exception:
-                pass
-        
-        # Ensure we have Close column
-        if 'Close' not in df.columns:
-            cols_lower = {col.lower(): col for col in df.columns}
-            if 'close' in cols_lower:
-                df = df.rename(columns={cols_lower['close']: 'Close'})
-            else:
-                return None
-        
-        # Calculate EMA200
-        try:
-            ema200 = df['Close'].ewm(span=200, adjust=False).mean()
-            latest_ema200 = ema200.iloc[-1]
-            
-            if pd.isna(latest_ema200) or latest_ema200 <= 0:
-                return None
-            
-            # cache both the value and dataframe for downstream use
-            daily_cache[symbol] = {'ema200': float(latest_ema200), 'df': df}
-            return float(latest_ema200)
-        except Exception as e:
-            print(f"[DAILY] {symbol}: Failed to calculate EMA200 - {e}")
-            return None
-    
-    except Exception as e:
-        print(f"[DAILY] {symbol}: Error in fetch_daily_data - {e}")
-        return None
-
-# =====================================================================
-# SCREENING LOGIC FUNCTION
-# =====================================================================
-
-def scan_stock(symbol, df_30min, df_5min, chosen_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, confirm_trend=False, daily_trend_filter=False, trade_obj=None, inst_cache=None, inst_cache_lock=None):
-    """
-    Analyze a single stock and return result dict or None if filtered out.
-    df_30min is expected to be a 30‑minute resampled, snapshot‑filtered
-    DataFrame with a 'date' column already present.
-    This function no longer performs any slicing; that is handled by
-    the caller (process_symbol).
-    """
-    global CANDLES_START, SCAN_TIME, MA_WINDOW
-    
-    try:
-        # df_30min already contains only candles up to the snapshot datetime
-        if df_30min is None or df_30min.empty:
-            return None
-
-        # make a local copy to avoid mutating caller data
-        df_30min = df_30min.copy()
-        # ensure date column exists
-        if 'date' not in df_30min.columns:
-            df_30min['date'] = df_30min.index.to_series().dt.normalize().dt.date
-
-        day_30min = df_30min[df_30min['date'] == chosen_date]
-        if len(day_30min) < CANDLES_START:
-            return None
-
-        first5 = day_30min.head(CANDLES_START)
-
-        # =====================================================================
-        # TRUE CANDLE SNAPSHOT LOGIC - Use only selected candle count
-        # =====================================================================
-        # Convert candle_count to number (e.g., "5C" -> 5)
-        selected_candles = int(candle_count[0]) if candle_count and candle_count[0].isdigit() else 5
-        
-        # Safety check: ensure we have enough candles
-        if len(day_30min) < selected_candles:
-            return None
-        
-        # Create snapshot dataframe with exactly selected_candles
-        snapshot_df = day_30min.head(selected_candles).copy()
-        
-        # All subsequent calculations must use snapshot_df instead of df_30min
-        # =====================================================================
-
-        # after snapshot slicing we only use df_30min for everything
-        ma44_source = df_30min
-
-        # Early termination check for MA data (relaxed to 30 periods to allow early-session signals)
-        prior_44 = ma44_source[ma44_source['date'] < chosen_date].tail(44)
-        if len(prior_44) < 30:
-            return None
-
-        MA_TOLERANCE_PCT = 0.0005
-        ma44_series = ma44_source['Close'].rolling(window=MA_WINDOW, min_periods=MA_WINDOW).mean()
-        if ma44_series.count() < MA_WINDOW:
-            try:
-                ma44_series_fallback = ma44_source['Close'].rolling(window=MA_WINDOW, min_periods=1).mean()
-                ma44_series = ma44_series_fallback
-            except Exception:
-                pass
-        
-        ma44_list = []
-        for ma_idx in snapshot_df.index:
-            try:
-                if ma_idx in ma44_series.index:
-                    ma44_val = ma44_series.loc[ma_idx]
-                else:
-                    pos = ma44_series.index.get_indexer([ma_idx], method='pad')[0]
-                    if pos == -1:
-                        ma44_val = None
-                    else:
-                        ma44_val = ma44_series.iloc[pos]
-            except Exception:
-                ma44_val = None
-            ma44_list.append(ma44_val)
-
-        # --- ANALYSIS LOGIC (UNCHANGED) ---
-        prior_data = df_30min[df_30min.index < snapshot_df.index[0]].tail(44)
-        supports = []
-        for i in range(1, len(prior_data)-1):
-            if (prior_data['Low'].iloc[i] < prior_data['Low'].iloc[i-1] and 
-                prior_data['Low'].iloc[i] < prior_data['Low'].iloc[i+1]):
-                supports.append(prior_data['Low'].iloc[i])
-        resistances = []
-        for i in range(1, len(prior_data)-1):
-            if (prior_data['High'].iloc[i] > prior_data['High'].iloc[i-1] and 
-                prior_data['High'].iloc[i] > prior_data['High'].iloc[i+1]):
-                resistances.append(prior_data['High'].iloc[i])
-        current_price = snapshot_df['Close'].iloc[-1]
-        closest_support = min(supports, key=lambda x: abs(x - current_price)) if supports else None
-        closest_resistance = min(resistances, key=lambda x: abs(x - current_price)) if resistances else None
-        price_near_level = False
-        if closest_support and closest_resistance:
-            support_dist = abs(current_price - closest_support) / closest_support
-            resistance_dist = abs(current_price - closest_resistance) / closest_resistance
-            price_near_level = min(support_dist, resistance_dist) < 0.01
-
-        # Calculate RSI once at the start for this stock on the filtered 30-min data
-        if 'RSI' not in df_30min.columns:
-            delta = df_30min['Close'].diff()
-            gain = delta.clip(lower=0)
-            loss = -delta.clip(upper=0)
-            avg_gain = gain.ewm(span=14, adjust=False).mean()
-            avg_loss = loss.ewm(span=14, adjust=False).mean()
-            rs = avg_gain / (avg_loss + 1e-10)
-            df_30min['RSI'] = 100 - (100 / (1 + rs))
-
-            vol_delta = delta * df_30min['Volume']
-            vol_gain = vol_delta.clip(lower=0)
-            vol_loss = -vol_delta.clip(upper=0)
-            vol_avg_gain = vol_gain.ewm(span=14, adjust=False).mean()
-            vol_avg_loss = vol_loss.ewm(span=14, adjust=False).mean()
-            vol_rs = vol_avg_gain / (vol_avg_loss + 1e-10)
-            df_30min['VRSI'] = 100 - (100 / (1 + vol_rs))
-
-        try:
-            rsi_at_4th = df_30min.loc[snapshot_df.index[-1], 'RSI']
-            vrsi_at_4th = df_30min.loc[snapshot_df.index[-1], 'VRSI']
-        except Exception:
-            rsi_at_4th = None
-            vrsi_at_4th = None
-
-        volume_profile = []
-        price_levels = []
-        for i in range(len(snapshot_df)):
-            candle = snapshot_df.iloc[i]
-            vol = candle['Volume']
-            price = (candle['High'] + candle['Low']) / 2
-            volume_profile.append(vol)
-            price_levels.append(price)
-
-            # Use the snapshot-filtered 30-min data for volume calculations
-            avg_volume = snapshot_df['Volume'].mean()
-        institutional_volume = all(v > 1.2 * avg_volume for v in volume_profile)
-
-        body_ratios = []
-        shadows_ratios = []
-        for i in range(len(snapshot_df)):
-            o = snapshot_df['Open'].iloc[i]
-            c = snapshot_df['Close'].iloc[i]
-            h = snapshot_df['High'].iloc[i]
-            l = snapshot_df['Low'].iloc[i]
-            body = abs(c - o)
-            rng = h - l
-            body_ratio = (body / rng) if rng > 0 else 0
-            if c >= o:
-                upper_shadow = h - c
-                lower_shadow = o - l
-            else:
-                upper_shadow = h - o
-                lower_shadow = c - l
-            shadow_ratio = ((upper_shadow + lower_shadow) / rng) if rng > 0 else 0
-            body_ratios.append(body_ratio)
-            shadows_ratios.append(shadow_ratio)
-
-        price_gaps = [abs(snapshot_df['Close'].iloc[i] - snapshot_df['Open'].iloc[i+1])/snapshot_df['Close'].iloc[i] 
-                     for i in range(len(snapshot_df)-1)]
-        no_gaps = all(gap < 0.003 for gap in price_gaps)
-
-        price_range = abs(snapshot_df['Close'].iloc[-1] - snapshot_df['Close'].iloc[0])
-        avg_candle_size = (snapshot_df['High'] - snapshot_df['Low']).mean()
-        current_volatility = snapshot_df['High'].sub(snapshot_df['Low']).std()
-        historical_volatility = prior_data['High'].sub(prior_data['Low']).std()
-        volatility_ratio = current_volatility / historical_volatility if historical_volatility > 0 else 1
-        price_acceleration = [
-            snapshot_df['Close'].iloc[i] - snapshot_df['Close'].iloc[i-1] for i in range(1, len(snapshot_df))
-        ]
-        accelerating_momentum = all(price_acceleration[i] >= price_acceleration[i-1] 
-                                 for i in range(1, len(price_acceleration)))
-        vwap = (snapshot_df['Close'] * snapshot_df['Volume']).sum() / snapshot_df['Volume'].sum()
-        vwap_trend = snapshot_df['Close'].iloc[-1] > vwap
-        adx = 0.0
-        if len(prior_data) >= 20:
-            adx_window = 14
-            tr1 = prior_data['High'] - prior_data['Low']
-            tr2 = abs(prior_data['High'] - prior_data['Close'].shift(1))
-            tr3 = abs(prior_data['Low'] - prior_data['Close'].shift(1))
-            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            atr = tr.rolling(adx_window).mean()
-            pos_dm = (prior_data['High'] - prior_data['High'].shift(1)).clip(lower=0)
-            neg_dm = (prior_data['Low'].shift(1) - prior_data['Low']).clip(lower=0)
-            pos_dm[pos_dm < neg_dm] = 0
-            neg_dm[neg_dm < pos_dm] = 0
-            pos_di = 100 * (pos_dm.rolling(adx_window).mean() / atr)
-            neg_di = 100 * (neg_dm.rolling(adx_window).mean() / atr)
-            dx = 100 * np.abs(pos_di - neg_di) / (pos_di + neg_di + 1e-10)
-            adx_series = dx.rolling(adx_window).mean()  # Keep series for rising check
-            adx = adx_series.iloc[-1]
-            previous_adx = adx_series.iloc[-2] if len(adx_series) >= 2 else adx
-            strong_trend = adx > 25
-        else:
-            strong_trend = True
-            adx_series = None
-            previous_adx = None
-
-        strong_momentum = (
-            price_range > (2 * avg_candle_size) and
-            accelerating_momentum and
-            no_gaps and
-            institutional_volume and
-            strong_trend and
-            volatility_ratio > 0.8 and
-            volatility_ratio < 2.0 and
-            (price_near_level or vwap_trend)
-        )
-
-        df_ma = df_30min[df_30min.index <= snapshot_df.index[-1]]
-
-        short_ma = df_ma['Close'].rolling(5).mean()
-        medium_ma = df_ma['Close'].rolling(10).mean()
-        long_ma = df_ma['Close'].rolling(20).mean()
-        last_idx = short_ma.index.get_loc(snapshot_df.index[-1])
-        ma_alignment_bull = (short_ma.iloc[last_idx] > medium_ma.iloc[last_idx] > long_ma.iloc[last_idx])
-        ma_alignment_bear = (short_ma.iloc[last_idx] < medium_ma.iloc[last_idx] < long_ma.iloc[last_idx])
-        closes_increasing = all(snapshot_df['Close'].iloc[i] > snapshot_df['Close'].iloc[i-1] for i in range(1, len(snapshot_df)))
-        closes_decreasing = all(snapshot_df['Close'].iloc[i] < snapshot_df['Close'].iloc[i-1] for i in range(1, len(snapshot_df)))
-        
-        tol = MA_TOLERANCE_PCT
-        bullish_ma = all(
-            (ma44_list[i] is not None) and
-            (snapshot_df['Open'].iloc[i] > ma44_list[i] * (1 + tol)) and
-            (snapshot_df['High'].iloc[i] > ma44_list[i] * (1 + tol)) and
-            (snapshot_df['Low'].iloc[i] > ma44_list[i] * (1 + tol)) and
-            (snapshot_df['Close'].iloc[i] > ma44_list[i] * (1 + tol))
-            for i in range(len(snapshot_df))
-        )
-        bearish_ma = all(
-            (ma44_list[i] is not None) and
-            (snapshot_df['Open'].iloc[i] < ma44_list[i] * (1 - tol)) and
-            (snapshot_df['High'].iloc[i] < ma44_list[i] * (1 - tol)) and
-            (snapshot_df['Low'].iloc[i] < ma44_list[i] * (1 - tol)) and
-            (snapshot_df['Close'].iloc[i] < ma44_list[i] * (1 - tol))
-            for i in range(len(snapshot_df))
-        )
-        
-        avg_vol_recent = snapshot_df['Volume'].mean()
-        avg_vol_prior = df_30min[df_30min['date'] < chosen_date].tail(44)['Volume'].mean()
-        strong_volume = avg_vol_recent > 1.5 * avg_vol_prior
-        strong_bodies = all(r > 0.6 for r in body_ratios)
-        
-        bullish_ma_touch = bullish_ma
-        bearish_ma_touch = bearish_ma
-        
-        prev_day_data = df_30min[df_30min['date'] < chosen_date].tail(13)
-        prev_high = prev_day_data['High'].max() if not prev_day_data.empty else None
-        prev_low = prev_day_data['Low'].min() if not prev_day_data.empty else None
-        last_close = snapshot_df['Close'].iloc[-1]
-        breakout_bull = (prev_high is not None) and (last_close > prev_high)
-        breakout_bear = (prev_low is not None) and (last_close < prev_low)
-        
-        volume_strong = (avg_vol_prior is not None) and (avg_vol_recent > 1.5 * avg_vol_prior)
-        rsi_bull = (rsi_at_4th is not None) and (rsi_at_4th > 60)
-        rsi_bear = (rsi_at_4th is not None) and (rsi_at_4th < 40)
-
-        def calculate_signal_score(conds, is_bull=True):
-            categories = {
-                'candle_pattern': ['strong_bodies', 'clean_shadows', 'bullish_candles' if is_bull else 'bearish_candles', 'higher_highs' if is_bull else 'lower_lows'],
-                'trend': ['above_ma' if is_bull else 'below_ma', 'resistance_break' if is_bull else 'support_break', 'clean_moves', 'ma_aligned', 'near_level', 'strong_trend'],
-                'volume': ['strong_volume', 'inst_buying' if is_bull else 'inst_selling', 'above_vwap' if is_bull else 'below_vwap', 'vol_trend_aligned'],
-                'technical': ['momentum', 'acceleration', 'rsi_strong' if is_bull else 'rsi_weak', 'volatility_good']
-            }
-            weights = {'candle_pattern': 25, 'trend': 30, 'volume': 25, 'technical': 20}
-            breakdown = {}
-            total = 0.0
-            for cat, keys in categories.items():
-                valid = 0
-                possible = 0
-                for k in keys:
-                    if k in conds:
-                        possible += 1
-                        try:
-                            if bool(conds[k]):
-                                valid += 1
-                        except Exception:
-                            pass
-                score = (valid / possible * 100) if possible else 0
-                breakdown[cat] = score
-                total += score * (weights[cat] / 100)
-            return total, breakdown
-
-        try:
-            if df_5min is not None and not df_5min.empty:
-                df_1h = df_5min.resample('60min', origin='start').agg({
-                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-                }).dropna()
-            else:
-                df_1h = pd.DataFrame()
-            ma20_1h = df_1h['Close'].rolling(20).mean()
-            df_1h = df_1h.loc[df_1h.index <= snapshot_df.index[-1]]
-            if not df_1h.empty and len(ma20_1h.dropna()) >= 2:
-                ma20_1h_last = ma20_1h.loc[df_1h.index[-1]]
-                ma20_1h_prev = ma20_1h.loc[df_1h.index[-2]] if len(ma20_1h.dropna()) >= 2 else ma20_1h_last
-                ma20_1h_slope = (ma20_1h_last - ma20_1h_prev) / ma20_1h_prev * 100 if ma20_1h_prev else 0
-            else:
-                ma20_1h_last = None
-                ma20_1h_slope = 0
-        except Exception:
-            ma20_1h_last = None
-            ma20_1h_slope = 0
-
-        ma1h_confirmation_bull = ma20_1h_last is not None and snapshot_df['Close'].iloc[-1] > ma20_1h_last
-        ma1h_confirmation_bear = ma20_1h_last is not None and snapshot_df['Close'].iloc[-1] < ma20_1h_last
-
-        breakout_retest_bull = False
-        breakout_retest_bear = False
-        if prev_high is not None:
-            try:
-                prior_lows = snapshot_df['Low'].iloc[:-1]
-                breakout_retest_bull = breakout_bull and (prior_lows.min() < prev_high)
-            except Exception:
-                breakout_retest_bull = breakout_bull
-        if prev_low is not None:
-            try:
-                prior_highs = snapshot_df['High'].iloc[:-1]
-                breakout_retest_bear = breakout_bear and (prior_highs.max() > prev_low)
-            except Exception:
-                breakout_retest_bear = breakout_bear
-
-        pos_di_last = None
-        neg_di_last = None
-        try:
-            if len(prior_data) >= 20:
-                pos_di_last = pos_di.iloc[-1]
-                neg_di_last = neg_di.iloc[-1]
-        except Exception:
-            pos_di_last = None
-            neg_di_last = None
-
-        adx_strong_bull = (adx is not None and adx > 30 and pos_di_last is not None and pos_di_last > neg_di_last)
-        adx_strong_bear = (adx is not None and adx > 30 and neg_di_last is not None and neg_di_last > pos_di_last)
-
-        try:
-            if ma44_list and ma44_list[0] and ma44_list[CANDLES_START-1]:
-                ma44_slope_pct = (ma44_list[CANDLES_START-1] - ma44_list[0]) / ma44_list[0] * 100
-            else:
-                ma44_slope_pct = 0
-        except Exception:
-            ma44_slope_pct = 0
-
-        ma44_slope_bull = ma44_slope_pct > 0.2
-        ma44_slope_bear = ma44_slope_pct < -0.2
-
-        try:
-            atr_last = atr.iloc[-1] if 'atr' in locals() and not atr.isna().all() else None
-            atr_pct = (atr_last / last_close * 100) if (atr_last and last_close) else None
-        except Exception:
-            atr_pct = None
-
-        atr_ok = (atr_pct is not None) and (0.4 <= atr_pct <= 3.5)
-
-        try:
-            last_range = snapshot_df['High'].iloc[-1] - snapshot_df['Low'].iloc[-1]
-            avg_range = (snapshot_df['High'] - snapshot_df['Low']).mean()
-            range_expansion = last_range > 1.2 * avg_range
-        except Exception:
-            range_expansion = False
-        try:
-            volume_expansion = snapshot_df['Volume'].iloc[-1] > 1.8 * avg_vol_recent
-        except Exception:
-            volume_expansion = False
-
-        # --- VOLUME LOGIC (CORE) ---
-        try:
-            prior_for_avg = ma44_source[ma44_source.index < snapshot_df.index[0]]
-            avg_volume_20 = prior_for_avg['Volume'].tail(20).mean() if not prior_for_avg.empty else None
-        except Exception:
-            avg_volume_20 = None
-
-        try:
-            current_vol = float(snapshot_df['Volume'].iloc[-1])
-        except Exception:
-            current_vol = None
-
-        try:
-            unusual_volume = (avg_volume_20 is not None) and (current_vol is not None) and (current_vol >= 2.0 * avg_volume_20)
-        except Exception:
-            unusual_volume = False
-
-        try:
-            vol_seq_ok = False
-            pos = None
-            try:
-                pos = df_30min.index.get_loc(snapshot_df.index[-1])
-            except Exception:
-                try:
-                    pos = df_30min.index.get_indexer_for([snapshot_df.index[-1]])[0]
-                except Exception:
-                    pos = None
-
-            if pos is not None and pos >= 2:
-                v_prev = float(df_30min['Volume'].iloc[pos-1])
-                v_prev2 = float(df_30min['Volume'].iloc[pos-2])
-                vol_seq_ok = (current_vol is not None) and (current_vol > v_prev) and (v_prev > v_prev2)
-            else:
-                if len(snapshot_df) >= 3:
-                    v_prev = float(snapshot_df['Volume'].iloc[-2])
-                    v_prev2 = float(snapshot_df['Volume'].iloc[-3])
-                    vol_seq_ok = (current_vol is not None) and (current_vol > v_prev) and (v_prev > v_prev2)
-        except Exception:
-            vol_seq_ok = False
-
-        try:
-            volume_confirmed = bool(unusual_volume and vol_seq_ok)
-        except Exception:
-            volume_confirmed = False
-
-        try:
-            last_o = snapshot_df['Open'].iloc[-1]
-            last_h = snapshot_df['High'].iloc[-1]
-            last_l = snapshot_df['Low'].iloc[-1]
-            last_c = snapshot_df['Close'].iloc[-1]
-        except Exception:
-            last_o = last_h = last_l = last_c = None
-
-        try:
-            bullish_volume_confirmed = (
-                volume_confirmed and last_c is not None and last_o is not None and last_h is not None and last_l is not None
-                and (last_c > last_o) and (last_c >= (last_h - (last_h - last_l) * 0.25))
-            )
-        except Exception:
-            bullish_volume_confirmed = False
-
-        try:
-            bearish_volume_confirmed = (
-                volume_confirmed and last_c is not None and last_o is not None and last_h is not None and last_l is not None
-                and (last_c < last_o) and (last_c <= (last_l + (last_h - last_l) * 0.25))
-            )
-        except Exception:
-            bearish_volume_confirmed = False
-
-        # If user opted NOT to consider unusual volume, override confirmations
-        try:
-            if not require_unusual_volume:
-                bullish_volume_confirmed = True
-                bearish_volume_confirmed = True
-        except Exception:
-            pass
-
-        ma1h_slope_ok_bull = ma20_1h_slope > 0
-        ma1h_slope_ok_bear = ma20_1h_slope < 0
-
-        delta = df_30min['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-10)
-        rsi = 100 - (100 / (1 + rs))
-
-        bullish_candle_pattern = (body_ratios[-1] > 0.6 and 
-                                snapshot_df['Close'].iloc[-1] > snapshot_df['Open'].iloc[-1] and
-                                snapshot_df['Close'].iloc[-1] > snapshot_df['Close'].iloc[-2])
-
-        bearish_candle_pattern = (body_ratios[-1] > 0.6 and 
-                                snapshot_df['Close'].iloc[-1] < snapshot_df['Open'].iloc[-1] and
-                                snapshot_df['Close'].iloc[-1] < snapshot_df['Close'].iloc[-2])
-
-        bullish_trend = all(ma44_list[i] < ma44_list[i+1] for i in range(len(ma44_list)-1))
-        bearish_trend = all(ma44_list[i] > ma44_list[i+1] for i in range(len(ma44_list)-1))
-        volume_ok = snapshot_df['Volume'].iloc[-1] > 1.2 * avg_vol_recent
-        rsi_ok = (30 <= rsi.iloc[-1] <= 70) if not rsi.empty else False
-
-        bullish_conditions = {
-            'strong_bodies': strong_bodies and all(r > 0.65 for r in body_ratios),
-            'clean_shadows': all(s < 0.25 for s in shadows_ratios),
-            'bullish_candles': all(snapshot_df['Close'] > snapshot_df['Open']),
-            'higher_highs': closes_increasing,
-            'above_ma': bullish_ma_touch,
-            'resistance_break': breakout_bull,
-            'clean_moves': no_gaps,
-            'ma_aligned': ma_alignment_bull,
-            'near_level': price_near_level,
-            'strong_trend': strong_trend,
-            'strong_volume': volume_strong,
-            'inst_buying': institutional_volume,
-            'above_vwap': vwap_trend,
-            'vol_trend_aligned': vrsi_at_4th > 60 if vrsi_at_4th is not None else False,
-            'momentum': strong_momentum,
-            'acceleration': accelerating_momentum,
-            'rsi_strong': rsi_bull and (rsi_at_4th < 80) if rsi_at_4th is not None else False,
-            'volatility_good': 0.8 < volatility_ratio < 2.0
-        }
-
-        bearish_conditions = {
-            'strong_bodies': strong_bodies and all(r > 0.65 for r in body_ratios),
-            'clean_shadows': all(s < 0.25 for s in shadows_ratios),
-            'bearish_candles': all(snapshot_df['Close'] < snapshot_df['Open']),
-            'lower_lows': closes_decreasing,
-            'below_ma': bearish_ma_touch,
-            'support_break': breakout_bear,
-            'clean_moves': no_gaps,
-            'ma_aligned': ma_alignment_bear,
-            'near_level': price_near_level,
-            'strong_trend': strong_trend,
-            'strong_volume': volume_strong,
-            'inst_selling': institutional_volume,
-            'below_vwap': not vwap_trend,
-            'vol_trend_aligned': vrsi_at_4th < 40 if vrsi_at_4th is not None else False,
-            'momentum': strong_momentum,
-            'acceleration': accelerating_momentum,
-            'rsi_weak': rsi_bear and (rsi_at_4th > 20) if rsi_at_4th is not None else False,
-            'volatility_good': 0.8 < volatility_ratio < 2.0
-        }
-
-        bull_score, bull_breakdown = calculate_signal_score(bullish_conditions, is_bull=True)
-        bear_score, bear_breakdown = calculate_signal_score(bearish_conditions, is_bull=False)
-
-        SURE_THRESHOLD = 75.0
-
-        bull_essential = all([
-            bullish_conditions.get('strong_bodies', False),
-            bullish_conditions.get('bullish_candles', False),
-            bullish_conditions.get('above_ma', False),
-            bullish_conditions.get('strong_volume', False),
-            bullish_conditions.get('momentum', False)
-        ])
-
-        bear_essential = all([
-            bearish_conditions.get('strong_bodies', False),
-            bearish_conditions.get('bearish_candles', False),
-            bearish_conditions.get('below_ma', False),
-            bearish_conditions.get('strong_volume', False),
-            bearish_conditions.get('momentum', False)
-        ])
-
-        sure_bullish = (bull_score >= SURE_THRESHOLD) and bull_essential
-        sure_bearish = (bear_score >= SURE_THRESHOLD) and bear_essential
-
-        conditions_bullish = (
-            all(snapshot_df['Close'] > snapshot_df['Open']) and
-            bullish_ma
-        )
-        conditions_bearish = (
-            all(snapshot_df['Close'] < snapshot_df['Open']) and
-            bearish_ma
-        )
-
-        if sure_bullish:
-            signal = "Sure Bullish"
-        elif sure_bearish:
-            signal = "Sure Bearish"
-        else:
-            signal = "Bullish" if conditions_bullish else "Bearish" if conditions_bearish else "No Signal"
-
-        # =====================================================================
-        # HARD GATE CONFIRMATIONS - Applied before final signal decision
-        # =====================================================================
-        
-        # Gate 1: Multi-Timeframe Confirmation (Daily EMA200)
-        # Calculate BOTH bullish and bearish trend conditions independently
-        daily_ema200 = None
-        bullish_daily_trend = False
-        bearish_daily_trend = False
-        try:
-            daily_ema200 = fetch_daily_data(symbol, trade_obj=trade_obj, inst_cache=inst_cache, inst_cache_lock=inst_cache_lock)
-            if daily_ema200 is not None:
-                bullish_daily_trend = (last_close > daily_ema200)
-                bearish_daily_trend = (last_close < daily_ema200)
-        except Exception as e:
-            print(f"[GATE-EMA200] {symbol}: {e}")
-            bullish_daily_trend = False
-            bearish_daily_trend = False
-        
-        # Gate 2: Strong Candle Body Filter (>75% of candle range)
-        strong_body_candle = False
-        try:
-            last_o = snapshot_df['Open'].iloc[-1]
-            last_c = snapshot_df['Close'].iloc[-1]
-            last_h = snapshot_df['High'].iloc[-1]
-            last_l = snapshot_df['Low'].iloc[-1]
-            body = abs(last_c - last_o)
-            candle_range = last_h - last_l
-            if candle_range > 0:
-                body_ratio = body / candle_range
-                strong_body_candle = body_ratio > 0.75
-            else:
-                body_ratio = 0.0
-                strong_body_candle = False
-        except Exception:
-            body_ratio = 0.0
-            strong_body_candle = False
-        
-        # Gate 3: Volume Pressure Filter (>=2.0x average volume)
-        volume_pressure_confirmed = False
-        try:
-            if avg_volume_20 is not None and current_vol is not None:
-                volume_pressure_confirmed = (current_vol >= 2.0 * avg_volume_20)
-        except Exception:
-            volume_pressure_confirmed = False
-        
-        # Gate 4: ADX Trend Confirmation (ADX > 25 and ADX rising)
-        adx_strong = False
-        adx_rising = False
-        try:
-            if adx is not None and adx > 0:
-                adx_strong = (adx > 25)
-                # Check if ADX is rising by comparing current to previous
-                if previous_adx is not None:
-                    adx_rising = (adx > previous_adx)
-                else:
-                    adx_rising = False
-        except Exception:
-            adx_strong = False
-            adx_rising = False
-        
-        # Gate 5: VWAP Confirmation (price above/below VWAP) - calculate independently
-        vwap_bullish = False
-        vwap_bearish = False
-        try:
-            vwap_bullish = (last_close > vwap)
-            vwap_bearish = (last_close < vwap)
-        except Exception:
-            vwap_bullish = False
-            vwap_bearish = False
-        
-        # Gate 6: Overextension Filter (distance from MA44)
-        # NOTE: Overextension only relabels the signal, does NOT block it in hard gates
-        distance_from_ma = 0.0
-        is_overextended = False
-        try:
-            if ma44_list and len(ma44_list) >= CANDLES_START and ma44_list[CANDLES_START-1]:
-                ma44_value = ma44_list[CANDLES_START-1]
-                if ma44_value > 0:
-                    distance_from_ma = abs(last_close - ma44_value) / ma44_value * 100
-                    is_overextended = (distance_from_ma > 2.5)
-        except Exception:
-            distance_from_ma = 0.0
-            is_overextended = False
-        
-        # Gate 7: Apply Overextension Relabeling (relabel only, does NOT block signal)
-        if is_overextended and signal.startswith("Sure"):
-            if signal == "Sure Bullish":
-                signal = "Overextended Bullish"
-            elif signal == "Sure Bearish":
-                signal = "Overextended Bearish"
-        
-        # Gate 8: Hard Gate Logic for "Sure" Signals
-        # All required gates must pass for "Sure Bullish" or "Sure Bearish" to remain
-        # NOTE: is_overextended is NOT included in the gates (only relabels)
-        if signal == "Sure Bullish":
-            all_gates_pass = all([
-                bullish_daily_trend,       # Must be above Daily EMA200
-                strong_body_candle,        # Must have body > 75% of range
-                volume_pressure_confirmed, # Must have 2x volume
-                adx_strong,                # Must have ADX > 25
-                adx_rising,                # Must have ADX rising
-                vwap_bullish               # Must be above VWAP
-            ])
-            if not all_gates_pass:
-                signal = "Bullish"  # Downgrade to regular Bullish
-        
-        elif signal == "Sure Bearish":
-            all_gates_pass = all([
-                bearish_daily_trend,       # Must be below Daily EMA200
-                strong_body_candle,        # Must have body > 75% of range
-                volume_pressure_confirmed, # Must have 2x volume
-                adx_strong,                # Must have ADX > 25
-                adx_rising,                # Must have ADX rising
-                vwap_bearish               # Must be below VWAP
-            ])
-            if not all_gates_pass:
-                signal = "Bearish"  # Downgrade to regular Bearish
-        
-        # Debug Dictionary - Verify all hard gate conditions
-        hard_gate_debug = {
-            "daily_ema_bull": bullish_daily_trend,
-            "daily_ema_bear": bearish_daily_trend,
-            "body_ratio": float(body_ratio),
-            "body_ratio_check": strong_body_candle,
-            "volume": volume_pressure_confirmed,
-            "adx_strong": adx_strong,
-            "adx_rising": adx_rising,
-            "vwap_bull": vwap_bullish,
-            "vwap_bear": vwap_bearish,
-            "overextended": is_overextended,
-            "distance_from_ma": float(distance_from_ma),
-            "final_signal": signal
-        }
-        
-        # Only print debug data if it's a Sure signal (for verification)
-        if signal.startswith("Sure") or signal.startswith("Overextended"):
-            print(f"[HARD-GATE] {symbol}: {hard_gate_debug}")
-        
-        # PART 4: Apply optional strong trend confirmation filter (if enabled)
-        if confirm_trend and signal != "No Signal":
-            try:
-                last_close = snapshot_df['Close'].iloc[-1]
-                last_open = snapshot_df['Open'].iloc[-1]
-                last_high = snapshot_df['High'].iloc[-1]
-                last_low = snapshot_df['Low'].iloc[-1]
-                
-                # Calculate candle body % of range (50% threshold)
-                body = abs(last_close - last_open)
-                candle_range = last_high - last_low
-                strong_body = body > (candle_range * 0.5) if candle_range > 0 else False
-                
-                # Volume above 20-candle average
-                avg_volume_20 = snapshot_df['Volume'].tail(20).mean()
-                last_volume = snapshot_df['Volume'].iloc[-1]
-                volume_confirm = last_volume > avg_volume_20 if avg_volume_20 > 0 else False
-                
-                # MA44 confirmation
-                if ma44_list and ma44_list[-1] is not None:
-                    ma44_last = ma44_list[-1]
-                    bullish_ma_confirm = last_close > ma44_last
-                    bearish_ma_confirm = last_close < ma44_last
-                else:
-                    bullish_ma_confirm = False
-                    bearish_ma_confirm = False
-                
-                # Apply filter: if bullish signal but conditions not met, downgrade
-                if signal.startswith("Bullish"):
-                    if not (bullish_ma_confirm and strong_body and volume_confirm):
-                        signal = "No Signal"
-                # Apply filter: if bearish signal but conditions not met, downgrade
-                elif signal.startswith("Bearish"):
-                    if not (bearish_ma_confirm and strong_body and volume_confirm):
-                        signal = "No Signal"
-            except Exception:
-                pass
-
-        try:
-            if signal == "Sure Bullish" and not bullish_volume_confirmed:
-                signal = "Bullish"
-            if signal == "Bullish" and not bullish_volume_confirmed:
-                signal = "No Signal"
-
-            if signal == "Sure Bearish" and not bearish_volume_confirmed:
-                signal = "Bearish"
-            if signal == "Bearish" and not bearish_volume_confirmed:
-                signal = "No Signal"
-        except Exception:
-            pass
-
-        # -------------------------------------------------------
-        # DAILY TREND FILTER (optional)
-        # -------------------------------------------------------
-        daily_ma44 = None
-        daily_ma200 = None
-        daily_close = None
-        daily_bullish_trend = False
-        daily_bearish_trend = False
-        if daily_trend_filter:
-            # ensure daily data is cached
-            if symbol not in daily_cache or 'df' not in daily_cache[symbol]:
-                # this call will populate cache
-                _ = fetch_daily_data(symbol, trade_obj=trade_obj, inst_cache=inst_cache, inst_cache_lock=inst_cache_lock)
-            df_daily = daily_cache.get(symbol, {}).get('df')
-            if df_daily is not None and not df_daily.empty:
-                try:
-                    df_local = df_daily.copy()
-                    df_local['daily_ma44'] = df_local['Close'].rolling(44).mean()
-                    df_local['daily_ma200'] = df_local['Close'].rolling(200).mean()
-                    daily_ma44 = df_local['daily_ma44'].iloc[-1]
-                    daily_ma200 = df_local['daily_ma200'].iloc[-1]
-                    daily_close = df_local['Close'].iloc[-1]
-                except Exception:
-                    daily_ma44 = None
-                    daily_ma200 = None
-                    daily_close = None
-            # intraday 30-min trend
-            try:
-                last_candles = df_30min.tail(6)
-                green_candles = all(last_candles['Close'] > last_candles['Open'])
-                red_candles = all(last_candles['Close'] < last_candles['Open'])
-                ma44_last = ma44_list[CANDLES_START-1] if ma44_list and len(ma44_list) >= CANDLES_START else None
-                above_ma44 = all(last_candles['Close'] > ma44_last) if ma44_last is not None else False
-                below_ma44 = all(last_candles['Close'] < ma44_last) if ma44_last is not None else False
-
-                daily_bullish_trend = (
-                    daily_ma44 is not None and daily_ma200 is not None and daily_close is not None and
-                    (daily_ma44 > daily_ma200) and
-                    (daily_close > daily_ma44) and
-                    (daily_close > daily_ma200) and
-                    green_candles and above_ma44
-                )
-                daily_bearish_trend = (
-                    daily_ma44 is not None and daily_ma200 is not None and daily_close is not None and
-                    (daily_ma44 < daily_ma200) and
-                    (daily_close < daily_ma44) and
-                    (daily_close < daily_ma200) and
-                    red_candles and below_ma44
-                )
-
-            except Exception:
-                daily_bullish_trend = False
-                daily_bearish_trend = False
-
-            # apply filter to final signal
-            if signal in ["Bullish", "Sure Bullish"] and not daily_bullish_trend:
-                signal = "No Signal"
-            if signal in ["Bearish", "Sure Bearish"] and not daily_bearish_trend:
-                signal = "No Signal"
-        # -------------------------------------------------------
-
-        # always apply 44MA filter : candles must stay above/below MA44 for bullish/bearish
-        if signal.startswith("Bullish") and last_c is not None and ma44_list and ma44_list[-1] is not None:
-            if last_c <= ma44_list[-1]:
-                return None
-        elif signal.startswith("Bearish") and last_c is not None and ma44_list and ma44_list[-1] is not None:
-            if last_c >= ma44_list[-1]:
-                return None
-
-        volume_status = "High" if snapshot_df['Volume'].mean() > df_30min['Volume'].mean() else "Low"
-
-        first_open = snapshot_df.iloc[0]['Open']
-        last_close = snapshot_df.iloc[len(snapshot_df) - 1]['Close']
-        if first_open and last_close:
-            move_pct = ((last_close - first_open) / first_open) * 100
-            if move_pct > 0.5:
-                top_mover = f"Top Up ({move_pct:.2f}%)"
-                top_gainer_loser = "Top Gainer"
-            elif move_pct < -0.5:
-                top_mover = f"Top Down ({move_pct:.2f}%)"
-                top_gainer_loser = "Top Loser"
-            else:
-                top_mover = f"No Move ({move_pct:.2f}%)"
-                top_gainer_loser = "No Change"
-        else:
-            top_mover = "NA"
-            top_gainer_loser = "NA"
-
-        try:
-            prior_30min = df_30min[df_30min.index < snapshot_df.index[0]] if (not df_30min.empty and len(snapshot_df) > 0) else pd.DataFrame()
-            prior_vol = prior_30min['Volume'].tail(44).mean() if len(prior_30min) >= 44 else None
-        except Exception:
-            prior_30min = pd.DataFrame()
-            prior_vol = None
-        snapshot_vol = snapshot_df['Volume'].mean()
-        volume_spike = "Yes" if prior_vol and snapshot_vol > 1.5 * prior_vol else "No"
-
-        ma_distance = "NA"
-        try:
-            if ma44_list and len(ma44_list) >= len(snapshot_df) and ma44_list[len(snapshot_df)-1] and len(snapshot_df) >= len(snapshot_df) and snapshot_df.iloc[len(snapshot_df)-1]['Close']:
-                ma_distance_val = ((snapshot_df.iloc[len(snapshot_df)-1]['Close'] - ma44_list[len(snapshot_df)-1]) / ma44_list[len(snapshot_df)-1]) * 100
-                ma_distance = f"{ma_distance_val:.2f}%"
-        except Exception:
-            ma_distance = "NA"
-
-        strength_score = 0
-        if all(snapshot_df['Close'] > snapshot_df['Open']):
-            strength_score += 2
-        elif all(snapshot_df['Close'] < snapshot_df['Open']):
-            strength_score -= 2
-        if volume_spike == "Yes":
-            strength_score += 1 if signal == "Bullish" else -1
-        try:
-            if abs(float(ma_distance.strip('%'))) > 1.5:
-                strength_score += 1 if signal == "Bullish" else -1
-        except:
-            pass
-
-        # Ensure daily MA values always exist for result display
-        if daily_ma44 is None:
-            daily_ma44 = "NA"
-        if daily_ma200 is None:
-            daily_ma200 = "NA"
-
-        result = {
-            "Symbol": symbol,
-            "Signal": signal,
-            "Vol Confirm": "YES" if (bullish_volume_confirmed or bearish_volume_confirmed) else "NO",
-            "bullish_vol_confirmed": bool(bullish_volume_confirmed),
-            "bearish_vol_confirmed": bool(bearish_volume_confirmed),
-            "Strength": strength_score,
-            "Volume": volume_status,
-            "Top Mover": top_mover,
-            "Top": top_gainer_loser,
-            "Volume Spike": volume_spike,
-            "MA Distance": ma_distance,
-            "Daily_MA44": daily_ma44,
-            "Daily_MA200": daily_ma200,
-            "1st Open": snapshot_df.iloc[0]['Open'] if len(snapshot_df) > 0 else None,
-            "1st Close": snapshot_df.iloc[0]['Close'] if len(snapshot_df) > 0 else None,
-            "2nd Open": snapshot_df.iloc[1]['Open'] if len(snapshot_df) > 1 else None,
-            "2nd Close": snapshot_df.iloc[1]['Close'] if len(snapshot_df) > 1 else None,
-            "3rd Open": snapshot_df.iloc[2]['Open'] if len(snapshot_df) > 2 else None,
-            "3rd Close": snapshot_df.iloc[2]['Close'] if len(snapshot_df) > 2 else None,
-            "4th Open": snapshot_df.iloc[3]['Open'] if len(snapshot_df) > 3 else None,
-            "4th Close": snapshot_df.iloc[3]['Close'] if len(snapshot_df) > 3 else None,
-            "5th Open": snapshot_df.iloc[4]['Open'] if len(snapshot_df) > 4 else None,
-            "5th Close": snapshot_df.iloc[4]['Close'] if len(snapshot_df) > 4 else None,
-            "6th Open": snapshot_df.iloc[5]['Open'] if len(snapshot_df) > 5 else None,
-            "6th Close": snapshot_df.iloc[5]['Close'] if len(snapshot_df) > 5 else None,
-            "1st 44MA": ma44_list[0] if len(ma44_list) > 0 else None,
-            "2nd 44MA": ma44_list[1] if len(ma44_list) > 1 else None,
-            "3rd 44MA": ma44_list[2] if len(ma44_list) > 2 else None,
-            "4th 44MA": ma44_list[3] if len(ma44_list) > 3 else None,
-            "5th 44MA": (ma44_list[4] if len(ma44_list) > 4 and CANDLES_START >= 5 else None),
-            "6th 44MA": (ma44_list[5] if len(ma44_list) > 5 and CANDLES_START >= 6 else None),
-            "UnusualPriority": 1 if unusual_volume else 0,
-            "Score": bull_score if signal.startswith("Bullish") else bear_score if signal.startswith("Bearish") else 0,
-        }
-        return result
-    except Exception as e:
-        print(f"[SCAN ERROR] {symbol}: {e}")
-        return None
-
-
-def run_screening(stocks, mode, selected_date, timeframe, candle_count, results_container=None, require_unusual_volume=True, confirm_trend=False, daily_trend_filter=False, status_text=None):
-    """
-    Main screening function that returns results list
-    Optionally updates results_container in real-time
-    """
-    global CANDLES_START, SCAN_TIME
-    
-    # Map timeframe and candle count to settings (30m only)
-    if candle_count == "4C":
-        CANDLES_START = 4
-        SCAN_TIME = "11:15"
-    elif candle_count == "5C":
-        CANDLES_START = 5
-        SCAN_TIME = "11:45"
-    elif candle_count == "6C":
-        CANDLES_START = 6
-        SCAN_TIME = "12:15"
-    else:
-        CANDLES_START = 5
-        SCAN_TIME = "11:45"
-    
-    results = []
-    total_stocks = len(stocks)
-    progress_bar = st.progress(0)
-    progress_text = st.empty()
-    scan_status = st.empty()  # show current symbol
-    status_text = st.empty()
-    
+# =============================================================================
+# MARKET CALENDAR
+# =============================================================================
+HOLIDAYS = {
+    (1,26),(2,26),(3,15),(4,10),(5,24),(5,26),
+    (8,15),(8,27),(9,30),(10,2),(10,12),(10,24),(10,25),
+    (11,1),(11,11),(12,25)
+}
+def is_trading_day(d):
+    return d.weekday() < 5 and (d.month, d.day) not in HOLIDAYS
+
+def last_trading_day(d=None):
     tz = pytz.timezone('Asia/Kolkata')
-    if mode == "Historical":
-        try:
-            start_date = datetime.strptime(selected_date, "%Y-%m-%d")
-            today = datetime.now(tz)
-            days_diff = (today.date() - start_date.date()).days
-            if days_diff < 0 or days_diff > 30:
-                status_text.error("Historical intraday data is limited. Please select a recent weekday within the last 30 days.")
-                return results
-            if start_date.weekday() > 4:
-                prev_day = start_date
-                while prev_day.weekday() > 4:
-                    prev_day -= timedelta(days=1)
-                status_text.info(f"Selected date {start_date.date()} is weekend. Using previous working day {prev_day.date()} for screening.")
-                start_date = prev_day
-            # If selected date is today, fetch up to now
-            if start_date.date() == today.date():
-                start_dt = today.replace(hour=9, minute=15, second=0, microsecond=0)
-                end_dt = today
-            else:
-                start_dt = tz.localize(datetime.combine(start_date.date(), datetime.min.time()).replace(hour=9, minute=15))
-                end_dt = tz.localize(datetime.combine(start_date.date(), datetime.min.time()).replace(hour=15, minute=30))
-            # send raw datetime objects to fetch functions (avoid string formatting bug)
-            fetch_start = start_dt - timedelta(days=10)
-            fetch_end = end_dt + timedelta(days=1)
-            filter_date = start_date.date()
-        except ValueError:
-            status_text.error("Invalid date format. Please use YYYY-MM-DD.")
-            return results
-    else:
-        today = datetime.now(tz)
-        last_trading_day = get_last_trading_day(today.date())
-        
-        # If today is not a trading day, show notification and use last trading day
-        if today.date() != last_trading_day:
-            if date.today().weekday() >= 5:
-                msg = f"📅 Weekend detected! Using last trading day ({last_trading_day.strftime('%Y-%m-%d')}) for Live scan."
-            else:
-                msg = f"🏖️ Market holiday today! Using last trading day ({last_trading_day.strftime('%Y-%m-%d')}) for Live scan."
-            status_text.warning(msg)
-            # Use last trading day as the live scan date
-            live_scan_date = last_trading_day
-        else:
-            status_text.info("📊 Live mode: Scanning today's market data")
-            live_scan_date = today.date()
+    if d is None: d = datetime.now(tz).date()
+    c = d
+    for _ in range(15):
+        if is_trading_day(c): return c
+        c -= timedelta(days=1)
+    return d
 
-        start_dt = tz.localize(datetime.combine(live_scan_date, datetime.min.time()).replace(hour=9, minute=15))
-        end_dt = datetime.now(tz)
-        # use datetime objects directly
-        fetch_start = start_dt - timedelta(days=10)
-        fetch_end = end_dt
-        filter_date = live_scan_date
+def prior_trading_days(from_date, n):
+    days, c = [], from_date - timedelta(days=1)
+    while len(days) < n:
+        if is_trading_day(c): days.append(c)
+        c -= timedelta(days=1)
+    return days
 
-    # =====================================================================
-    # HARD SNAPSHOT ISOLATION: Calculate snapshot time and limit fetch_end
-    # =====================================================================
-    snapshot_time_map = {
-        "4C": dt_time(11, 15),
-        "5C": dt_time(11, 45),
-        "6C": dt_time(12, 15)
-    }
-    snapshot_time = snapshot_time_map.get(candle_count, dt_time(11, 45))
-    snapshot_dt = datetime.combine(filter_date, snapshot_time)
-    snapshot_dt = tz.localize(snapshot_dt)
-    
-    # CRITICAL: System behaves like script ran exactly at snapshot_time
-    # Never fetch data beyond the snapshot point
-    if mode == "Live":
-        snapshot_dt = min(snapshot_dt, datetime.now(tz))
-    fetch_end = min(snapshot_dt, fetch_end)
-
-    # NOTE: skipping sequential prefetch of instruments to avoid startup delay.
-    # Workers will resolve instruments into the local `inst_cache` concurrently.
-
-    # Fetch 5-min data in parallel (limit workers to avoid broker rate limits)
-    # make sure cache exists
-    if "instrument_cache" not in st.session_state:
-        st.session_state.instrument_cache = {}
-
-    # grab broker connection *before* launching any workers; streamlit context
-    # is not available inside spawned threads, so we must capture the object now.
-    trade_obj = st.session_state.get('alice_trade')
-    if not trade_obj:
-        status_text.error("❌ Not connected to Alice Blue. Please authenticate before running the screener.")
-        return results
-
-    # local copy of cache for workers
-    inst_cache = {}
-    inst_cache_lock = threading.Lock()
+# =============================================================================
+# INSTRUMENT CACHE
+# =============================================================================
+def get_inst(sym, trade, cache, lock):
+    with lock:
+        if sym in cache: return cache[sym]
+    clean = sym.replace('.NS','') if sym.upper().endswith('.NS') else sym
     try:
-        if isinstance(st.session_state.get('instrument_cache', None), dict):
-            inst_cache.update(st.session_state.get('instrument_cache', {}))
-    except Exception:
-        pass
+        inst = trade.get_instrument(exchange=Exchange.NSE, symbol=clean)
+        if inst:
+            with lock: cache[sym] = inst
+        return inst
+    except Exception: return None
 
-    # nested processing function handles fetch/resample/snapshot and then calls scan_stock
-    def process_symbol(symbol):
+# =============================================================================
+# FETCH 1-MIN DATA
+# =============================================================================
+def fetch_raw(sym, from_dt, to_dt, trade, cache, lock):
+    try:
+        inst = get_inst(sym, trade, cache, lock)
+        if inst is None: return None
+
+        result = trade.get_HistoricalData(
+            instrument=inst, resolution="1",
+            from_datetime=from_dt, to_datetime=to_dt, indices=False)
+
+        df = None
+        if isinstance(result, list) and result:
+            df = pd.DataFrame(result)
+        elif isinstance(result, dict):
+            if result.get('stat') == 'Ok' and 'data' in result:
+                df = pd.DataFrame(result['data'])
+            else: return None
+        elif isinstance(result, pd.DataFrame): df = result.copy()
+        else:
+            try: df = pd.DataFrame(result)
+            except Exception: return None
+
+        if df is None or df.empty: return None
+        df = df.copy()
+
+        if 'datetime' in list(df.columns):
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df.set_index('datetime', inplace=True)
+
+        cl = {c.lower(): c for c in df.columns}
+        rn = {cl[r.lower()]: r for r in ['Open','High','Low','Close','Volume']
+              if r.lower() in cl and cl[r.lower()] != r}
+        if rn: df = df.rename(columns=rn)
+
+        for r in ['Open','High','Low','Close','Volume']:
+            if r not in df.columns: return None
+
         try:
-            # use the thread‑safe worker variant which accepts an explicit trade
-            # object and a shared instrument cache.  This avoids touching
-            # st.session_state from within a ThreadPoolExecutor worker, which
-            # triggers Streamlit warnings and causes `None` to be returned.
-            df_5min = None
-            # retry loop for robustness against transient API glitches
-            for attempt in range(3):
-                df_5min = fetch_5min_data_worker(
-                    symbol,
-                    fetch_start,
-                    fetch_end,
-                    trade_obj=trade_obj,
-                    inst_cache=inst_cache,
-                    inst_cache_lock=inst_cache_lock,
-                )
-                # validation
-                if df_5min is not None and not (hasattr(df_5min, 'empty') and df_5min.empty):
-                    df_5min = df_5min[~df_5min.index.duplicated(keep="last")]
-                    df_5min = df_5min.sort_index()
-                    df_5min = df_5min.dropna(subset=["Open","High","Low","Close"])
-                    df_5min = df_5min[df_5min["High"] >= df_5min["Low"]]
-                    if len(df_5min) >= 50:
-                        break
-                time.sleep(0.2)
-            # EARLY SKIP: If not enough 5min data, skip this symbol
-            if df_5min is None or (hasattr(df_5min, 'empty') and df_5min.empty) or len(df_5min) < 50:
-                return None
+            if df.index.tzinfo is None:
+                df.index = pd.to_datetime(df.index).tz_localize('Asia/Kolkata')
+            else:
+                df.index = df.index.tz_convert('Asia/Kolkata')
+        except Exception: return None
 
-            df_30min_full = resample_to_30min(df_5min)
-            if df_30min_full is None or df_30min_full.empty:
-                del df_5min
-                return None
-            df_30min_full = df_30min_full.sort_index()
-            df_30min_full['date'] = df_30min_full.index.to_series().dt.normalize().dt.date
+        df = df.sort_index()[['Open','High','Low','Close','Volume']]
+        df = df[~df.index.duplicated(keep='last')]
+        for c in ['Open','High','Low','Close','Volume']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df = df.dropna(subset=['Open','High','Low','Close'])
+        return df if not df.empty else None
 
-            # HARD SNAPSHOT ISOLATION: Slice and immediately delete full version
-            df_30min = df_30min_full[df_30min_full.index <= snapshot_dt]
-            del df_30min_full  # Free memory, ensure no accidental use of full data
+    except Exception as e:
+        if DEBUG: print(f"[FETCH] {sym}: {e}")
+        return None
 
-            required_count = int(candle_count[0])
-            day_df = df_30min[df_30min['date'] == filter_date]
-            if len(day_df) < required_count:
-                del df_5min
-                del df_30min
-                return None
+# =============================================================================
+# RESAMPLE TO 15-MIN
+# =============================================================================
+def to_15min(df, cutoff_time=None):
+    """Resample 1-min data to 15-min candles.
+    
+    Args:
+        df: 1-min price data
+        cutoff_time: Optional datetime to limit data (e.g., for scan time cutoff).
+                     If provided, only data up to this time is included.
+    """
+    if df is None or df.empty: return pd.DataFrame()
+    try:
+        tz = 'Asia/Kolkata'
+        if df.index.tzinfo is None:
+            df.index = df.index.tz_localize(tz)
+        elif str(df.index.tz) != tz:
+            df.index = df.index.tz_convert(tz)
+        
+        # Filter to market hours 9:15-15:30
+        df = df[(df.index.time >= dt_time(9,15)) &
+                (df.index.time <= dt_time(15,30))]
+        
+        # If cutoff_time provided, only include data up to that time
+        if cutoff_time is not None:
+            if cutoff_time.tzinfo is None:
+                cutoff_time = cutoff_time.replace(tzinfo=pytz.timezone(tz))
+            df = df[df.index <= cutoff_time]
+        
+        if df.empty: return pd.DataFrame()
+        out = df[['Open','High','Low','Close','Volume']].resample(
+            '15min', origin='start_day', offset='9h15min',
+            label='left', closed='left'
+        ).agg({'Open':'first','High':'max','Low':'min',
+               'Close':'last','Volume':'sum'})
+        return out[out['Close'].notna()]
+    except Exception: return pd.DataFrame()
 
-            result = scan_stock(symbol, df_30min, df_5min, filter_date, timeframe, candle_count, require_unusual_volume, mode, snapshot_dt, confirm_trend, daily_trend_filter, trade_obj, inst_cache, inst_cache_lock)
-            # memory cleanup
-            try:
-                del df_5min
-            except Exception:
-                pass
-            try:
-                del df_30min
-            except Exception:
-                pass
-            return result
-        except Exception as e:
-            print(f"[PROCESS ERROR] {symbol}: {e}")
+# =============================================================================
+# ADX
+# =============================================================================
+def calc_adx(df15, period=14):
+    try:
+        if len(df15) < period + 5: return None, None, None
+        h = df15['High']; l = df15['Low']; c = df15['Close']
+        tr   = pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+        pdm  = (h-h.shift()).clip(lower=0)
+        ndm  = (l.shift()-l).clip(lower=0)
+        pdm[pdm<ndm]=0; ndm[ndm<pdm]=0
+        atr  = tr.ewm(span=period,adjust=False).mean()
+        pdi  = 100*pdm.ewm(span=period,adjust=False).mean()/atr.replace(0,np.nan)
+        ndi  = 100*ndm.ewm(span=period,adjust=False).mean()/atr.replace(0,np.nan)
+        dx   = 100*(pdi-ndi).abs()/(pdi+ndi).replace(0,np.nan)
+        adx  = dx.ewm(span=period,adjust=False).mean()
+        return float(adx.iloc[-1]), float(pdi.iloc[-1]), float(ndi.iloc[-1])
+    except Exception: return None, None, None
+
+# =============================================================================
+# CORE SCAN — ONE STOCK
+# =============================================================================
+def scan_stock(sym, scan_date, scan_hour, scan_min, n_candles, trade, cache, lock):
+    try:
+        tz = pytz.timezone('Asia/Kolkata')
+
+        # Single wide fetch: 20 days back → scan time
+        fd = tz.localize(datetime.combine(scan_date - timedelta(days=20), dt_time(9,0)))
+        td = tz.localize(datetime.combine(scan_date, dt_time(scan_hour, scan_min+1)))
+        
+        # Exact scan datetime for data cutoff
+        scan_datetime = tz.localize(datetime.combine(scan_date, dt_time(scan_hour, scan_min)))
+
+        df_raw = fetch_raw(sym, fd, td, trade, cache, lock)
+        if df_raw is None or df_raw.empty or len(df_raw) < 30:
             return None
 
-    # execute symbols in parallel using optimized thread pool
-    # follow recommended formula: CPUs*3 capped at 20
-    max_workers = min(20, (os.cpu_count() or 4) * 3)
-    completed = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_symbol, s): s for s in stocks}
-        for future in as_completed(futures):
-            sym = futures[future]
+        # Use explicit date conversion with timezone awareness to avoid boundary issues
+        df_raw_tz = df_raw.copy()
+        if df_raw_tz.index.tzinfo is None:
+            df_raw_tz.index = df_raw_tz.index.tz_localize('Asia/Kolkata')
+        elif str(df_raw_tz.index.tz) != 'Asia/Kolkata':
+            df_raw_tz.index = df_raw_tz.index.tz_convert('Asia/Kolkata')
+        
+        # Filter by converting index to date in IST timezone
+        df_raw_tz['_date'] = df_raw_tz.index.date
+        df_today = df_raw_tz[df_raw_tz['_date'] == scan_date].drop('_date', axis=1)
+        df_prior = df_raw_tz[df_raw_tz['_date']  < scan_date].drop('_date', axis=1)
+        if df_today.empty or df_prior.empty: return None
+
+        prior_days = sorted(set(df_prior.index.date), reverse=True)
+        if len(prior_days) < 2: return None
+
+        # ── PREV DAY ──────────────────────────────────────────────────────────
+        prev_df    = df_prior[df_prior.index.date == prior_days[0]]
+        if prev_df.empty: return None
+        prev_close = float(prev_df['Close'].iloc[-1])
+        prev_high  = float(prev_df['High'].max())
+        prev_low   = float(prev_df['Low'].min())
+
+        # ── TODAY 15-MIN CANDLES ──────────────────────────────────────────────
+        # IMPORTANT: Only include candles up to scan time (11:00 AM or 11:30 AM)
+        # This ensures we don't use future data that hasn't occurred yet
+        snap15 = to_15min(df_today, cutoff_time=scan_datetime)
+        if snap15 is None or len(snap15) < n_candles: return None
+        snap = snap15.head(n_candles).copy()
+
+        C  = snap['Close'].values
+        O  = snap['Open'].values
+        H  = snap['High'].values
+        L  = snap['Low'].values
+        V  = snap['Volume'].values
+
+        first_open  = float(O[0])   # 9:15 AM open price
+        first_close = float(C[0])   # 9:15–9:30 AM close
+        first_high  = float(H[0])
+        first_low   = float(L[0])
+        last_close  = float(C[-1])  # price at scan time
+
+        # ══════════════════════════════════════════════════════════════════════
+        # CHECK 1 — FIRST CANDLE SETS DIRECTION STRONGLY
+        # The 9:15 candle must be a strong directional candle.
+        # Body >= 55% of total range = conviction, not indecision.
+        # ══════════════════════════════════════════════════════════════════════
+        first_range = first_high - first_low
+        first_body  = abs(first_close - first_open)
+
+        if first_range <= 0: return None
+        first_body_ratio = first_body / first_range
+
+        if first_body_ratio < FIRST_BODY_MIN:
+            return None  # weak first candle — doji/spinning top — skip
+
+        # Direction from first candle
+        if first_close > first_open:
+            direction = 'BULL'
+        elif first_close < first_open:
+            direction = 'BEAR'
+        else:
+            return None  # flat first candle
+
+        # ══════════════════════════════════════════════════════════════════════
+        # CHECK 2 — CANDLES CONTINUE IN SAME DIRECTION
+        # Count how many candles reversed direction.
+        # Allow max 1 reversal (small pullback is ok).
+        # ══════════════════════════════════════════════════════════════════════
+        if direction == 'BULL':
+            reversals = sum(1 for i in range(1, len(C)) if C[i] < C[i-1])
+        else:
+            reversals = sum(1 for i in range(1, len(C)) if C[i] > C[i-1])
+
+        if reversals > MAX_REVERSALS:
+            return None  # too choppy
+
+        # ══════════════════════════════════════════════════════════════════════
+        # CHECK 3 — PRICE HAS NOT RECOVERED BACK TO OPEN
+        # If price recovered to the opening level, trend is over.
+        # Bull: last close must still be above first candle open
+        # Bear: last close must still be below first candle open
+        # Also: move from first open to last close must be >= 0.5%
+        # ══════════════════════════════════════════════════════════════════════
+        open_to_now_pct = (last_close - first_open) / first_open * 100
+
+        if direction == 'BULL':
+            if last_close <= first_open * 1.003:  # must be at least 0.3% above open
+                return None
+            if open_to_now_pct < 0.3:
+                return None
+        else:
+            if last_close >= first_open * 0.997:  # must be at least 0.3% below open
+                return None
+            if open_to_now_pct > -0.3:
+                return None
+
+        # ══════════════════════════════════════════════════════════════════════
+        # CHECK 4 — TOTAL MOVE FROM YESTERDAY'S CLOSE >= 1%
+        # Ensures we capture meaningful points, not tiny moves.
+        # ══════════════════════════════════════════════════════════════════════
+        move_from_prev = (last_close - prev_close) / prev_close * 100
+
+        if direction == 'BULL' and move_from_prev < MIN_MOVE_PCT:
+            return None
+        if direction == 'BEAR' and move_from_prev > -MIN_MOVE_PCT:
+            return None
+
+        # ══════════════════════════════════════════════════════════════════════
+        # CHECK 5 — VOLUME ABOVE AVERAGE (1.5x)
+        # Confirms institutions are driving the move, not just retail.
+        # ══════════════════════════════════════════════════════════════════════
+        prev_vols = []
+        for d in prior_days[:5]:
+            ddf = df_prior[df_prior.index.date == d]
+            if not ddf.empty:
+                d15 = to_15min(ddf)
+                if d15 is not None and not d15.empty:
+                    prev_vols.append(float(d15.head(n_candles)['Volume'].sum()))
+
+        today_vol = float(np.sum(V))
+        avg_vol   = float(np.mean(prev_vols)) if prev_vols else today_vol
+        vol_ratio = today_vol / avg_vol if avg_vol > 0 else 1.0
+
+        if vol_ratio < VOL_MULT:
+            return None
+
+        # ══════════════════════════════════════════════════════════════════════
+        # CHECK 6 — VWAP CONFIRMS DIRECTION
+        # Price must be clearly above (bull) or below (bear) VWAP.
+        # Near VWAP = direction contested = skip.
+        # ══════════════════════════════════════════════════════════════════════
+        tp   = (snap['High'] + snap['Low'] + snap['Close']) / 3
+        vol  = snap['Volume'].replace(0, np.nan)
+        vwap = float((tp*vol).sum() / vol.sum()) if vol.sum() > 0 else last_close
+
+        vwap_dist = (last_close - vwap) / vwap
+
+        if direction == 'BULL' and vwap_dist < VWAP_MIN_SEP:
+            return None
+        if direction == 'BEAR' and vwap_dist > -VWAP_MIN_SEP:
+            return None
+
+        # ══════════════════════════════════════════════════════════════════════
+        # CHECK 7 — ADX CONFIRMS TREND STRENGTH
+        # ADX >= 20 = real trend. < 20 = sideways/choppy.
+        # Use full day data for ADX (not limited to scan time) for better trend assessment
+        # ══════════════════════════════════════════════════════════════════════
+        df_all_15 = to_15min(df_raw, cutoff_time=None)
+        adx, pdi, ndi = calc_adx(df_all_15) if (
+            df_all_15 is not None and len(df_all_15) >= 20) else (None, None, None)
+
+        if adx is not None:
+            if adx < ADX_MIN: return None
+            if direction == 'BULL' and pdi is not None and pdi < ndi: return None
+            if direction == 'BEAR' and ndi is not None and ndi < pdi: return None
+
+        # ══════════════════════════════════════════════════════════════════════
+        # ALL 7 CHECKS PASSED — COMPUTE SCORE FOR RANKING
+        # ══════════════════════════════════════════════════════════════════════
+        score = 0
+
+        # First candle strength (25 pts)
+        score += int(25 * min(first_body_ratio / 0.8, 1.0))
+
+        # Candle cleanliness (20 pts)
+        score += 20 - (reversals * 10)
+
+        # Volume strength (25 pts)
+        if   vol_ratio >= 4.0: score += 25
+        elif vol_ratio >= 3.0: score += 20
+        elif vol_ratio >= 2.0: score += 15
+        elif vol_ratio >= 1.5: score += 10
+        else:                  score += 5
+
+        # ADX strength (15 pts)
+        if adx is not None:
+            if   adx >= 35: score += 15
+            elif adx >= 28: score += 11
+            elif adx >= 20: score += 7
+
+        # VWAP separation (15 pts)
+        vd = abs(vwap_dist) * 100
+        if   vd >= 1.5: score += 15
+        elif vd >= 1.0: score += 11
+        elif vd >= 0.5: score += 7
+        else:           score += 3
+
+        score = max(0, min(score, 100))
+
+        # ── PATTERN TYPE ──────────────────────────────────────────────────────
+        gap_pct = (first_open - prev_close) / prev_close * 100
+        if abs(gap_pct) >= 1.5:
+            if (direction == 'BULL' and gap_pct > 0):
+                pattern = f"Gap Up +{gap_pct:.1f}% → Bull"
+            elif (direction == 'BEAR' and gap_pct < 0):
+                pattern = f"Gap Down {gap_pct:.1f}% → Bear"
+            elif (direction == 'BEAR' and gap_pct > 0):
+                pattern = f"Gap Up +{gap_pct:.1f}% → Fade (Short)"
+            else:
+                pattern = f"Gap Down {gap_pct:.1f}% → Bounce (Buy)"
+        else:
+            pattern = "Momentum" + (" Bull" if direction == 'BULL' else " Bear")
+
+        # ── ENTRY / SL / TARGET ───────────────────────────────────────────────
+        entry = last_close
+        if direction == 'BULL':
+            morning_low  = float(np.min(L))
+            sl    = round(min(morning_low, prev_low) * 0.999, 2)
+            risk  = max(entry - sl, entry * 0.004)
+            sl    = round(entry - risk, 2)
+            target= round(entry + RR * risk, 2)
+        else:
+            morning_high = float(np.max(H))
+            sl    = round(max(morning_high, prev_high) * 1.001, 2)
+            risk  = max(sl - entry, entry * 0.004)
+            sl    = round(entry + risk, 2)
+            target= round(entry - RR * risk, 2)
+
+        # Candle summary
+        candles = []
+        for i in range(len(snap)):
+            candles.append({
+                'time':  snap.index[i].strftime('%H:%M'),
+                'open':  round(float(O[i]),2),
+                'close': round(float(C[i]),2),
+                'vol':   int(V[i]),
+                'icon':  '🟢' if C[i]>=O[i] else '🔴',
+            })
+
+        return {
+            'Symbol':      sym,
+            'Direction':   direction,
+            'Signal':      '🟢 BUY' if direction=='BULL' else '🔴 SHORT',
+            'Pattern':     pattern,
+            'Score':       score,
+            'Entry':       round(entry,2),
+            'SL':          sl,
+            'Target':      target,
+            'Risk ₹':      round(abs(risk),2),
+            'Reward ₹':    round(abs(target-entry),2),
+            'Move%':       round(move_from_prev,2),
+            'Gap%':        round(gap_pct,2),
+            'Vol Ratio':   round(vol_ratio,2),
+            'ADX':         round(adx,1) if adx else None,
+            'VWAP':        round(vwap,2),
+            'VWAP Dist%':  round(vwap_dist*100,2),
+            'Reversals':   reversals,
+            'Body%':       round(first_body_ratio*100,1),
+            'Prev Close':  round(prev_close,2),
+            'Prev High':   round(prev_high,2),
+            'Prev Low':    round(prev_low,2),
+            'Candles':     candles,
+        }
+
+    except Exception as e:
+        if DEBUG:
+            import traceback
+            print(f"[SCAN] {sym}: {e}\n{traceback.format_exc()[-200:]}")
+        return None
+
+# =============================================================================
+# RUN FULL SCAN
+# =============================================================================
+def run_scan(stocks, scan_date, scan_hour, scan_min, n_candles,
+             is_live, trade, prog_bar=None, prog_text=None, sym_lbl=None):
+    tz      = pytz.timezone('Asia/Kolkata')
+    snap_dt = tz.localize(datetime.combine(scan_date, dt_time(scan_hour, scan_min)))
+    if is_live:
+        snap_dt = min(snap_dt, datetime.now(tz))
+
+    cache = {}; lock = threading.Lock()
+    done = 0; total = len(stocks); out = []
+
+    def process(sym):
+        return scan_stock(sym, scan_date, scan_hour, scan_min, n_candles,
+                          trade, cache, lock)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = {ex.submit(process, s): s for s in stocks}
+        for f in as_completed(futs):
+            sym = futs[f]
             try:
-                res = future.result()
-                if res is not None:
-                    results.append(res)
+                r = f.result()
+                if r: out.append(r)
             except Exception as e:
-                print(f"[SCAN ERROR] {sym}: {e}")
-            completed += 1
-            prog = int((completed / total_stocks) * 100) if total_stocks else 100
-            progress_bar.progress(prog)
-            # show current symbol alongside count
-            progress_text.text(f"Scanning {completed}/{total_stocks} : {sym}")
-            # periodically collect garbage to free memory
-            if completed % 10 == 0:
-                gc.collect()
+                if DEBUG: print(f"[THREAD] {sym}: {e}")
+            done += 1
+            pct = int(done/total*100) if total else 100
+            # Update progress from the main Streamlit thread only
+            if prog_bar:
+                try:
+                    prog_bar.progress(pct, text=f"Scanning: {sym}")
+                except Exception:
+                    pass
+            if prog_text:
+                try:
+                    prog_text.markdown(
+                        f"<div style='font-size:13px;color:var(--color-text-secondary);'>"
+                        f"⏳ <b>{pct}%</b> &nbsp;·&nbsp; {done}/{total} stocks · Scanning: <b>{sym}</b></div>",
+                        unsafe_allow_html=True)
+                except Exception:
+                    pass
+            if sym_lbl:
+                try:
+                    sym_lbl.markdown(
+                        f"<div style='font-size:12px;color:var(--color-text-secondary);'>"
+                        f"📊 Currently scanning: <b>{sym}</b> ({done}/{total})</div>", 
+                        unsafe_allow_html=True)
+                except Exception:
+                    pass
+            gc.collect()
 
-    # merge cache back
-    try:
-        sc = st.session_state.get('instrument_cache', {})
-        sc.update(inst_cache)
-        st.session_state.instrument_cache = sc
-    except Exception:
-        pass
+    if prog_bar:  prog_bar.progress(100)
+    if prog_text: prog_text.markdown(
+        f"<div style='font-size:14px;font-weight:500;color:var(--color-text-success);'>"
+        f"✅ Done — {len(out)} signals from {total} stocks</div>",
+        unsafe_allow_html=True)
+    if sym_lbl: sym_lbl.empty()
 
-    # POST-PROCESSING: Build DataFrame, apply SortPriority, sort results, convert back to list
-    if results:
-        try:
-            df_results = pd.DataFrame(results)
-            
-            # Assign SortPriority (1=Unusual+Bull, 2=Unusual+Bear, 3=Normal+Bull, 4=Normal+Bear)
-            df_results["SortPriority"] = 4  # Default to Normal+Bear
-            df_results.loc[
-                (df_results["Signal"].str.startswith("Bullish")) & (df_results["UnusualPriority"] == 1),
-                "SortPriority"
-            ] = 1  # Unusual+Bull
-            df_results.loc[
-                (df_results["Signal"].str.startswith("Bearish")) & (df_results["UnusualPriority"] == 1),
-                "SortPriority"
-            ] = 2  # Unusual+Bear
-            df_results.loc[
-                (df_results["Signal"].str.startswith("Bullish")) & (df_results["UnusualPriority"] == 0),
-                "SortPriority"
-            ] = 3  # Normal+Bull
-            
-            # Sort by SortPriority (ascending: 1→2→3→4) then by Score (descending: highest first)
-            df_results = df_results.sort_values(
-                by=["SortPriority", "Score"],
-                ascending=[True, False]
-            )
-            
-            # Convert back to list of dicts for display
-            results = df_results.to_dict('records')
-        except Exception as e:
-            print(f"[POST-PROCESSING ERROR] {e}")
-            # If DataFrame processing fails, keep results as-is (unsorted)
+    bull = sorted([r for r in out if r['Direction']=='BULL'],
+                  key=lambda r: r['Score'], reverse=True)[:TOP_N]
+    bear = sorted([r for r in out if r['Direction']=='BEAR'],
+                  key=lambda r: r['Score'], reverse=True)[:TOP_N]
+    return bull, bear
 
-    progress_bar.progress(100)
-    progress_text.text("Scanning: 100%")
-    status_text.text(f"✅ Scan complete! Found {len(results)} signals.")
-    print(f"[DEBUG] Screening finished. Total results: {len(results)}")
-    
-    return results
+# =============================================================================
+# BACKTEST
+# =============================================================================
+def run_backtest(bull, bear, scan_date, trade):
+    tz    = pytz.timezone('Asia/Kolkata')
+    fd    = tz.localize(datetime.combine(scan_date-timedelta(days=3), dt_time(9,0)))
+    td    = tz.localize(datetime.combine(scan_date, dt_time(15,35)))
+    cache = {}; lock = threading.Lock()
 
-# =====================================================================
+    def eod(sym):
+        df = fetch_raw(sym, fd, td, trade, cache, lock)
+        if df is not None and not df.empty:
+            df = df[df.index.date == scan_date]
+        return float(df['Close'].iloc[-1]) if df is not None and not df.empty else None
+
+    stats = dict(bw=0,bl=0,sw=0,sl_=0,total=0)
+
+    for r in bull+bear:
+        e = eod(r['Symbol']); ib = r['Direction']=='BULL'
+        r['EOD Close'] = round(e,2) if e else None
+        if e:
+            if ib:
+                if e>=r['Target']:   r['Result']='✅ Target Hit'; stats['bw']+=1
+                elif e<=r['SL']:     r['Result']='❌ SL Hit';    stats['bl']+=1
+                elif e>r['Entry']:   r['Result']='🟡 Partial';   stats['bw']+=1
+                else:                r['Result']='❌ Loss';       stats['bl']+=1
+            else:
+                if e<=r['Target']:   r['Result']='✅ Target Hit'; stats['sw']+=1
+                elif e>=r['SL']:     r['Result']='❌ SL Hit';    stats['sl_']+=1
+                elif e<r['Entry']:   r['Result']='🟡 Partial';   stats['sw']+=1
+                else:                r['Result']='❌ Loss';       stats['sl_']+=1
+        else:
+            r['Result']='❓ No Data'
+        stats['total']+=1
+
+    w=stats['bw']+stats['sw']; t=stats['total']
+    stats['wr']=round(w/t*100,1) if t else 0
+    return bull, bear, stats
+
+# =============================================================================
+# HTML RESULT TABLE
+# =============================================================================
+def make_table(results, is_bt=False):
+    if not results:
+        return ("<div style='padding:20px;text-align:center;"
+                "color:var(--color-text-secondary);font-size:14px;'>"
+                "No signals found.</div>")
+
+    ib     = results[0]['Direction']=='BULL'
+    hdr    = '#1565C0' if ib else '#7F0000'
+    ra     = '#EFF6FF' if ib else '#FFF5F5'
+    rb     = '#DBEAFE' if ib else '#FEE2E2'
+    txt    = '#1E3A5F' if ib else '#5C0505'
+    bt_th  = '<th style="{}">EOD ₹</th><th style="{}">Result</th>'.format(
+             f'background:{hdr};color:white;padding:9px 10px;text-align:left;white-space:nowrap;font-size:12px;',
+             f'background:{hdr};color:white;padding:9px 10px;text-align:left;white-space:nowrap;font-size:12px;') if is_bt else ''
+
+    th = f"background:{hdr};color:white;padding:9px 10px;text-align:left;white-space:nowrap;font-size:12px;"
+    td = "padding:9px 10px;border-bottom:0.5px solid rgba(0,0,0,0.07);"
+
+    rows=[]
+    for i,r in enumerate(results):
+        bg  = ra if i%2==0 else rb
+        mc  = '#1B5E20' if r['Move%']>0 else '#B71C1C'
+        sc  = '#1565C0' if r['Score']>=70 else ('#E65100' if r['Score']>=50 else '#555')
+        adx = f"{r['ADX']:.0f}" if r.get('ADX') else '—'
+        cnd = ' '.join(f"{c['icon']}{c['time']}" for c in r.get('Candles',[]))
+        rev = r.get('Reversals',0)
+        bd  = r.get('Body%','—')
+        vd  = r.get('VWAP Dist%','—')
+        pat = r.get('Pattern','—')
+
+        bt_td=''
+        if is_bt:
+            eodv = r.get('EOD Close','—')
+            res  = r.get('Result','—')
+            rc   = ('#1B5E20' if '✅' in str(res) else
+                    '#B71C1C' if '❌' in str(res) else '#E65100')
+            bt_td=(f'<td style="{td}font-weight:500;">₹{eodv if eodv else "—"}</td>'
+                   f'<td style="{td}color:{rc};font-weight:700;">{res}</td>')
+
+        rows.append(f"""
+<tr style="background:{bg};color:{txt};">
+  <td style="{td}font-weight:700;font-size:14px;white-space:nowrap;">{r['Symbol']}</td>
+  <td style="{td}font-weight:500;white-space:nowrap;">{r['Signal']}</td>
+  <td style="{td}font-size:11px;color:#555;white-space:nowrap;">{pat}</td>
+  <td style="{td}font-weight:700;color:{sc};">{r['Score']}</td>
+  <td style="{td}font-weight:600;">₹{r['Entry']}</td>
+  <td style="{td}color:#C62828;font-weight:600;">₹{r['SL']}</td>
+  <td style="{td}color:#1B5E20;font-weight:600;">₹{r['Target']}</td>
+  <td style="{td}">₹{r['Risk ₹']} / ₹{r['Reward ₹']}</td>
+  <td style="{td}color:{mc};font-weight:600;">{r['Move%']:+.2f}%</td>
+  <td style="{td}">{r['Vol Ratio']:.1f}×</td>
+  <td style="{td}">{adx}</td>
+  <td style="{td}font-size:11px;">{bd}% / {vd}%</td>
+  <td style="{td}font-size:11px;">{cnd} ({rev}rev)</td>
+  {bt_td}
+</tr>""")
+
+    return f"""
+<div style="overflow-x:auto;border-radius:10px;
+     box-shadow:0 2px 10px rgba(0,0,0,0.1);margin-bottom:20px;">
+<table style="width:100%;border-collapse:collapse;font-size:13px;">
+<thead><tr>
+  <th style="{th}">Symbol</th>
+  <th style="{th}">Signal</th>
+  <th style="{th}">Pattern</th>
+  <th style="{th}">Score</th>
+  <th style="{th}">Entry ₹</th>
+  <th style="{th}">SL ₹</th>
+  <th style="{th}">Target ₹</th>
+  <th style="{th}">Risk/Reward</th>
+  <th style="{th}">Move%</th>
+  <th style="{th}">Vol</th>
+  <th style="{th}">ADX</th>
+  <th style="{th}">Body/VWAP%</th>
+  <th style="{th}">Candles</th>
+  {bt_th}
+</tr></thead>
+<tbody>{''.join(rows)}</tbody>
+</table>
+<p style="font-size:11px;color:#888;padding:6px 12px;margin:0;">
+Score = first candle strength + candle cleanliness + volume + ADX + VWAP separation.
+All signals passed 7 checks. Higher score = stronger trend.
+</p>
+</div>"""
+
+# =============================================================================
 # STREAMLIT UI
-# =====================================================================
-
+# =============================================================================
 def main():
-    st.set_page_config(page_title="Stock Candle Screener", layout="wide")
-    st.title("🔍 Stock Candle Screener 30Min 4C/5C/6C")
-    
-    # ensure instrument cache exists in session state (FIX 5)
-    if "instrument_cache" not in st.session_state:
-        st.session_state.instrument_cache = {}
-    
-    # Alice Blue Credentials UI
-    st.markdown("### 🔐 Alice Blue Credentials")
-    
-    # Load persisted credentials from local file (survive restarts)
+    st.set_page_config(page_title="Trend Master",
+                       page_icon="📈",layout="wide",
+                       initial_sidebar_state="collapsed")
+
+    st.markdown("""<style>
+.block-container{padding-top:.8rem;padding-bottom:.8rem;}
+.stButton>button{border-radius:8px;font-weight:600;height:44px;font-size:15px;}
+div[data-testid="metric-container"]{
+  background:var(--color-background-secondary);
+  border-radius:10px;padding:12px 16px;
+  box-shadow:none;border:0.5px solid var(--color-border-tertiary);}
+</style>""", unsafe_allow_html=True)
+
+    # Header
+    st.markdown("""
+<div style="background:linear-gradient(135deg,#0D47A1,#1976D2);
+     padding:18px 24px;border-radius:12px;margin-bottom:16px;color:white;">
+  <h2 style="margin:0;font-size:22px;color:white;">📈 Trend Master — Sure Bullish & Bearish</h2>
+  <p style="margin:4px 0 0;opacity:.85;font-size:13px;">
+    Run at 11:00 or 11:30 AM · Detects gap-and-trend + momentum patterns · Buy/Short → hold till 3 PM
+  </p>
+</div>""", unsafe_allow_html=True)
+
+    # Session state
+    for k,v in [('trade',None),('connected',False),('results',None),
+                ('bt_stats',None),('uid',''),('auth',''),('skey','')]:
+        if k not in st.session_state: st.session_state[k]=v
+
     try:
         if os.path.exists(CREDS_FILE):
-            with open(CREDS_FILE, 'r', encoding='utf-8') as f:
-                _creds = json.load(f)
-            st.session_state['saved_user_id'] = _creds.get('user_id', '')
-            st.session_state['saved_auth_code'] = _creds.get('auth_code', '')
-            st.session_state['saved_secret_key'] = _creds.get('secret_key', '')
-        else:
-            st.session_state['saved_user_id'] = ""
-            st.session_state['saved_auth_code'] = ""
-            st.session_state['saved_secret_key'] = ""
-    except Exception as e:
-        print(f"[CRED] Failed to load creds file: {e}")
-        st.session_state['saved_user_id'] = ""
-        st.session_state['saved_auth_code'] = ""
-        st.session_state['saved_secret_key'] = ""
+            with open(CREDS_FILE) as f: c=json.load(f)
+            st.session_state.update({'uid':c.get('user_id',''),
+                                     'auth':c.get('auth_code',''),
+                                     'skey':c.get('secret_key','')})
+    except Exception: pass
 
-    cola, colb, colc = st.columns([3,3,4])
-    with cola:
-        user_id = st.text_input("User ID / Client ID", value=st.session_state['saved_user_id'], placeholder="e.g., ABC123", help="Your Alice Blue trading account ID", key="user_id_input")
-    with colb:
-        auth_code = st.text_input("Auth Code / App Key", value=st.session_state['saved_auth_code'], placeholder="OAuth code or App Key", help="From Alice Blue API dashboard", key="auth_code_input")
-    with colc:
-        secret_key = st.text_input("Secret Key / App Secret", value=st.session_state['saved_secret_key'], placeholder="e.g., abc123xyz", help="Your API Secret Key", type="password", key="secret_key_input")
+    # ── LOGIN ─────────────────────────────────────────────────────────────────
+    conn_ph = st.empty()
+    if st.session_state['connected']:
+        conn_ph.success("✅ Alice Blue Connected")
 
-    # Save/Clear logic (session only)
-    gen_col1, gen_col2, save_col, clear_col = st.columns([1, 3, 1, 1])
-    with gen_col1:
-        gen_session = st.button("Generate Session", use_container_width=True, key="gen_session_btn")
-    with gen_col2:
-        conn_status_placeholder = st.empty()
-    with save_col:
-        if st.button("💾 Save Creds", use_container_width=True, help="Save credentials (persist across restarts)", key="save_creds_btn"):
-            st.session_state['saved_user_id'] = user_id
-            st.session_state['saved_auth_code'] = auth_code
-            st.session_state['saved_secret_key'] = secret_key
-            try:
-                with open(CREDS_FILE, 'w', encoding='utf-8') as f:
-                    json.dump({
-                        'user_id': user_id,
-                        'auth_code': auth_code,
-                        'secret_key': secret_key
-                    }, f)
-                st.success("✅ Credentials saved to disk", icon="✔️")
-            except Exception as e:
-                st.error(f"❌ Failed to save credentials: {e}")
-    with clear_col:
-        if st.button("🗑️ Clear Creds", use_container_width=True, help="Clear saved credentials", key="clear_creds_btn"):
-            st.session_state['saved_user_id'] = ""
-            st.session_state['saved_auth_code'] = ""
-            st.session_state['saved_secret_key'] = ""
-            try:
-                if os.path.exists(CREDS_FILE):
-                    os.remove(CREDS_FILE)
-                st.info("🗑️ Credentials cleared from disk", icon="ℹ️")
-            except Exception as e:
-                st.error(f"❌ Failed to clear credentials file: {e}")
-
-    # Initialize session state for SDK connection and results storage
-    if 'alice_trade' not in st.session_state:
-        st.session_state.alice_trade = None
-    if 'alice_connected' not in st.session_state:
-        st.session_state.alice_connected = False
-    if 'screening_results' not in st.session_state:
-        st.session_state.screening_results = None
-    if 'scan_running' not in st.session_state:
-        st.session_state.scan_running = False
-    if 'saved_user_id' not in st.session_state:
-        st.session_state.saved_user_id = ""
-    if 'saved_auth_code' not in st.session_state:
-        st.session_state.saved_auth_code = ""
-    if 'saved_secret_key' not in st.session_state:
-        st.session_state.saved_secret_key = ""
-    if 'instrument_cache' not in st.session_state:
-        st.session_state.instrument_cache = {}  # Cache for instrument objects
-
-    # Handle session generation
-    if gen_session:
-        if not user_id or not auth_code or not secret_key:
-            conn_status_placeholder.error("❌ All fields required: User ID, Auth Code, Secret Key")
-        else:
-            with conn_status_placeholder.container():
-                st.info("🔄 Attempting to authenticate...")
-            
-            connected = False
-            trade_obj = None
-            error_detail = ""
-            
-            attempts = [
-                ("Standard (user_id, auth_code, secret_key)", lambda: TradeHub(user_id=user_id, auth_code=auth_code, secret_key=secret_key)),
-                ("Alternative (auth_code as auth)", lambda: TradeHub(user_id=user_id, auth_code=secret_key, secret_key=auth_code)),
-                ("Direct init", lambda: TradeHub(user_id, auth_code, secret_key)),
-            ]
-            
-            for attempt_name, attempt_func in attempts:
-                try:
-                    trade_obj = attempt_func()
-                    session_id = trade_obj.get_session_id()
-                    
-                    if session_id and str(session_id).strip() and 'Not_ok' not in str(session_id):
-                        connected = True
-                        st.session_state.alice_trade = trade_obj
-                        st.session_state.alice_connected = True
-                        # persist successful user id to creds file automatically
-                        try:
-                            with open(CREDS_FILE, 'w', encoding='utf-8') as f:
-                                json.dump({'user_id': user_id, 'auth_code': auth_code, 'secret_key': secret_key}, f)
-                            print("[CRED] Saved credentials to disk after successful connect")
-                        except Exception as e:
-                            print(f"[CRED] Failed to save creds after connect: {e}")
-                        with conn_status_placeholder.container():
-                            st.success(f"✅ **Connected!** Session obtained via: {attempt_name}")
-                            st.write(f"Session ID (truncated): `{str(session_id)[:32]}...`")
-                        break
-                except Exception as e:
-                    error_detail = str(e)
-                    continue
-            
-            if not connected:
-                with conn_status_placeholder.container():
-                    st.error("❌ **Authentication Failed**")
-                    st.write("**Possible causes:**")
-                    st.write("1. Invalid **Auth Code** (check Alice Blue developer dashboard)")
-                    st.write("2. Invalid **User ID** (verify your trading account ID)")
-                    st.write("3. Invalid **Secret Key** (ensure you copied it correctly)")
-                    st.write("4. Credentials expired or revoked")
-                    if error_detail:
-                        st.code(error_detail, language="text")
-                    st.write("**Next steps:**")
-                    st.write("- Verify all credentials in Alice Blue Dashboard")
-                    st.write("- Regenerate API keys if necessary")
-                    st.write("- Contact Alice Blue support if issue persists")
-
-    # Display connection status
-    if st.session_state.alice_connected:
-        with conn_status_placeholder.container():
-            st.success("✅ **Alice Blue: Connected & Ready**")
-    elif not gen_session:
-        conn_status_placeholder.warning("⚠️ Alice Blue: Not connected — Enter credentials above")
-
-    # ===== SINGLE COLUMN LAYOUT: CONFIG, BUTTON, RESULTS VERTICALLY =====
-    st.markdown("### ⚙️ Configuration")
-    
-    st.warning("💡 **TIP**: For best results, use **'Live' mode** to scan today's data in real-time. Historical mode requires complete trading day data (09:15-15:30).")
-    
-    # Scan mode selector
-    st.markdown("**1️⃣ Scan Mode**")
-    mode = st.radio("Select Mode", ["Live", "Historical"], label_visibility="collapsed", horizontal=True)
-    timeframe = "30m"  # fixed
-    
-    # Historical date selector
-    if mode == "Historical":
-        selected_date = st.date_input("Select Date (Last 7 trading days)", label_visibility="collapsed")
-        selected_date = selected_date.strftime("%Y-%m-%d")
-    else:
-        selected_date = None
-    
-    # Candle count for 30min timeframe
-    candle_count = st.select_slider("Candle Count (30min)", options=["4C", "5C", "6C"], value="5C", label_visibility="collapsed")
-
-    # Option: require unusual volume condition
-    require_unusual_volume = st.checkbox(
-        "Require Unusual Volume",
-        value=True,
-        help="If checked, screening only considers candles with unusual volume (current >2x avg). "
-             "Uncheck to ignore unusual-volume requirement."
-    )
-    
-    # New: Option for strong trend confirmation filter  
-    confirm_trend = st.checkbox(
-        "Enable Strong Trend Filter",
-        value=False,
-        help="If enabled, applies additional confirmation: price must be above/below MA44, "
-             "strong candle body (>50% range), and volume above 20-candle average. "
-             "Improves signal reliability. Disabled = original strategy behavior."
-    )
-
-    # New feature: daily trend filter toggle
-    daily_trend_filter = st.checkbox(
-        "Daily Trend Check",
-        value=False,
-        help="Enable additional daily timeframe trend validation (requires MA data)."
-    )
-
-    # timeframe is fixed to 30m, no user choice
-    
-    st.divider()
-    
-    # Stocks list editor
-    st.markdown("**3️⃣ Stocks List**")
-    default_stocks = [
-        "360ONE.NS", "ABB.NS", "APLAPOLLO.NS", "AUBANK.NS", "ADANIENSOL.NS", "ADANIENT.NS", "ADANIGREEN.NS", "ADANIPORTS.NS", "ABCAPITAL.NS", 
-"ALKEM.NS", "AMBER.NS", "AMBUJACEM.NS", "ANGELONE.NS", "APOLLOHOSP.NS", "ASHOKLEY.NS", "ASIANPAINT.NS", "ASTRAL.NS", "AUROPHARMA.NS", 
-"DMART.NS", "AXISBANK.NS", "BSE.NS", "BAJAJ-AUTO.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS", "BANDHANBNK.NS", "BANKBARODA.NS", "BANKINDIA.NS", 
-"BDL.NS", "BEL.NS", "BHARATFORG.NS", "BHEL.NS", "BPCL.NS", "BHARTIARTL.NS", "BIOCON.NS", "BLUESTARCO.NS", "BOSCHLTD.NS", "BRITANNIA.NS", 
-"CGPOWER.NS", "CANBK.NS", "CDSL.NS", "CHOLAFIN.NS", "CIPLA.NS", "COALINDIA.NS", "COFORGE.NS", "COLPAL.NS", "CAMS.NS", "CONCOR.NS", 
-"CROMPTON.NS", "CUMMINSIND.NS", "CYIENT.NS", "DLF.NS", "DABUR.NS", "DALBHARAT.NS", "DELHIVERY.NS", "DIVISLAB.NS", "DIXON.NS", "DRREDDY.NS", 
-"ETERNAL.NS", "EICHERMOT.NS", "EXIDEIND.NS", "NYKAA.NS", "FORTIS.NS", "GAIL.NS", "GMRAIRPORT.NS", "GLENMARK.NS", "GODREJCP.NS", 
-"GODREJPROP.NS", "GRASIM.NS", "HCLTECH.NS", "HDFCAMC.NS", "HDFCBANK.NS", "HDFCLIFE.NS", "HFCL.NS", "HAVELLS.NS", "HEROMOTOCO.NS", 
-"HINDALCO.NS", "HAL.NS", "HINDPETRO.NS", "HINDUNILVR.NS", "HINDZINC.NS", "POWERINDIA.NS", "HUDCO.NS", "ICICIBANK.NS", "ICICIGI.NS", 
-"ICICIPRULI.NS", "IDFCFIRSTB.NS", "IIFL.NS", "ITC.NS", "INDIANB.NS", "IEX.NS", "IOC.NS", "IRCTC.NS", "IRFC.NS", "IREDA.NS", "IGL.NS", 
-"INDUSTOWER.NS", "INDUSINDBK.NS", "NAUKRI.NS", "INFY.NS", "INOXWIND.NS", "INDIGO.NS", "JINDALSTEL.NS", "JSWENERGY.NS", "JSWSTEEL.NS", 
-"JIOFIN.NS", "JUBLFOOD.NS", "KEI.NS", "KPITTECH.NS", "KALYANKJIL.NS", "KAYNES.NS", "KFINTECH.NS", "KOTAKBANK.NS", "LTF.NS", "LICHSGFIN.NS", 
-"LTIM.NS", "LT.NS", "LAURUSLABS.NS", "LICI.NS", "LODHA.NS", "LUPIN.NS", "M&M.NS", "MANAPPURAM.NS", "MANKIND.NS", "MARICO.NS", "MARUTI.NS", 
-"MFSL.NS", "MAXHEALTH.NS", "MAZDOCK.NS", "MPHASIS.NS", "MCX.NS", "MUTHOOTFIN.NS", "NBCC.NS", "NCC.NS", "NHPC.NS", "NMDC.NS", "NTPC.NS", 
-"NATIONALUM.NS", "NESTLEIND.NS", "NUVAMA.NS", "OBEROIRLTY.NS", "ONGC.NS", "OIL.NS", "PAYTM.NS", "OFSS.NS", "POLICYBZR.NS", "PGEL.NS", "PIIND.NS", 
-"PNBHOUSING.NS", "PAGEIND.NS", "PATANJALI.NS", "PERSISTENT.NS", "PETRONET.NS", "PIDILITIND.NS", "PPLPHARMA.NS", "POLYCAB.NS", "PFC.NS", 
-"POWERGRID.NS", "PRESTIGE.NS", "PNB.NS", "RBLBANK.NS", "RECLTD.NS", "RVNL.NS", "RELIANCE.NS", "SBICARD.NS", "SBILIFE.NS", "SHREECEM.NS", "SRF.NS", 
-"SAMMAANCAP.NS", "MOTHERSON.NS", "SHRIRAMFIN.NS", "SIEMENS.NS", "SOLARINDS.NS", "SONACOMS.NS", "SBIN.NS", "SAIL.NS", "SUNPHARMA.NS", "SUPREMEIND.NS", 
-"SUZLON.NS", "SYNGENE.NS", "TATACONSUM.NS", "TITAGARH.NS", "TVSMOTOR.NS", "TCS.NS", "TATAELXSI.NS", "TMPV.NS", "TATAPOWER.NS", "TATASTEEL.NS", 
-"TATATECH.NS", "TECHM.NS", "FEDERALBNK.NS", "INDHOTEL.NS", "PHOENIXLTD.NS", "TITAN.NS", "TORNTPHARM.NS", "TORNTPOWER.NS", "TRENT.NS", "TIINDIA.NS", 
-"UNOMINDA.NS", "UPL.NS", "ULTRACEMCO.NS", "UNIONBANK.NS", "UNITDSPR.NS", "VBL.NS", "VEDL.NS", "IDEA.NS", "VOLTAS.NS", "WIPRO.NS", "YESBANK.NS", "ZYDUSLIFE.NS"
-    ]
-    
-    stocks_text = st.text_area("📋 Stocks (one per line)", value="\n".join(default_stocks), height=68, label_visibility="collapsed")
-    stocks = [s.strip().upper() for s in stocks_text.split('\n') if s.strip()]
-    
-    st.divider()
-    
-    # Run button - PROMINENT
-    run_button = st.button("▶️ RUN SCREENER", key="run_btn", use_container_width=True, 
-                          help=f"Scan {len(stocks)} stocks")
-    
-    st.divider()
-    
-    # ===== RESULTS SECTION (BELOW BUTTON) =====
-    # Create placeholder for results that will update in real-time
-    results_placeholder = st.empty()
-    
-    if run_button:
-        st.session_state.screening_results = []
-        st.session_state.scan_running = True
-        results = run_screening(
-            stocks,
-            mode,
-            selected_date,
-            timeframe,
-            candle_count,
-            results_container=True,
-            require_unusual_volume=require_unusual_volume,
-            confirm_trend=confirm_trend,
-            daily_trend_filter=daily_trend_filter
-        )
-        st.session_state.screening_results = results
-        st.session_state.scan_running = False
-    
-    # Display results if available
-    if st.session_state.screening_results is not None:
-        results = st.session_state.screening_results
-        with results_placeholder.container():
-            if results:
-                st.markdown("### 📊 Results")
-                # Sort results with exact same logic as Tkinter
-                def get_move_pct(top_mover):
-                    match = re.search(r"\(([-+]?[0-9]*\.?[0-9]+)%\)", top_mover)
-                    if match:
-                        return float(match.group(1))
-                    return 0.0
-
-                def sort_key(res):
-                    signal = res['Signal']
-                    volume = res['Volume']
-                    top_mover = res['Top Mover']
-                    top_status = res['Top']
-                    move_pct = get_move_pct(top_mover)
-                    
-                    if signal == "Sure Bullish":
-                        return (-2, -move_pct)
-                    if signal == "Sure Bearish":
-                        return (-1, -abs(move_pct))
-                    if signal == "Bullish" and volume == "High" and top_mover.startswith("Top Up") and top_status == "Top Gainer":
-                        return (0, -move_pct)
-                    if signal == "Bearish" and volume == "High" and top_mover.startswith("Top Down") and top_status == "Top Loser":
-                        return (1, -abs(move_pct))
-                    if signal == "Bullish" and volume == "High":
-                        return (2, 0)
-                    if signal == "Bearish" and volume == "High":
-                        return (3, 0)
-                    if signal == "Bullish" and volume == "Low" and top_mover.startswith("Top Up") and top_status == "Top Gainer":
-                        return (4, -move_pct)
-                    if signal == "Bearish" and volume == "Low" and top_mover.startswith("Top Down") and top_status == "Top Loser":
-                        return (5, -abs(move_pct))
-                    if signal == "Bullish" and volume == "Low":
-                        return (6, 0)
-                    if signal == "Bearish" and volume == "Low":
-                        return (7, 0)
-                    
-                    vol_conf = True if str(res.get('Vol Confirm', '')).upper() == 'YES' else False
-                    if signal == "No Signal" and vol_conf and volume == "High" and top_mover.startswith("Top Up") and top_status == "Top Gainer":
-                        return (8, -move_pct)
-                    if signal == "No Signal" and vol_conf and volume == "Low" and top_mover.startswith("Top Down") and top_status == "Top Loser":
-                        return (9, -abs(move_pct))
-                    if signal == "No Signal" and vol_conf:
-                        return (10, -move_pct)
-                    if vol_conf:
-                        return (11, -move_pct)
-                    
-                    return (12, 0)
-
-                sorted_results = sorted(results, key=sort_key)
-                
-                # Build HTML table with exact Tkinter colors
-                html_rows = []
-                for r in sorted_results:
-                    def fmt(val):
-                        return f"{val:.2f}" if isinstance(val, float) and val is not None else "NA"
-                    
-                    signal = r['Signal']
-                    volume = r['Volume']
-                    top_mover = r['Top Mover']
-                    top_status = r['Top']
-                    
-                    # Apply exact same colors as Tkinter
-                    if signal == "Sure Bullish":
-                        bg_color = "#00C853"
-                        text_color = "white"
-                    elif signal == "Sure Bearish":
-                        bg_color = "#D50000"
-                        text_color = "white"
-                    elif signal == "Bullish" and volume == "High" and top_mover.startswith("Top Up") and top_status == "Top Gainer":
-                        bg_color = "#00e676"
-                        text_color = "#003300"
-                    elif signal == "Bearish" and volume == "High" and top_mover.startswith("Top Down") and top_status == "Top Loser":
-                        bg_color = "#ff5252"
-                        text_color = "white"
-                    elif signal == "Bullish" and volume == "High":
-                        bg_color = "#b9f6ca"
-                        text_color = "#003300"
-                    elif signal == "Bearish" and volume == "High":
-                        bg_color = "#ffcdd2"
-                        text_color = "#b71c1c"
-                    elif signal == "Bullish" and volume == "Low" and top_mover.startswith("Top Up") and top_status == "Top Gainer":
-                        bg_color = "#b9f6ca"
-                        text_color = "#003300"
-                    elif signal == "Bearish" and volume == "Low" and top_mover.startswith("Top Down") and top_status == "Top Loser":
-                        bg_color = "#ffcdd2"
-                        text_color = "#b71c1c"
-                    elif signal == "Bullish" and volume == "Low":
-                        bg_color = "#b9f6ca"
-                        text_color = "#003300"
-                    elif signal == "Bearish" and volume == "Low":
-                        bg_color = "#ffcdd2"
-                        text_color = "#b71c1c"
-                    else:
-                        bg_color = "#ffffff"
-                        text_color = "#000000"
-                    
-                    # Add volume confirm color highlight
-                    vol_confirm = r.get('Vol Confirm', 'NO')
-                    if vol_confirm == 'YES':
-                        if signal.startswith("Bullish") or signal.startswith("Sure Bullish"):
-                            border_left = "5px solid #00C853"
-                        else:
-                            border_left = "5px solid #D50000"
-                    else:
-                        border_left = "none"
-                    
-                    row_html = f"""
-<tr style="background-color: {bg_color}; color: {text_color}; border-left: {border_left}; font-weight: bold;">
-    <td>{r['Symbol']}</td>
-    <td>{r['Signal']}</td>
-    <td>{r['Strength']}</td>
-    <td>{r['Volume']}</td>
-    <td>{vol_confirm}</td>
-    <td>{r['Top Mover']}</td>
-    <td>{r['Top']}</td>
-    <td>{r['Volume Spike']}</td>
-    <td>{r['MA Distance']}</td>
-    <td>{fmt(r['1st Open'])}</td>
-    <td>{fmt(r['1st Close'])}</td>
-    <td>{fmt(r['2nd Open'])}</td>
-    <td>{fmt(r['2nd Close'])}</td>
-    <td>{fmt(r['3rd Open'])}</td>
-    <td>{fmt(r['3rd Close'])}</td>
-    <td>{fmt(r['4th Open'])}</td>
-    <td>{fmt(r['4th Close'])}</td>
-    <td>{fmt(r['5th Open'])}</td>
-    <td>{fmt(r['5th Close'])}</td>
-    <td>{fmt(r.get('6th Open'))}</td>
-    <td>{fmt(r.get('6th Close'))}</td>
-    <td>{fmt(r['1st 44MA'])}</td>
-    <td>{fmt(r['2nd 44MA'])}</td>
-    <td>{fmt(r['3rd 44MA'])}</td>
-    <td>{fmt(r['4th 44MA'])}</td>
-    <td>{fmt(r['5th 44MA'])}</td>
-    <td>{fmt(r.get('6th 44MA'))}</td>
-</tr>
-"""
-                    html_rows.append(row_html)
-                
-                # Create HTML table (after loop)
-                html_table = f"""
-<div style="overflow-x: auto; margin-top: 20px;">
-    <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
-        <thead>
-            <tr style="background-color: #003d6b; color: white; font-weight: bold; position: sticky; top: 0; font-size: 14px;">
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">Symbol</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">Signal</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">Strength</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">Volume</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">Vol Cnf</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">Top Mover</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">Top</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">Spike</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">MA Dis</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">1st O</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">1st C</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">2nd O</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">2nd C</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">3rd O</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">3rd C</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">4th O</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">4th C</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">5th O</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">5th C</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">6th O</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">6th C</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">1st MA</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">2nd MA</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">3rd MA</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">4th MA</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">5th MA</th>
-                <th style="padding: 10px; border: 1px solid #ccc; text-align: center;">6th MA</th>
-            </tr>
-        </thead>
-        <tbody>
-            {''.join(html_rows)}
-        </tbody>
-    </table>
-</div>
-"""
-                
-                st.markdown(html_table, unsafe_allow_html=True)
-                
-                # Summary stats
-                st.divider()
-                col1, col2, col3, col4, col5 = st.columns(5)
-                with col1:
-                    sure_bull_count = len([r for r in results if r['Signal'] == "Sure Bullish"])
-                    st.metric("🟢 Sure Bullish", sure_bull_count)
-                with col2:
-                    sure_bear_count = len([r for r in results if r['Signal'] == "Sure Bearish"])
-                    st.metric("🔴 Sure Bearish", sure_bear_count)
-                with col3:
-                    bull_count = len([r for r in results if r['Signal'] == "Bullish"])
-                    st.metric("📈 Bullish", bull_count)
-                with col4:
-                    bear_count = len([r for r in results if r['Signal'] == "Bearish"])
-                    st.metric("📉 Bearish", bear_count)
-                with col5:
-                    no_signal_count = len([r for r in results if r['Signal'] == "No Signal"])
-                    st.metric("⚪ No Signal", no_signal_count)
+    with st.expander("🔐 Alice Blue Login", expanded=not st.session_state['connected']):
+        c1,c2,c3 = st.columns(3)
+        uid  = c1.text_input("User ID",   value=st.session_state['uid'])
+        auth = c2.text_input("Auth Code", value=st.session_state['auth'])
+        skey = c3.text_input("Secret Key",value=st.session_state['skey'],type="password")
+        b1,b2,b3,_ = st.columns([3,1,1,3])
+        msg = st.empty()
+        if b1.button("🔌 Connect",use_container_width=True):
+            if not all([uid,auth,skey]): msg.error("All fields required.")
             else:
-                st.warning(f"⚠️ No trading signals found from {len(stocks)} stocks analyzed.")
-                st.info("**Possible reasons:**\n"
-                       "1. Selected date may not have enough intraday data\n"
-                       "2. Stocks don't meet the screening criteria\n"
-                       "3. Try a different date or use 'Live' mode\n"
-                       "4. Check the console logs (terminal) for debugging info")
+                ok=False
+                for fn in [lambda:TradeHub(user_id=uid,auth_code=auth,secret_key=skey),
+                           lambda:TradeHub(user_id=uid,auth_code=skey,secret_key=auth),
+                           lambda:TradeHub(uid,auth,skey)]:
+                    try:
+                        t=fn(); s=t.get_session_id()
+                        if s and 'Not_ok' not in str(s):
+                            st.session_state.update({'trade':t,'connected':True})
+                            conn_ph.success("✅ Alice Blue Connected")
+                            msg.success("✅ Connected!")
+                            try:
+                                with open(CREDS_FILE,'w') as f:
+                                    json.dump({'user_id':uid,'auth_code':auth,'secret_key':skey},f)
+                            except Exception: pass
+                            ok=True; break
+                    except Exception: continue
+                if not ok: msg.error("❌ Authentication failed.")
+        if b2.button("💾 Save",use_container_width=True):
+            try:
+                with open(CREDS_FILE,'w') as f:
+                    json.dump({'user_id':uid,'auth_code':auth,'secret_key':skey},f)
+                st.toast("✅ Saved!")
+            except Exception as e: st.error(str(e))
+        if b3.button("🗑️ Clear",use_container_width=True):
+            try: os.remove(CREDS_FILE); st.toast("Cleared")
+            except Exception: pass
+
+    # ── SETTINGS ──────────────────────────────────────────────────────────────
+    st.markdown("---")
+    r1,r2,r3 = st.columns([2,2,3])
+
+    with r1:
+        mode    = st.radio("Mode",["🔴 Live","📅 Historical"],horizontal=True)
+        is_live = mode=="🔴 Live"
+
+    scan_date=None
+    with r2:
+        if not is_live:
+            sd = st.date_input("Historical Date",
+                               value=last_trading_day()-timedelta(days=1))
+            scan_date = sd if is_trading_day(sd) else last_trading_day(sd)
+        else:
+            tz  = pytz.timezone('Asia/Kolkata')
+            now = datetime.now(tz)
+            scan_date = last_trading_day(now.date())
+            if now.time()<dt_time(11,0):
+                rem=int((datetime.combine(now.date(),dt_time(11,0))-now.replace(tzinfo=None)).total_seconds()/60)
+                st.warning(f"⏰ Best time: **11:00 AM**. {rem} min remaining.")
+            else:
+                st.success(f"✅ {now.strftime('%H:%M')} — Good time to scan!")
+
+    with r3:
+        scan_lbl = st.radio("⏰ Scan Time",list(SCAN_OPTIONS.keys()),
+                            horizontal=True,
+                            help="11:30 gives one more candle of confirmation.")
+        scan_hour,scan_min,n_candles = SCAN_OPTIONS[scan_lbl]
+
+    # ── HOW IT WORKS ──────────────────────────────────────────────────────────
+    with st.expander("📖 How signals are found — 7 checks + 2 patterns",expanded=False):
+        st.markdown(f"""
+**Two patterns detected:**
+
+| Pattern | Example | Signal |
+|---|---|---|
+| Gap up + fade | Stock gaps up 5% on results, then sells off from open | SHORT |
+| Gap down + bounce | Stock gaps down 4%, then bounces from open | BUY |
+| Momentum (no gap) | Stock opens flat, moves in one direction every candle | BUY or SHORT |
+
+**7 checks — all must pass:**
+
+| # | Check | Threshold |
+|---|---|---|
+| 1 | First candle (9:15) must be strongly directional | Body ≥ {int(FIRST_BODY_MIN*100)}% of candle range |
+| 2 | Candles continue in same direction | Max {MAX_REVERSALS} reversal candle allowed |
+| 3 | Price has NOT recovered back to 9:15 open | Must be ≥ 0.3% away from first open |
+| 4 | Total move from yesterday's close | ≥ {MIN_MOVE_PCT}% |
+| 5 | Volume surge | ≥ {VOL_MULT}× 5-day average |
+| 6 | VWAP confirms direction | Price ≥ 0.2% away from VWAP |
+| 7 | ADX trend strength | ADX ≥ {ADX_MIN}, DI aligned |
+
+**Score** (0–100) ranks signals: first candle strength + cleanliness + volume + ADX + VWAP distance.
+**SL** = morning low (bull) / morning high (bear). **Target** = {RR}R. **Exit** = 3:00 PM hard.
+""")
+
+    # ── STOCK LIST ────────────────────────────────────────────────────────────
+    with st.expander("📋 F&O Stock List",expanded=False):
+        default="""AARTIIND.NS
+ABB.NS
+ABCAPITAL.NS
+ADANIENT.NS
+ADANIGREEN.NS
+ADANIPORTS.NS
+ALKEM.NS
+AMBUJACEM.NS
+ANGELONE.NS
+APOLLOHOSP.NS
+APOLLOTYRE.NS
+ASHOKLEY.NS
+ASIANPAINT.NS
+ASTRAL.NS
+AUBANK.NS
+AUROPHARMA.NS
+AXISBANK.NS
+BAJAJ-AUTO.NS
+BAJFINANCE.NS
+BAJAJFINSV.NS
+BAJAJHLDNG.NS
+BALKRISIND.NS
+BANDHANBNK.NS
+BANKBARODA.NS
+BANKINDIA.NS
+BATAINDIA.NS
+BDL.NS
+BEL.NS
+BERGEPAINT.NS
+BHARATFORG.NS
+BHARTIARTL.NS
+BHEL.NS
+BIOCON.NS
+BOSCHLTD.NS
+BPCL.NS
+BRITANNIA.NS
+BSE.NS
+CANBK.NS
+CANFINHOME.NS
+CDSL.NS
+CESC.NS
+CGPOWER.NS
+CHAMBLFERT.NS
+CHOLAFIN.NS
+CIPLA.NS
+COALINDIA.NS
+COFORGE.NS
+COLPAL.NS
+CONCOR.NS
+COROMANDEL.NS
+CROMPTON.NS
+CUMMINSIND.NS
+CYIENT.NS
+DABUR.NS
+DALBHARAT.NS
+DEEPAKFERT.NS
+DEEPAKNTR.NS
+DELHIVERY.NS
+DIVISLAB.NS
+DIXON.NS
+DLF.NS
+DMART.NS
+DRREDDY.NS
+EICHERMOT.NS
+ESCORTS.NS
+ETERNAL.NS
+EXIDEIND.NS
+FEDERALBNK.NS
+FORTIS.NS
+GAIL.NS
+GLENMARK.NS
+GMRAIRPORT.NS
+GODREJCP.NS
+GODREJPROP.NS
+GRANULES.NS
+GRASIM.NS
+GSPL.NS
+HAL.NS
+HAVELLS.NS
+HCLTECH.NS
+HDFCAMC.NS
+HDFCBANK.NS
+HDFCLIFE.NS
+HEROMOTOCO.NS
+HINDALCO.NS
+HINDCOPPER.NS
+HINDPETRO.NS
+HINDUNILVR.NS
+HINDZINC.NS
+HUDCO.NS
+ICICIBANK.NS
+ICICIGI.NS
+ICICIPRULI.NS
+IDFCFIRSTB.NS
+IEX.NS
+IIFL.NS
+IGL.NS
+INDHOTEL.NS
+INDIAMART.NS
+INDIGO.NS
+INDUSINDBK.NS
+INDUSTOWER.NS
+INFY.NS
+INOXWIND.NS
+IOC.NS
+IRCTC.NS
+IREDA.NS
+IRFC.NS
+ITC.NS
+JINDALSTEL.NS
+JIOFIN.NS
+JSWENERGY.NS
+JSWSTEEL.NS
+JUBLFOOD.NS
+KALYANKJIL.NS
+KAYNES.NS
+KEI.NS
+KFINTECH.NS
+KOTAKBANK.NS
+KPITTECH.NS
+LAURUSLABS.NS
+LICHSGFIN.NS
+LICI.NS
+LODHA.NS
+LT.NS
+LTIM.NS
+LTF.NS
+LUPIN.NS
+M&M.NS
+MANAPPURAM.NS
+MANKIND.NS
+MARICO.NS
+MARUTI.NS
+MAXHEALTH.NS
+MAZDOCK.NS
+MCX.NS
+METROPOLIS.NS
+MFSL.NS
+MOTHERSON.NS
+MPHASIS.NS
+MRF.NS
+MUTHOOTFIN.NS
+NATIONALUM.NS
+NAUKRI.NS
+NBCC.NS
+NCC.NS
+NESTLEIND.NS
+NHPC.NS
+NMDC.NS
+NTPC.NS
+NUVAMA.NS
+NYKAA.NS
+OBEROIRLTY.NS
+OFSS.NS
+OIL.NS
+ONGC.NS
+PAGEIND.NS
+PATANJALI.NS
+PAYTM.NS
+PERSISTENT.NS
+PETRONET.NS
+PFC.NS
+PHOENIXLTD.NS
+PIDILITIND.NS
+PIIND.NS
+PNB.NS
+PNBHOUSING.NS
+POLYCAB.NS
+POLICYBZR.NS
+POWERGRID.NS
+PRESTIGE.NS
+RBLBANK.NS
+RECLTD.NS
+RELIANCE.NS
+RVNL.NS
+SAIL.NS
+SBICARD.NS
+SBILIFE.NS
+SBIN.NS
+SHREECEM.NS
+SHRIRAMFIN.NS
+SIEMENS.NS
+SOLARINDS.NS
+SONACOMS.NS
+SRF.NS
+SUNPHARMA.NS
+SUPREMEIND.NS
+SUZLON.NS
+SYNGENE.NS
+TATACONSUM.NS
+TATAELXSI.NS
+TATAPOWER.NS
+TATASTEEL.NS
+TATATECH.NS
+TCS.NS
+TECHM.NS
+TIINDIA.NS
+TITAGARH.NS
+TITAN.NS
+TORNTPHARM.NS
+TORNTPOWER.NS
+TRENT.NS
+TVSMOTOR.NS
+ULTRACEMCO.NS
+UNIONBANK.NS
+UNITDSPR.NS
+UNOMINDA.NS
+UPL.NS
+VBL.NS
+VEDL.NS
+VOLTAS.NS
+WIPRO.NS
+YESBANK.NS
+ZYDUSLIFE.NS"""
+        stxt=st.text_area("Stock symbols (one per line)",value=default,height=100,label_visibility="collapsed")
+        stocks=[s.strip().upper() for s in stxt.split('\n') if s.strip()]
+        st.caption(f"**{len(stocks)}** stocks loaded")
+
+    # ── RUN ───────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    rc1,_ = st.columns([2,5])
+    run_btn = rc1.button("▶️ RUN SCAN",use_container_width=True,type="primary")
+    st.markdown("---")
+
+    prog_ph  = st.empty()
+    res_area = st.container()
+
+    if run_btn:
+        if not st.session_state['connected'] or not st.session_state['trade']:
+            st.error("❌ Connect to Alice Blue first.")
+        else:
+            trade=st.session_state['trade']
+            if not is_trading_day(scan_date):
+                scan_date=last_trading_day(scan_date)
+
+            with prog_ph.container():
+                st.markdown(f"**Scanning {len(stocks)} stocks · {scan_date} · {scan_lbl}**")
+                pb   = st.progress(0)
+                ptxt = st.empty()
+                slbl = st.empty()
+
+            bull,bear = run_scan(
+                stocks,scan_date,scan_hour,scan_min,n_candles,
+                is_live,trade,prog_bar=pb,prog_text=ptxt,sym_lbl=slbl)
+
+            bt_stats=None
+            if not is_live and (bull or bear):
+                with prog_ph.container():
+                    st.info("🔬 Fetching EOD prices for backtest...")
+                bull,bear,bt_stats = run_backtest(bull,bear,scan_date,trade)
+
+            st.session_state['results']  = (bull,bear,scan_date,not is_live)
+            st.session_state['bt_stats'] = bt_stats
+            prog_ph.empty()
+
+    # ── DISPLAY ───────────────────────────────────────────────────────────────
+    if st.session_state.get('results'):
+        bull,bear,res_date,is_hist = st.session_state['results']
+        bt = st.session_state.get('bt_stats')
+
+        with res_area:
+            if not bull and not bear:
+                st.markdown(f"""
+<div style="background:var(--color-background-warning);
+     border-left:4px solid var(--color-border-warning);
+     padding:16px 20px;border-radius:8px;font-size:14px;margin-top:8px;">
+<b>⚠️ No signals found for {res_date}</b><br><br>
+No stock passed all 7 checks today. This means the market was choppy or flat —
+no clear trending stocks identified. This is the correct result on such days.
+<br><br>
+<b>Tip:</b> Try Historical mode on a strong market day (Nifty moved ±1%+) to
+see how the strategy performs when trends are present.
+</div>""", unsafe_allow_html=True)
+            else:
+                st.markdown(f"### 📊 Results — {res_date}")
+                m1,m2,m3,m4 = st.columns(4)
+                m1.metric("🟢 BUY Signals",  len(bull))
+                m2.metric("🔴 SHORT Signals", len(bear))
+                m3.metric("📊 Total",         len(bull)+len(bear))
+                if bt:
+                    w=bt['bw']+bt['sw']; t=bt['total']; wr=bt['wr']
+                    m4.metric("✅ Win Rate",f"{wr}%",
+                              delta=f"{w}W / {t-w}L",
+                              delta_color="normal" if wr>=55 else "inverse")
+                else:
+                    m4.metric("🎯 All checks","7/7 passed")
+
+                if bt and bt['total']>0:
+                    w=bt['bw']+bt['sw']; t=bt['total']; wr=bt['wr']
+                    col='var(--color-text-success)' if wr>=60 else (
+                        'var(--color-text-warning)' if wr>=45 else 'var(--color-text-danger)')
+                    st.markdown(f"""
+<div style="background:var(--color-background-secondary);border-radius:10px;
+     padding:14px 20px;margin:12px 0;border:0.5px solid var(--color-border-tertiary);">
+<span style="font-size:20px;font-weight:500;color:{col};">
+  Backtest Win Rate: {wr}%
+</span>
+<span style="font-size:13px;color:var(--color-text-secondary);margin-left:12px;">
+  ({w} wins / {t} trades)
+</span>
+&nbsp;&nbsp;|&nbsp;&nbsp;
+🟢 {bt['bw']}W {bt['bl']}L &nbsp;·&nbsp; 🔴 {bt['sw']}W {bt['sl_']}L
+</div>""", unsafe_allow_html=True)
+
+                st.markdown("---")
+
+                st.markdown("""
+<div style="background:var(--color-background-success);padding:10px 16px;
+     border-radius:8px;margin-bottom:8px;
+     border-left:4px solid var(--color-border-success);">
+<b style="color:var(--color-text-success);">🟢 BUY Signals</b>
+<span style="font-size:12px;color:var(--color-text-secondary);margin-left:8px;">
+Enter at scan time · SL = morning low · Target = 2R · Exit 3:00 PM
+</span></div>""", unsafe_allow_html=True)
+                st.markdown(make_table(bull,is_hist),unsafe_allow_html=True)
+
+                st.markdown("""
+<div style="background:var(--color-background-danger);padding:10px 16px;
+     border-radius:8px;margin-bottom:8px;margin-top:16px;
+     border-left:4px solid var(--color-border-danger);">
+<b style="color:var(--color-text-danger);">🔴 SHORT Signals</b>
+<span style="font-size:12px;color:var(--color-text-secondary);margin-left:8px;">
+Enter at scan time · SL = morning high · Target = 2R · Exit 3:00 PM
+</span></div>""", unsafe_allow_html=True)
+                st.markdown(make_table(bear,is_hist),unsafe_allow_html=True)
+
+                st.markdown("---")
+                st.markdown("""
+<div style="background:var(--color-background-secondary);border-radius:10px;
+     padding:14px 20px;font-size:13px;line-height:1.9;
+     border:0.5px solid var(--color-border-tertiary);">
+<b>📌 Trade rules</b><br>
+⏰ Enter within 15 min of scan time only<br>
+🛑 Exit all positions at 3:00 PM — no exceptions<br>
+❌ If SL hit — exit immediately, never average down<br>
+📊 Score ≥ 70 = strongest signals, use full position size<br>
+📊 Score 50–69 = moderate signals, use half size<br>
+🚫 Zero signals today = skip trading, protect capital
+</div>""", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
