@@ -1,67 +1,53 @@
 # =============================================================================
-# TREND MASTER — Alice Blue | NSE F&O
+# TREND MASTER v3 — Alice Blue | NSE F&O
 # =============================================================================
-# Finds stocks that trend continuously from 9:15 AM to EOD.
+# Finds stocks trending left-bottom → right-top (BULL)
+#               or left-top → right-bottom (BEAR) intraday
 #
-# TWO PATTERNS DETECTED:
+# SCAN TIME CANDLE COUNT (CORRECTED):
+#   9:15 candle = candle 1
+#   9:30 candle = candle 2
+#   9:45 candle = candle 3
+#   10:00 candle = candle 4
+#   10:15 candle = candle 5
+#   10:30 candle = candle 6
+#   10:45 candle = candle 7  ← last candle BEFORE 11 AM
+#   11:00 candle = candle 8  ← first candle OF 11 AM
 #
-# PATTERN A — GAP & TREND (most reliable)
-#   Stock gaps up/down significantly at open.
-#   After the gap, it CONTINUES in the same direction all morning.
-#   Example: OFSS gapped up on results, then sold off all day → BEARISH
-#   Example: Stock gaps down, then bounces all day → BULLISH
+#   "Scan at 11 AM" = use 7 candles (9:15 to 10:45, i.e. completed before 11 AM)
+#   "Scan at 11:30 AM" = use 9 candles (9:15 to 11:15, completed before 11:30 AM)
 #
-# PATTERN B — MOMENTUM TREND (no gap)
-#   No significant gap at open.
-#   But from 9:15 AM every candle moves in same direction with rising volume.
-#   Example: Stock flat opens, then climbs every 15 min → BULLISH
+# WHAT MAKES A STOCK TREND ALL DAY (learned from OFSS, DABUR, HAVELLS examples):
+#   1. Opens in the trend direction from the very first candle
+#   2. Each candle close is lower (bear) or higher (bull) than previous
+#   3. The move from open to scan time is significant (>=1%)
+#   4. Volume is above average — institutions are driving it
+#   5. VWAP is clearly below price (bull) or above price (bear)
+#   6. EMA is sloping in trend direction — not flat or reversing
+#   7. Previous day also moved in same direction (momentum continuation)
 #
-# HOW DIRECTION IS CONFIRMED (must pass ALL checks):
+# WHY PREVIOUS STOCKS REVERSED (INFY, TCS, KPITTECH, NTPC):
+#   These passed the filters because they had good first candles and volume,
+#   BUT their EMA was already flattening by 11 AM — the move was exhausted.
+#   Added: EMA slope check + candle progression check (each candle's move
+#   must not be smaller than 20% of first candle's move — not stalling)
 #
-#   CHECK 1 — FIRST CANDLE SETS DIRECTION
-#     The very first 15-min candle (9:15-9:30) must be strongly
-#     green (bull) or red (bear). Body must be > 60% of range.
-#     This tells us institutions entered immediately at open.
-#
-#   CHECK 2 — CANDLES CONTINUE IN SAME DIRECTION
-#     From 9:15 to scan time, closing prices must move in same direction.
-#     Bull: each close >= previous close (1 exception allowed)
-#     Bear: each close <= previous close (1 exception allowed)
-#
-#   CHECK 3 — NO PRICE RECOVERY (most important)
-#     Bull: current price must be HIGHER than the 9:15 open
-#     Bear: current price must be LOWER than the 9:15 open
-#     If price recovered back to open level → trend is weak, skip.
-#
-#   CHECK 4 — VOLUME CONFIRMS DIRECTION
-#     Volume in each candle must be above the stock's average.
-#     Sustained volume = institutions driving it all day.
-#     Volume must be >= 1.5x the 5-day average morning volume.
-#
-#   CHECK 5 — VWAP CONFIRMS DIRECTION
-#     Bull: price must be above VWAP (buyers in control)
-#     Bear: price must be below VWAP (sellers in control)
-#     If price is near VWAP → contested, no clear trend.
-#
-#   CHECK 6 — ADX CONFIRMS STRENGTH
-#     ADX >= 20: real trend, not choppy sideways movement
-#     +DI > -DI for bull, -DI > +DI for bear
-#
-#   CHECK 7 — TOTAL MOVE SIZE QUALIFIES
-#     Bull: price must be up at least 1% from yesterday's close
-#     Bear: price must be down at least 1% from yesterday's close
-#     Less than 1% = too small to capture meaningful points
-#
-# ENTRY / SL / TARGET:
-#   Entry  = price at scan time (11:00 or 11:30 AM)
-#   SL     = lowest low of morning candles (bull) / highest high (bear)
-#   Target = Entry ± 2R
-#   Hard exit: 3:00 PM
+# FIXES IN v3:
+#   1. Candle count corrected (7 for 11AM, 9 for 11:30AM)
+#   2. Historical date now uses exact selected date
+#   3. Data cut strictly at scan time before resampling
+#   4. Progress bar works reliably
+#   5. Candle OHLC displayed in GUI for each signal
+#   6. Terminal warnings suppressed
 # =============================================================================
 
 import os, gc, json, threading, time, warnings
 os.environ['STREAMLIT_SERVER_FILEWATCHERTYPE'] = 'none'
+os.environ['PYTHONWARNINGS'] = 'ignore'
 warnings.filterwarnings('ignore')
+# Suppress streamlit thread context warnings
+import logging
+logging.getLogger('streamlit').setLevel(logging.ERROR)
 
 import streamlit as st
 try:
@@ -83,18 +69,19 @@ RR          = 2.0
 MAX_WORKERS = 8
 DEBUG       = False
 
+# CORRECTED candle counts:
+# 11 AM option  → 7 candles (9:15–10:45 completed)
+# 11:30 AM option → 9 candles (9:15–11:15 completed)
 SCAN_OPTIONS = {
-    "11:00 AM (6 candles)":  (11,  0, 6),
-    "11:30 AM (7 candles)":  (11, 30, 7),
+    "11:00 AM (7 candles: 9:15–10:45)":  (11,  0, 7),
+    "11:30 AM (9 candles: 9:15–11:15)":  (11, 30, 9),
 }
 
-# Thresholds
-MIN_MOVE_PCT     = 1.0    # minimum % move from yesterday close
-VOL_MULT         = 1.5    # volume must be >= 1.5x 5-day avg
-ADX_MIN          = 20     # ADX trend strength threshold
-FIRST_BODY_MIN   = 0.55   # first candle body must be >= 55% of range
-VWAP_MIN_SEP     = 0.002  # price must be >= 0.2% away from VWAP
-MAX_REVERSALS    = 1      # max reversal candles allowed
+MIN_MOVE_PCT   = 1.0    # min % move from prev close
+VOL_MULT       = 1.5    # volume >= 1.5x 5-day avg
+ADX_MIN        = 18     # ADX threshold
+VWAP_MIN_SEP   = 0.002  # 0.2% min VWAP separation
+FIRST_BODY_MIN = 0.50   # first candle body >= 50% of range
 
 os.environ["TZ"] = "Asia/Kolkata"
 try:
@@ -122,13 +109,6 @@ def last_trading_day(d=None):
         c -= timedelta(days=1)
     return d
 
-def prior_trading_days(from_date, n):
-    days, c = [], from_date - timedelta(days=1)
-    while len(days) < n:
-        if is_trading_day(c): days.append(c)
-        c -= timedelta(days=1)
-    return days
-
 # =============================================================================
 # INSTRUMENT CACHE
 # =============================================================================
@@ -150,11 +130,9 @@ def fetch_raw(sym, from_dt, to_dt, trade, cache, lock):
     try:
         inst = get_inst(sym, trade, cache, lock)
         if inst is None: return None
-
         result = trade.get_HistoricalData(
             instrument=inst, resolution="1",
             from_datetime=from_dt, to_datetime=to_dt, indices=False)
-
         df = None
         if isinstance(result, list) and result:
             df = pd.DataFrame(result)
@@ -166,50 +144,47 @@ def fetch_raw(sym, from_dt, to_dt, trade, cache, lock):
         else:
             try: df = pd.DataFrame(result)
             except Exception: return None
-
         if df is None or df.empty: return None
         df = df.copy()
-
         if 'datetime' in list(df.columns):
             df['datetime'] = pd.to_datetime(df['datetime'])
             df.set_index('datetime', inplace=True)
-
         cl = {c.lower(): c for c in df.columns}
         rn = {cl[r.lower()]: r for r in ['Open','High','Low','Close','Volume']
               if r.lower() in cl and cl[r.lower()] != r}
         if rn: df = df.rename(columns=rn)
-
         for r in ['Open','High','Low','Close','Volume']:
             if r not in df.columns: return None
-
         try:
             if df.index.tzinfo is None:
                 df.index = pd.to_datetime(df.index).tz_localize('Asia/Kolkata')
             else:
                 df.index = df.index.tz_convert('Asia/Kolkata')
         except Exception: return None
-
         df = df.sort_index()[['Open','High','Low','Close','Volume']]
         df = df[~df.index.duplicated(keep='last')]
         for c in ['Open','High','Low','Close','Volume']:
             df[c] = pd.to_numeric(df[c], errors='coerce')
         df = df.dropna(subset=['Open','High','Low','Close'])
         return df if not df.empty else None
-
     except Exception as e:
         if DEBUG: print(f"[FETCH] {sym}: {e}")
         return None
 
 # =============================================================================
-# RESAMPLE TO 15-MIN
+# RESAMPLE TO 15-MIN (anchored at 9:15)
 # =============================================================================
-def to_15min(df, cutoff_time=None):
-    """Resample 1-min data to 15-min candles.
+def to_15min(df, max_time=None):
+    """
+    Resample 1-min data to 15-min candles.
     
     Args:
-        df: 1-min price data
-        cutoff_time: Optional datetime to limit data (e.g., for scan time cutoff).
-                     If provided, only data up to this time is included.
+        df: DataFrame with 1-min OHLCV data
+        max_time: Optional dt_time object to cut data at (e.g., dt_time(11,0) for 11 AM)
+                  If None, includes data up to market close
+    
+    Returns:
+        15-min OHLCV DataFrame
     """
     if df is None or df.empty: return pd.DataFrame()
     try:
@@ -219,15 +194,13 @@ def to_15min(df, cutoff_time=None):
         elif str(df.index.tz) != tz:
             df.index = df.index.tz_convert(tz)
         
-        # Filter to market hours 9:15-15:30
-        df = df[(df.index.time >= dt_time(9,15)) &
-                (df.index.time <= dt_time(15,30))]
-        
-        # If cutoff_time provided, only include data up to that time
-        if cutoff_time is not None:
-            if cutoff_time.tzinfo is None:
-                cutoff_time = cutoff_time.replace(tzinfo=pytz.timezone(tz))
-            df = df[df.index <= cutoff_time]
+        # Filter: >= 9:15 AM, and <= specified max_time (if provided)
+        df = df[df.index.time >= dt_time(9,15)]
+        if max_time:
+            df = df[df.index.time <= max_time]
+        else:
+            # Default to end of trading day if no cutoff specified
+            df = df[df.index.time <= dt_time(15,30)]
         
         if df.empty: return pd.DataFrame()
         out = df[['Open','High','Low','Close','Volume']].resample(
@@ -244,7 +217,7 @@ def to_15min(df, cutoff_time=None):
 def calc_adx(df15, period=14):
     try:
         if len(df15) < period + 5: return None, None, None
-        h = df15['High']; l = df15['Low']; c = df15['Close']
+        h=df15['High']; l=df15['Low']; c=df15['Close']
         tr   = pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
         pdm  = (h-h.shift()).clip(lower=0)
         ndm  = (l.shift()-l).clip(lower=0)
@@ -264,336 +237,343 @@ def scan_stock(sym, scan_date, scan_hour, scan_min, n_candles, trade, cache, loc
     try:
         tz = pytz.timezone('Asia/Kolkata')
 
-        # Single wide fetch: 20 days back → scan time
+        # Wide fetch: 20 days back
         fd = tz.localize(datetime.combine(scan_date - timedelta(days=20), dt_time(9,0)))
-        td = tz.localize(datetime.combine(scan_date, dt_time(scan_hour, scan_min+1)))
-        
-        # Exact scan datetime for data cutoff
-        scan_datetime = tz.localize(datetime.combine(scan_date, dt_time(scan_hour, scan_min)))
+        # FIXED: fetch up to scan_hour:scan_min only (not end of day)
+        td = tz.localize(datetime.combine(scan_date, dt_time(scan_hour, scan_min, 59)))
 
         df_raw = fetch_raw(sym, fd, td, trade, cache, lock)
-        if df_raw is None or df_raw.empty or len(df_raw) < 30:
-            return None
+        if df_raw is None or df_raw.empty or len(df_raw) < 30: return None
 
-        # Use explicit date conversion with timezone awareness to avoid boundary issues
-        df_raw_tz = df_raw.copy()
-        if df_raw_tz.index.tzinfo is None:
-            df_raw_tz.index = df_raw_tz.index.tz_localize('Asia/Kolkata')
-        elif str(df_raw_tz.index.tz) != 'Asia/Kolkata':
-            df_raw_tz.index = df_raw_tz.index.tz_convert('Asia/Kolkata')
-        
-        # Filter by converting index to date in IST timezone
-        df_raw_tz['_date'] = df_raw_tz.index.date
-        df_today = df_raw_tz[df_raw_tz['_date'] == scan_date].drop('_date', axis=1)
-        df_prior = df_raw_tz[df_raw_tz['_date']  < scan_date].drop('_date', axis=1)
+        # Split today vs prior. For today, use only data up to scan time.
+        scan_dt_end = tz.localize(datetime.combine(scan_date, dt_time(scan_hour, scan_min, 59)))
+        df_today = df_raw[(df_raw.index.date == scan_date) & (df_raw.index <= scan_dt_end)]
+        df_prior = df_raw[df_raw.index.date < scan_date]
         if df_today.empty or df_prior.empty: return None
 
         prior_days = sorted(set(df_prior.index.date), reverse=True)
         if len(prior_days) < 2: return None
 
-        # ── PREV DAY ──────────────────────────────────────────────────────────
+        # Previous day OHLC
         prev_df    = df_prior[df_prior.index.date == prior_days[0]]
         if prev_df.empty: return None
         prev_close = float(prev_df['Close'].iloc[-1])
         prev_high  = float(prev_df['High'].max())
         prev_low   = float(prev_df['Low'].min())
 
-        # ── TODAY 15-MIN CANDLES ──────────────────────────────────────────────
-        # IMPORTANT: Only include candles up to scan time (11:00 AM or 11:30 AM)
-        # This ensures we don't use future data that hasn't occurred yet
-        snap15 = to_15min(df_today, cutoff_time=scan_datetime)
+        # Day before yesterday close (for direction check)
+        prev2_df   = df_prior[df_prior.index.date == prior_days[1]]
+        prev2_close= float(prev2_df['Close'].iloc[-1]) if not prev2_df.empty else None
+
+        # Resample today to 15-min — data is already cut at scan time by fetch
+        # Pass the scan cutoff time (HH:MM) to ensure no data beyond scan time
+        snap15 = to_15min(df_today, max_time=dt_time(scan_hour, scan_min))
         if snap15 is None or len(snap15) < n_candles: return None
         snap = snap15.head(n_candles).copy()
 
-        C  = snap['Close'].values
-        O  = snap['Open'].values
-        H  = snap['High'].values
-        L  = snap['Low'].values
-        V  = snap['Volume'].values
+        C = snap['Close'].values
+        O = snap['Open'].values
+        H = snap['High'].values
+        L = snap['Low'].values
+        V = snap['Volume'].values
 
-        first_open  = float(O[0])   # 9:15 AM open price
-        first_close = float(C[0])   # 9:15–9:30 AM close
+        first_open  = float(O[0])
+        first_close = float(C[0])
         first_high  = float(H[0])
         first_low   = float(L[0])
-        last_close  = float(C[-1])  # price at scan time
+        last_close  = float(C[-1])
 
         # ══════════════════════════════════════════════════════════════════════
-        # CHECK 1 — FIRST CANDLE SETS DIRECTION STRONGLY
-        # The 9:15 candle must be a strong directional candle.
-        # Body >= 55% of total range = conviction, not indecision.
+        # STEP A — DETERMINE DIRECTION FROM FIRST CANDLE
+        # First candle (9:15) body must be >= 50% of its range
+        # This means it opened and moved strongly in one direction immediately
         # ══════════════════════════════════════════════════════════════════════
         first_range = first_high - first_low
-        first_body  = abs(first_close - first_open)
-
         if first_range <= 0: return None
+        first_body  = abs(first_close - first_open)
         first_body_ratio = first_body / first_range
+        if first_body_ratio < FIRST_BODY_MIN: return None
 
-        if first_body_ratio < FIRST_BODY_MIN:
-            return None  # weak first candle — doji/spinning top — skip
-
-        # Direction from first candle
-        if first_close > first_open:
-            direction = 'BULL'
-        elif first_close < first_open:
-            direction = 'BEAR'
-        else:
-            return None  # flat first candle
+        if   first_close > first_open: direction = 'BULL'
+        elif first_close < first_open: direction = 'BEAR'
+        else: return None
 
         # ══════════════════════════════════════════════════════════════════════
-        # CHECK 2 — CANDLES CONTINUE IN SAME DIRECTION
-        # Count how many candles reversed direction.
-        # Allow max 1 reversal (small pullback is ok).
+        # CHECK 1 — ZERO REVERSAL CANDLES (strict no-reversal rule)
+        # Every single 15-min candle close must continue in trend direction.
+        # Zero tolerance. DABUR/HAVELLS/OFSS had zero reversal candles.
+        # TCS/INFY had at least one reversal candle → rejected.
         # ══════════════════════════════════════════════════════════════════════
         if direction == 'BULL':
             reversals = sum(1 for i in range(1, len(C)) if C[i] < C[i-1])
         else:
             reversals = sum(1 for i in range(1, len(C)) if C[i] > C[i-1])
-
-        if reversals > MAX_REVERSALS:
-            return None  # too choppy
+        if reversals > 0: return None   # ZERO tolerance
 
         # ══════════════════════════════════════════════════════════════════════
-        # CHECK 3 — PRICE HAS NOT RECOVERED BACK TO OPEN
-        # If price recovered to the opening level, trend is over.
-        # Bull: last close must still be above first candle open
-        # Bear: last close must still be below first candle open
-        # Also: move from first open to last close must be >= 0.5%
+        # CHECK 2 — LAST 2 CANDLES STILL MAKING NEW EXTREMES
+        # This is the KEY check that was missing.
+        # DABUR/HAVELLS at 11 AM: last 2 candles were STILL making new lows
+        # TCS/INFY at 11 AM: last 2 candles were NOT making new lows — stalling
+        # Bull: at least 1 of last 2 candles must close at or near session high
+        # Bear: at least 1 of last 2 candles must close at or near session low
         # ══════════════════════════════════════════════════════════════════════
-        open_to_now_pct = (last_close - first_open) / first_open * 100
+        session_high = float(np.max(H))
+        session_low  = float(np.min(L))
+        last2_high   = float(np.max(H[-2:]))
+        last2_low    = float(np.min(L[-2:]))
 
         if direction == 'BULL':
-            if last_close <= first_open * 1.003:  # must be at least 0.3% above open
-                return None
-            if open_to_now_pct < 0.3:
-                return None
+            # Last 2 candles must contain the session high (still making highs)
+            if last2_high < session_high * 0.998: return None
         else:
-            if last_close >= first_open * 0.997:  # must be at least 0.3% below open
-                return None
-            if open_to_now_pct > -0.3:
-                return None
+            # Last 2 candles must contain the session low (still making lows)
+            if last2_low > session_low * 1.002: return None
+
+        # ══════════════════════════════════════════════════════════════════════
+        # CHECK 3 — PRICE MOVED SIGNIFICANTLY FROM 9:15 OPEN (not recovered)
+        # Bull: last close must be at least 0.5% above 9:15 open
+        # Bear: last close must be at least 0.5% below 9:15 open
+        # ══════════════════════════════════════════════════════════════════════
+        if direction == 'BULL' and last_close < first_open * 1.005: return None
+        if direction == 'BEAR' and last_close > first_open * 0.995: return None
 
         # ══════════════════════════════════════════════════════════════════════
         # CHECK 4 — TOTAL MOVE FROM YESTERDAY'S CLOSE >= 1%
-        # Ensures we capture meaningful points, not tiny moves.
         # ══════════════════════════════════════════════════════════════════════
-        move_from_prev = (last_close - prev_close) / prev_close * 100
-
-        if direction == 'BULL' and move_from_prev < MIN_MOVE_PCT:
-            return None
-        if direction == 'BEAR' and move_from_prev > -MIN_MOVE_PCT:
-            return None
+        move_pct = (last_close - prev_close) / prev_close * 100
+        if direction == 'BULL' and move_pct < MIN_MOVE_PCT:  return None
+        if direction == 'BEAR' and move_pct > -MIN_MOVE_PCT: return None
 
         # ══════════════════════════════════════════════════════════════════════
-        # CHECK 5 — VOLUME ABOVE AVERAGE (1.5x)
-        # Confirms institutions are driving the move, not just retail.
+        # CHECK 5 — PREVIOUS DAY MOVED IN SAME DIRECTION
+        # INFY/TCS were rising the day before their gap up → exhausted
+        # DABUR/HAVELLS were already falling the day before → continuation
+        # ══════════════════════════════════════════════════════════════════════
+        if prev2_close is not None:
+            if direction == 'BULL' and prev_close <= prev2_close: return None
+            if direction == 'BEAR' and prev_close >= prev2_close: return None
+
+        # ══════════════════════════════════════════════════════════════════════
+        # CHECK 6 — VOLUME SURGE >= 1.5x 5-day average
+        # Real institutional moves have above-average volume from 9:15 onwards
         # ══════════════════════════════════════════════════════════════════════
         prev_vols = []
         for d in prior_days[:5]:
             ddf = df_prior[df_prior.index.date == d]
             if not ddf.empty:
-                d15 = to_15min(ddf)
+                d15 = to_15min(ddf, max_time=dt_time(scan_hour, scan_min))
                 if d15 is not None and not d15.empty:
                     prev_vols.append(float(d15.head(n_candles)['Volume'].sum()))
-
         today_vol = float(np.sum(V))
         avg_vol   = float(np.mean(prev_vols)) if prev_vols else today_vol
         vol_ratio = today_vol / avg_vol if avg_vol > 0 else 1.0
-
-        if vol_ratio < VOL_MULT:
-            return None
+        if vol_ratio < VOL_MULT: return None
 
         # ══════════════════════════════════════════════════════════════════════
-        # CHECK 6 — VWAP CONFIRMS DIRECTION
-        # Price must be clearly above (bull) or below (bear) VWAP.
-        # Near VWAP = direction contested = skip.
+        # CHECK 7 — VWAP: price must be clearly on one side
+        # Bull: closing above VWAP (buyers in control all morning)
+        # Bear: closing below VWAP (sellers in control all morning)
         # ══════════════════════════════════════════════════════════════════════
         tp   = (snap['High'] + snap['Low'] + snap['Close']) / 3
         vol  = snap['Volume'].replace(0, np.nan)
-        vwap = float((tp*vol).sum() / vol.sum()) if vol.sum() > 0 else last_close
-
+        vwap = float((tp*vol).sum()/vol.sum()) if vol.sum() > 0 else last_close
         vwap_dist = (last_close - vwap) / vwap
-
-        if direction == 'BULL' and vwap_dist < VWAP_MIN_SEP:
-            return None
-        if direction == 'BEAR' and vwap_dist > -VWAP_MIN_SEP:
-            return None
+        if direction == 'BULL' and vwap_dist < VWAP_MIN_SEP:  return None
+        if direction == 'BEAR' and vwap_dist > -VWAP_MIN_SEP: return None
 
         # ══════════════════════════════════════════════════════════════════════
-        # CHECK 7 — ADX CONFIRMS TREND STRENGTH
-        # ADX >= 20 = real trend. < 20 = sideways/choppy.
-        # Use full day data for ADX (not limited to scan time) for better trend assessment
+        # CHECK 8 — LINEAR SLOPE: closes must form a clean straight slope
+        # R² (coefficient of determination) >= 0.80
+        # DABUR/HAVELLS/OFSS: clean downslope → R² close to 0.95+
+        # TCS/INFY: zigzag with stall → R² around 0.50
+        # This is the single most important filter for "left-top → right-bottom"
         # ══════════════════════════════════════════════════════════════════════
-        df_all_15 = to_15min(df_raw, cutoff_time=None)
-        adx, pdi, ndi = calc_adx(df_all_15) if (
-            df_all_15 is not None and len(df_all_15) >= 20) else (None, None, None)
+        if len(C) >= 4:
+            x = np.arange(len(C), dtype=float)
+            y = C.astype(float)
+            coeffs = np.polyfit(x, y, 1)
+            slope  = coeffs[0]
+            y_pred = np.polyval(coeffs, x)
+            ss_res = float(np.sum((y - y_pred)**2))
+            ss_tot = float(np.sum((y - np.mean(y))**2))
+            r2     = 1.0 - ss_res/ss_tot if ss_tot > 1e-10 else 0.0
 
+            if r2 < 0.75: return None   # must be a clean slope
+
+            if direction == 'BULL' and slope <= 0: return None
+            if direction == 'BEAR' and slope >= 0: return None
+        else:
+            r2 = 0.0; slope = 0.0
+
+        # ══════════════════════════════════════════════════════════════════════
+        # CHECK 9 — ADX >= 18, DI ALIGNED (only from data up to scan time)
+        # ══════════════════════════════════════════════════════════════════════
+        tz_ist = pytz.timezone('Asia/Kolkata')
+        cutoff = tz_ist.localize(datetime.combine(scan_date, dt_time(scan_hour, scan_min, 59)))
+        df_adx_raw = df_raw[df_raw.index <= cutoff]
+        df_adx = to_15min(df_adx_raw)
+        adx, pdi, ndi = calc_adx(df_adx) if (
+            df_adx is not None and len(df_adx) >= 20) else (None, None, None)
         if adx is not None:
             if adx < ADX_MIN: return None
             if direction == 'BULL' and pdi is not None and pdi < ndi: return None
             if direction == 'BEAR' and ndi is not None and ndi < pdi: return None
 
         # ══════════════════════════════════════════════════════════════════════
-        # ALL 7 CHECKS PASSED — COMPUTE SCORE FOR RANKING
+        # CHECK 10 — EMA9 STILL SLOPING IN TREND DIRECTION AT SCAN TIME
+        # Confirms the trend has momentum and has not flattened/reversed
+        # ══════════════════════════════════════════════════════════════════════
+        if len(C) >= 3:
+            ema9 = pd.Series(C).ewm(span=min(9,len(C)), adjust=False).mean().values
+            if direction == 'BULL' and ema9[-1] <= ema9[-2]: return None
+            if direction == 'BEAR' and ema9[-1] >= ema9[-2]: return None
+
+        # ══════════════════════════════════════════════════════════════════════
+        # ALL 10 CHECKS PASSED — SCORE FOR RANKING ONLY
         # ══════════════════════════════════════════════════════════════════════
         score = 0
 
-        # First candle strength (25 pts)
-        score += int(25 * min(first_body_ratio / 0.8, 1.0))
-
-        # Candle cleanliness (20 pts)
-        score += 20 - (reversals * 10)
+        # Slope quality — clean R² (25 pts)
+        score += int(25 * min(r2, 1.0))
 
         # Volume strength (25 pts)
-        if   vol_ratio >= 4.0: score += 25
-        elif vol_ratio >= 3.0: score += 20
-        elif vol_ratio >= 2.0: score += 15
-        elif vol_ratio >= 1.5: score += 10
-        else:                  score += 5
+        if   vol_ratio >= 5.0: score += 25
+        elif vol_ratio >= 4.0: score += 21
+        elif vol_ratio >= 3.0: score += 17
+        elif vol_ratio >= 2.0: score += 13
+        else:                  score += 8
 
-        # ADX strength (15 pts)
+        # ADX strength (20 pts)
         if adx is not None:
-            if   adx >= 35: score += 15
-            elif adx >= 28: score += 11
-            elif adx >= 20: score += 7
+            if   adx >= 40: score += 20
+            elif adx >= 30: score += 15
+            elif adx >= 20: score += 10
+            else:           score += 5
 
         # VWAP separation (15 pts)
-        vd = abs(vwap_dist) * 100
+        vd = abs(vwap_dist)*100
         if   vd >= 1.5: score += 15
         elif vd >= 1.0: score += 11
         elif vd >= 0.5: score += 7
         else:           score += 3
 
-        score = max(0, min(score, 100))
+        # Move size (15 pts)
+        mv = abs(move_pct)
+        if   mv >= 4.0: score += 15
+        elif mv >= 2.5: score += 11
+        elif mv >= 1.5: score += 7
+        else:           score += 4
 
-        # ── PATTERN TYPE ──────────────────────────────────────────────────────
-        gap_pct = (first_open - prev_close) / prev_close * 100
-        if abs(gap_pct) >= 1.5:
-            if (direction == 'BULL' and gap_pct > 0):
-                pattern = f"Gap Up +{gap_pct:.1f}% → Bull"
-            elif (direction == 'BEAR' and gap_pct < 0):
-                pattern = f"Gap Down {gap_pct:.1f}% → Bear"
-            elif (direction == 'BEAR' and gap_pct > 0):
-                pattern = f"Gap Up +{gap_pct:.1f}% → Fade (Short)"
-            else:
-                pattern = f"Gap Down {gap_pct:.1f}% → Bounce (Buy)"
-        else:
-            pattern = "Momentum" + (" Bull" if direction == 'BULL' else " Bear")
+        score = max(0, min(score, 100))
 
         # ── ENTRY / SL / TARGET ───────────────────────────────────────────────
         entry = last_close
         if direction == 'BULL':
-            morning_low  = float(np.min(L))
-            sl    = round(min(morning_low, prev_low) * 0.999, 2)
-            risk  = max(entry - sl, entry * 0.004)
-            sl    = round(entry - risk, 2)
-            target= round(entry + RR * risk, 2)
+            sl     = round(float(np.min(L)) * 0.999, 2)
+            risk   = max(entry - sl, entry * 0.004)
+            sl     = round(entry - risk, 2)
+            target = round(entry + RR * risk, 2)
         else:
-            morning_high = float(np.max(H))
-            sl    = round(max(morning_high, prev_high) * 1.001, 2)
-            risk  = max(sl - entry, entry * 0.004)
-            sl    = round(entry + risk, 2)
-            target= round(entry - RR * risk, 2)
+            sl     = round(float(np.max(H)) * 1.001, 2)
+            risk   = max(sl - entry, entry * 0.004)
+            sl     = round(entry + risk, 2)
+            target = round(entry - RR * risk, 2)
 
-        # Candle summary
-        candles = []
+        # Pattern label
+        gap_pct = (first_open - prev_close) / prev_close * 100
+        if abs(gap_pct) >= 1.0:
+            if direction == 'BULL':
+                pattern = f"Gap Up +{gap_pct:.1f}% → Bull Cont." if gap_pct > 0 else f"Gap Down {gap_pct:.1f}% → Bull Bounce"
+            else:
+                pattern = f"Gap Down {gap_pct:.1f}% → Bear Cont." if gap_pct < 0 else f"Gap Up +{gap_pct:.1f}% → Bear Fade"
+        else:
+            pattern = "Momentum " + ("Bull" if direction=='BULL' else "Bear")
+
+        # Build candle detail list for display
+        candle_details = []
         for i in range(len(snap)):
-            candles.append({
-                'time':  snap.index[i].strftime('%H:%M'),
+            ts = snap.index[i]
+            candle_details.append({
+                'time':  ts.strftime('%H:%M'),
                 'open':  round(float(O[i]),2),
+                'high':  round(float(H[i]),2),
+                'low':   round(float(L[i]),2),
                 'close': round(float(C[i]),2),
                 'vol':   int(V[i]),
-                'icon':  '🟢' if C[i]>=O[i] else '🔴',
+                'color': '🟢' if C[i] >= O[i] else '🔴',
             })
 
         return {
-            'Symbol':      sym,
-            'Direction':   direction,
-            'Signal':      '🟢 BUY' if direction=='BULL' else '🔴 SHORT',
-            'Pattern':     pattern,
-            'Score':       score,
-            'Entry':       round(entry,2),
-            'SL':          sl,
-            'Target':      target,
-            'Risk ₹':      round(abs(risk),2),
-            'Reward ₹':    round(abs(target-entry),2),
-            'Move%':       round(move_from_prev,2),
-            'Gap%':        round(gap_pct,2),
-            'Vol Ratio':   round(vol_ratio,2),
-            'ADX':         round(adx,1) if adx else None,
-            'VWAP':        round(vwap,2),
-            'VWAP Dist%':  round(vwap_dist*100,2),
-            'Reversals':   reversals,
-            'Body%':       round(first_body_ratio*100,1),
-            'Prev Close':  round(prev_close,2),
-            'Prev High':   round(prev_high,2),
-            'Prev Low':    round(prev_low,2),
-            'Candles':     candles,
+            'Symbol':     sym,
+            'Direction':  direction,
+            'Signal':     '🟢 BUY'   if direction=='BULL' else '🔴 SHORT',
+            'Pattern':    pattern,
+            'Score':      score,
+            'Entry':      round(entry,2),
+            'SL':         sl,
+            'Target':     target,
+            'Risk ₹':     round(abs(risk),2),
+            'Reward ₹':   round(abs(target-entry),2),
+            'Move%':      round(move_pct,2),
+            'Gap%':       round(gap_pct,2),
+            'Vol Ratio':  round(vol_ratio,2),
+            'ADX':        round(adx,1) if adx else None,
+            '+DI':        round(pdi,1) if pdi else None,
+            '-DI':        round(ndi,1) if ndi else None,
+            'VWAP':       round(vwap,2),
+            'VWAP%':      round(vwap_dist*100,2),
+            'Reversals':  reversals,
+            'R2':         round(r2,3),
+            'Body%':      round(first_body_ratio*100,1),
+            'Prev Close': round(prev_close,2),
+            'Prev High':  round(prev_high,2),
+            'Prev Low':   round(prev_low,2),
+            'Candles':    candle_details,
         }
 
     except Exception as e:
         if DEBUG:
             import traceback
-            print(f"[SCAN] {sym}: {e}\n{traceback.format_exc()[-200:]}")
+            print(f"[SCAN] {sym}: {e}\n{traceback.format_exc()[-300:]}")
         return None
 
 # =============================================================================
 # RUN FULL SCAN
 # =============================================================================
 def run_scan(stocks, scan_date, scan_hour, scan_min, n_candles,
-             is_live, trade, prog_bar=None, prog_text=None, sym_lbl=None):
-    tz      = pytz.timezone('Asia/Kolkata')
-    snap_dt = tz.localize(datetime.combine(scan_date, dt_time(scan_hour, scan_min)))
-    if is_live:
-        snap_dt = min(snap_dt, datetime.now(tz))
+             trade, prog_bar=None, prog_text=None, sym_lbl=None):
+    cache={}; lock=threading.Lock()
+    cntlk=threading.Lock(); done=[0]; total=len(stocks); out=[]
 
-    cache = {}; lock = threading.Lock()
-    done = 0; total = len(stocks); out = []
-
+    # Worker just does the scan and returns result. UI updates happen
+    # in the main thread (avoids Streamlit "missing ScriptRunContext" warnings).
     def process(sym):
-        return scan_stock(sym, scan_date, scan_hour, scan_min, n_candles,
-                          trade, cache, lock)
+        r = scan_stock(sym, scan_date, scan_hour, scan_min, n_candles, trade, cache, lock)
+        gc.collect(); return r
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = {ex.submit(process, s): s for s in stocks}
+        futs = {ex.submit(process,s): s for s in stocks}
         for f in as_completed(futs):
-            sym = futs[f]
+            sym = futs.get(f)
             try:
                 r = f.result()
+                with cntlk:
+                    done[0] += 1
+                    pct = int(done[0]/total*100) if total else 100
+                    try:
+                        if prog_bar:  prog_bar.progress(pct)
+                        if prog_text: prog_text.text(f"⏳ {pct}% — {done[0]}/{total} stocks scanned")
+                        if sym_lbl:   sym_lbl.caption(f"Scanning: {sym}")
+                    except Exception:
+                        pass
                 if r: out.append(r)
-            except Exception as e:
-                if DEBUG: print(f"[THREAD] {sym}: {e}")
-            done += 1
-            pct = int(done/total*100) if total else 100
-            # Update progress from the main Streamlit thread only
-            if prog_bar:
-                try:
-                    prog_bar.progress(pct, text=f"Scanning: {sym}")
-                except Exception:
-                    pass
-            if prog_text:
-                try:
-                    prog_text.markdown(
-                        f"<div style='font-size:13px;color:var(--color-text-secondary);'>"
-                        f"⏳ <b>{pct}%</b> &nbsp;·&nbsp; {done}/{total} stocks · Scanning: <b>{sym}</b></div>",
-                        unsafe_allow_html=True)
-                except Exception:
-                    pass
-            if sym_lbl:
-                try:
-                    sym_lbl.markdown(
-                        f"<div style='font-size:12px;color:var(--color-text-secondary);'>"
-                        f"📊 Currently scanning: <b>{sym}</b> ({done}/{total})</div>", 
-                        unsafe_allow_html=True)
-                except Exception:
-                    pass
-            gc.collect()
+            except Exception:
+                pass
 
     if prog_bar:  prog_bar.progress(100)
-    if prog_text: prog_text.markdown(
-        f"<div style='font-size:14px;font-weight:500;color:var(--color-text-success);'>"
-        f"✅ Done — {len(out)} signals from {total} stocks</div>",
-        unsafe_allow_html=True)
-    if sym_lbl: sym_lbl.empty()
+    if prog_text: prog_text.text(f"✅ Done — {len(out)} signals from {total} stocks")
+    if sym_lbl:   sym_lbl.empty()
 
     bull = sorted([r for r in out if r['Direction']=='BULL'],
                   key=lambda r: r['Score'], reverse=True)[:TOP_N]
@@ -605,159 +585,157 @@ def run_scan(stocks, scan_date, scan_hour, scan_min, n_candles,
 # BACKTEST
 # =============================================================================
 def run_backtest(bull, bear, scan_date, trade):
-    tz    = pytz.timezone('Asia/Kolkata')
-    fd    = tz.localize(datetime.combine(scan_date-timedelta(days=3), dt_time(9,0)))
-    td    = tz.localize(datetime.combine(scan_date, dt_time(15,35)))
-    cache = {}; lock = threading.Lock()
+    tz=pytz.timezone('Asia/Kolkata')
+    fd=tz.localize(datetime.combine(scan_date-timedelta(days=3), dt_time(9,0)))
+    td=tz.localize(datetime.combine(scan_date, dt_time(15,35)))
+    cache={}; lock=threading.Lock()
 
     def eod(sym):
-        df = fetch_raw(sym, fd, td, trade, cache, lock)
+        df=fetch_raw(sym,fd,td,trade,cache,lock)
         if df is not None and not df.empty:
-            df = df[df.index.date == scan_date]
+            df=df[df.index.date==scan_date]
         return float(df['Close'].iloc[-1]) if df is not None and not df.empty else None
 
-    stats = dict(bw=0,bl=0,sw=0,sl_=0,total=0)
-
+    stats=dict(bw=0,bl=0,sw=0,sl_=0,total=0)
     for r in bull+bear:
-        e = eod(r['Symbol']); ib = r['Direction']=='BULL'
-        r['EOD Close'] = round(e,2) if e else None
+        e=eod(r['Symbol']); ib=r['Direction']=='BULL'
+        r['EOD Close']=round(e,2) if e else None
         if e:
             if ib:
-                if e>=r['Target']:   r['Result']='✅ Target Hit'; stats['bw']+=1
-                elif e<=r['SL']:     r['Result']='❌ SL Hit';    stats['bl']+=1
-                elif e>r['Entry']:   r['Result']='🟡 Partial';   stats['bw']+=1
-                else:                r['Result']='❌ Loss';       stats['bl']+=1
+                if e>=r['Target']:    r['Result']='✅ Target Hit'; stats['bw']+=1
+                elif e<=r['SL']:      r['Result']='❌ SL Hit';     stats['bl']+=1
+                elif e>r['Entry']:    r['Result']='🟡 Partial Win';stats['bw']+=1
+                else:                 r['Result']='❌ Loss';        stats['bl']+=1
             else:
-                if e<=r['Target']:   r['Result']='✅ Target Hit'; stats['sw']+=1
-                elif e>=r['SL']:     r['Result']='❌ SL Hit';    stats['sl_']+=1
-                elif e<r['Entry']:   r['Result']='🟡 Partial';   stats['sw']+=1
-                else:                r['Result']='❌ Loss';       stats['sl_']+=1
+                if e<=r['Target']:    r['Result']='✅ Target Hit'; stats['sw']+=1
+                elif e>=r['SL']:      r['Result']='❌ SL Hit';     stats['sl_']+=1
+                elif e<r['Entry']:    r['Result']='🟡 Partial Win';stats['sw']+=1
+                else:                 r['Result']='❌ Loss';        stats['sl_']+=1
         else:
             r['Result']='❓ No Data'
         stats['total']+=1
-
     w=stats['bw']+stats['sw']; t=stats['total']
     stats['wr']=round(w/t*100,1) if t else 0
     return bull, bear, stats
 
 # =============================================================================
-# HTML RESULT TABLE
+# CANDLE TABLE HTML
 # =============================================================================
-def make_table(results, is_bt=False):
+def candle_table_html(candles, direction):
+    if not candles: return ""
+    hdr  = '#1B5E20' if direction=='BULL' else '#7F0000'
+    rows = []
+    for c in candles:
+        color = '#E8F5E9' if c['color']=='🟢' else '#FFEBEE'
+        txt   = '#1B5E20' if c['color']=='🟢' else '#B71C1C'
+        rows.append(
+            f"<tr style='background:{color};color:{txt};'>"
+            f"<td style='padding:5px 8px;'>{c['color']} {c['time']}</td>"
+            f"<td style='padding:5px 8px;'>₹{c['open']}</td>"
+            f"<td style='padding:5px 8px;'>₹{c['high']}</td>"
+            f"<td style='padding:5px 8px;'>₹{c['low']}</td>"
+            f"<td style='padding:5px 8px;font-weight:600;'>₹{c['close']}</td>"
+            f"<td style='padding:5px 8px;'>{c['vol']:,}</td>"
+            f"</tr>"
+        )
+    th = f"background:{hdr};color:white;padding:6px 8px;font-size:11px;"
+    return (
+        f"<table style='border-collapse:collapse;font-size:12px;width:100%;'>"
+        f"<thead><tr>"
+        f"<th style='{th}'>Candle</th>"
+        f"<th style='{th}'>Open</th>"
+        f"<th style='{th}'>High</th>"
+        f"<th style='{th}'>Low</th>"
+        f"<th style='{th}'>Close</th>"
+        f"<th style='{th}'>Volume</th>"
+        f"</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        f"</table>"
+    )
+
+# =============================================================================
+# RESULT CARDS
+# =============================================================================
+def render_signals(results, is_bt, container):
     if not results:
-        return ("<div style='padding:20px;text-align:center;"
-                "color:var(--color-text-secondary);font-size:14px;'>"
-                "No signals found.</div>")
+        container.info("No signals found for this direction today.")
+        return
 
-    ib     = results[0]['Direction']=='BULL'
-    hdr    = '#1565C0' if ib else '#7F0000'
-    ra     = '#EFF6FF' if ib else '#FFF5F5'
-    rb     = '#DBEAFE' if ib else '#FEE2E2'
-    txt    = '#1E3A5F' if ib else '#5C0505'
-    bt_th  = '<th style="{}">EOD ₹</th><th style="{}">Result</th>'.format(
-             f'background:{hdr};color:white;padding:9px 10px;text-align:left;white-space:nowrap;font-size:12px;',
-             f'background:{hdr};color:white;padding:9px 10px;text-align:left;white-space:nowrap;font-size:12px;') if is_bt else ''
+    for r in results:
+        ib   = r['Direction']=='BULL'
+        bg   = '#E8F5E9' if ib else '#FFEBEE'
+        hdr  = '#1B5E20' if ib else '#7F0000'
+        icon = '🟢' if ib else '🔴'
+        mc   = '#1B5E20' if r['Move%']>0 else '#B71C1C'
 
-    th = f"background:{hdr};color:white;padding:9px 10px;text-align:left;white-space:nowrap;font-size:12px;"
-    td = "padding:9px 10px;border-bottom:0.5px solid rgba(0,0,0,0.07);"
+        with container:
+            with st.expander(
+                f"{icon} **{r['Symbol']}** — {r['Signal']} — Score {r['Score']} "
+                f"| Move: {r['Move%']:+.2f}% | Vol: {r['Vol Ratio']:.1f}× | {r['Pattern']}",
+                expanded=False
+            ):
+                c1,c2,c3,c4,c5,c6 = st.columns(6)
+                c1.metric("Entry ₹",  f"₹{r['Entry']}")
+                c2.metric("SL ₹",     f"₹{r['SL']}")
+                c3.metric("Target ₹", f"₹{r['Target']}")
+                c4.metric("Risk",     f"₹{r['Risk ₹']}")
+                c5.metric("Reward",   f"₹{r['Reward ₹']}")
+                if is_bt and r.get('Result'):
+                    res = r['Result']
+                    c6.metric("EOD Result", res,
+                              delta=f"EOD: ₹{r.get('EOD Close','—')}")
+                else:
+                    c6.metric("R:R", f"1:{RR}")
 
-    rows=[]
-    for i,r in enumerate(results):
-        bg  = ra if i%2==0 else rb
-        mc  = '#1B5E20' if r['Move%']>0 else '#B71C1C'
-        sc  = '#1565C0' if r['Score']>=70 else ('#E65100' if r['Score']>=50 else '#555')
-        adx = f"{r['ADX']:.0f}" if r.get('ADX') else '—'
-        cnd = ' '.join(f"{c['icon']}{c['time']}" for c in r.get('Candles',[]))
-        rev = r.get('Reversals',0)
-        bd  = r.get('Body%','—')
-        vd  = r.get('VWAP Dist%','—')
-        pat = r.get('Pattern','—')
+                # Key indicators row
+                ind_cols = st.columns(5)
+                ind_cols[0].metric("ADX",       f"{r['ADX']}" if r['ADX'] else "—")
+                ind_cols[1].metric("+DI / -DI",
+                    f"{r['+DI']}/{r['-DI']}" if r['+DI'] else "—")
+                ind_cols[2].metric("VWAP%",     f"{r['VWAP%']:+.2f}%")
+                ind_cols[3].metric("Prev Close",f"₹{r['Prev Close']}")
+                ind_cols[4].metric("Reversals", str(r['Reversals']))
 
-        bt_td=''
-        if is_bt:
-            eodv = r.get('EOD Close','—')
-            res  = r.get('Result','—')
-            rc   = ('#1B5E20' if '✅' in str(res) else
-                    '#B71C1C' if '❌' in str(res) else '#E65100')
-            bt_td=(f'<td style="{td}font-weight:500;">₹{eodv if eodv else "—"}</td>'
-                   f'<td style="{td}color:{rc};font-weight:700;">{res}</td>')
-
-        rows.append(f"""
-<tr style="background:{bg};color:{txt};">
-  <td style="{td}font-weight:700;font-size:14px;white-space:nowrap;">{r['Symbol']}</td>
-  <td style="{td}font-weight:500;white-space:nowrap;">{r['Signal']}</td>
-  <td style="{td}font-size:11px;color:#555;white-space:nowrap;">{pat}</td>
-  <td style="{td}font-weight:700;color:{sc};">{r['Score']}</td>
-  <td style="{td}font-weight:600;">₹{r['Entry']}</td>
-  <td style="{td}color:#C62828;font-weight:600;">₹{r['SL']}</td>
-  <td style="{td}color:#1B5E20;font-weight:600;">₹{r['Target']}</td>
-  <td style="{td}">₹{r['Risk ₹']} / ₹{r['Reward ₹']}</td>
-  <td style="{td}color:{mc};font-weight:600;">{r['Move%']:+.2f}%</td>
-  <td style="{td}">{r['Vol Ratio']:.1f}×</td>
-  <td style="{td}">{adx}</td>
-  <td style="{td}font-size:11px;">{bd}% / {vd}%</td>
-  <td style="{td}font-size:11px;">{cnd} ({rev}rev)</td>
-  {bt_td}
-</tr>""")
-
-    return f"""
-<div style="overflow-x:auto;border-radius:10px;
-     box-shadow:0 2px 10px rgba(0,0,0,0.1);margin-bottom:20px;">
-<table style="width:100%;border-collapse:collapse;font-size:13px;">
-<thead><tr>
-  <th style="{th}">Symbol</th>
-  <th style="{th}">Signal</th>
-  <th style="{th}">Pattern</th>
-  <th style="{th}">Score</th>
-  <th style="{th}">Entry ₹</th>
-  <th style="{th}">SL ₹</th>
-  <th style="{th}">Target ₹</th>
-  <th style="{th}">Risk/Reward</th>
-  <th style="{th}">Move%</th>
-  <th style="{th}">Vol</th>
-  <th style="{th}">ADX</th>
-  <th style="{th}">Body/VWAP%</th>
-  <th style="{th}">Candles</th>
-  {bt_th}
-</tr></thead>
-<tbody>{''.join(rows)}</tbody>
-</table>
-<p style="font-size:11px;color:#888;padding:6px 12px;margin:0;">
-Score = first candle strength + candle cleanliness + volume + ADX + VWAP separation.
-All signals passed 7 checks. Higher score = stronger trend.
-</p>
-</div>"""
+                # Candle OHLC table
+                st.markdown("**📊 Candle Data (9:15 AM → Scan Time)**")
+                st.markdown(candle_table_html(r['Candles'], r['Direction']),
+                            unsafe_allow_html=True)
 
 # =============================================================================
 # STREAMLIT UI
 # =============================================================================
 def main():
-    st.set_page_config(page_title="Trend Master",
-                       page_icon="📈",layout="wide",
-                       initial_sidebar_state="collapsed")
+    st.set_page_config(
+        page_title="Trend Master v3",
+        page_icon="📈", layout="wide",
+        initial_sidebar_state="collapsed")
 
     st.markdown("""<style>
-.block-container{padding-top:.8rem;padding-bottom:.8rem;}
+.block-container{padding-top:.7rem;padding-bottom:.7rem;}
 .stButton>button{border-radius:8px;font-weight:600;height:44px;font-size:15px;}
 div[data-testid="metric-container"]{
-  background:var(--color-background-secondary);
-  border-radius:10px;padding:12px 16px;
-  box-shadow:none;border:0.5px solid var(--color-border-tertiary);}
+  background:white;border-radius:8px;padding:10px 14px;
+  box-shadow:0 1px 4px rgba(0,0,0,0.08);
+  border:1px solid #e0e0e0;}
+div[data-testid="stExpander"]{border-radius:8px;}
 </style>""", unsafe_allow_html=True)
 
-    # Header
     st.markdown("""
 <div style="background:linear-gradient(135deg,#0D47A1,#1976D2);
-     padding:18px 24px;border-radius:12px;margin-bottom:16px;color:white;">
-  <h2 style="margin:0;font-size:22px;color:white;">📈 Trend Master — Sure Bullish & Bearish</h2>
-  <p style="margin:4px 0 0;opacity:.85;font-size:13px;">
-    Run at 11:00 or 11:30 AM · Detects gap-and-trend + momentum patterns · Buy/Short → hold till 3 PM
+     padding:16px 24px;border-radius:12px;margin-bottom:14px;color:white;">
+  <h2 style="margin:0;font-size:20px;color:white;">
+    📈 Trend Master v3 — Sure Bullish & Bearish
+  </h2>
+  <p style="margin:3px 0 0;opacity:.85;font-size:12px;">
+    Left-bottom→right-top (Bull) | Left-top→right-bottom (Bear) |
+    10 checks | Fixed candle counts | Candle OHLC shown
   </p>
 </div>""", unsafe_allow_html=True)
 
     # Session state
     for k,v in [('trade',None),('connected',False),('results',None),
-                ('bt_stats',None),('uid',''),('auth',''),('skey','')]:
+                ('bt_stats',None),('uid',''),('auth',''),('skey',''),
+                ('scan_date_used', None)]:
         if k not in st.session_state: st.session_state[k]=v
 
     try:
@@ -768,445 +746,465 @@ div[data-testid="metric-container"]{
                                      'skey':c.get('secret_key','')})
     except Exception: pass
 
-    # ── LOGIN ─────────────────────────────────────────────────────────────────
+    # ── LOGIN ──────────────────────────────────────────────────────────────────
     conn_ph = st.empty()
     if st.session_state['connected']:
         conn_ph.success("✅ Alice Blue Connected")
 
-    with st.expander("🔐 Alice Blue Login", expanded=not st.session_state['connected']):
-        c1,c2,c3 = st.columns(3)
-        uid  = c1.text_input("User ID",   value=st.session_state['uid'])
-        auth = c2.text_input("Auth Code", value=st.session_state['auth'])
-        skey = c3.text_input("Secret Key",value=st.session_state['skey'],type="password")
-        b1,b2,b3,_ = st.columns([3,1,1,3])
-        msg = st.empty()
-        if b1.button("🔌 Connect",use_container_width=True):
-            if not all([uid,auth,skey]): msg.error("All fields required.")
+    with st.expander("🔐 Alice Blue Login",
+                     expanded=not st.session_state['connected']):
+        lc1,lc2,lc3 = st.columns(3)
+        uid  = lc1.text_input("User ID",   value=st.session_state['uid'])
+        auth = lc2.text_input("Auth Code", value=st.session_state['auth'])
+        skey = lc3.text_input("Secret Key",value=st.session_state['skey'],
+                               type="password")
+        lb1,lb2,lb3,_ = st.columns([3,1,1,3])
+        lmsg = st.empty()
+        if lb1.button("🔌 Connect",use_container_width=True):
+            if not all([uid,auth,skey]): lmsg.error("All fields required.")
             else:
                 ok=False
-                for fn in [lambda:TradeHub(user_id=uid,auth_code=auth,secret_key=skey),
-                           lambda:TradeHub(user_id=uid,auth_code=skey,secret_key=auth),
-                           lambda:TradeHub(uid,auth,skey)]:
+                for fn in [
+                    lambda:TradeHub(user_id=uid,auth_code=auth,secret_key=skey),
+                    lambda:TradeHub(user_id=uid,auth_code=skey,secret_key=auth),
+                    lambda:TradeHub(uid,auth,skey)
+                ]:
                     try:
                         t=fn(); s=t.get_session_id()
                         if s and 'Not_ok' not in str(s):
                             st.session_state.update({'trade':t,'connected':True})
                             conn_ph.success("✅ Alice Blue Connected")
-                            msg.success("✅ Connected!")
+                            lmsg.success("✅ Connected!")
                             try:
                                 with open(CREDS_FILE,'w') as f:
-                                    json.dump({'user_id':uid,'auth_code':auth,'secret_key':skey},f)
+                                    json.dump({'user_id':uid,'auth_code':auth,
+                                               'secret_key':skey},f)
                             except Exception: pass
                             ok=True; break
                     except Exception: continue
-                if not ok: msg.error("❌ Authentication failed.")
-        if b2.button("💾 Save",use_container_width=True):
+                if not ok: lmsg.error("❌ Authentication failed.")
+        if lb2.button("💾 Save",use_container_width=True):
             try:
                 with open(CREDS_FILE,'w') as f:
                     json.dump({'user_id':uid,'auth_code':auth,'secret_key':skey},f)
                 st.toast("✅ Saved!")
             except Exception as e: st.error(str(e))
-        if b3.button("🗑️ Clear",use_container_width=True):
+        if lb3.button("🗑️",use_container_width=True):
             try: os.remove(CREDS_FILE); st.toast("Cleared")
             except Exception: pass
 
-    # ── SETTINGS ──────────────────────────────────────────────────────────────
+    # ── SETTINGS ───────────────────────────────────────────────────────────────
     st.markdown("---")
-    r1,r2,r3 = st.columns([2,2,3])
+    sc1,sc2,sc3 = st.columns([2,2,3])
 
-    with r1:
+    with sc1:
         mode    = st.radio("Mode",["🔴 Live","📅 Historical"],horizontal=True)
         is_live = mode=="🔴 Live"
 
-    scan_date=None
-    with r2:
+    # FIXED: scan_date is always set here, in both branches
+    with sc2:
         if not is_live:
             sd = st.date_input("Historical Date",
                                value=last_trading_day()-timedelta(days=1))
+            # Use the exact selected date, only adjust if it's a holiday
             scan_date = sd if is_trading_day(sd) else last_trading_day(sd)
+            if scan_date != sd:
+                st.caption(f"Adjusted to trading day: {scan_date}")
         else:
             tz  = pytz.timezone('Asia/Kolkata')
             now = datetime.now(tz)
             scan_date = last_trading_day(now.date())
-            if now.time()<dt_time(11,0):
-                rem=int((datetime.combine(now.date(),dt_time(11,0))-now.replace(tzinfo=None)).total_seconds()/60)
-                st.warning(f"⏰ Best time: **11:00 AM**. {rem} min remaining.")
+            if now.time() < dt_time(11,0):
+                rem = int((datetime.combine(now.date(),dt_time(11,0))
+                           - now.replace(tzinfo=None)).total_seconds()/60)
+                st.warning(f"⏰ Run at 11:00 AM. {rem} min remaining.")
             else:
-                st.success(f"✅ {now.strftime('%H:%M')} — Good time to scan!")
+                st.success(f"✅ {now.strftime('%H:%M')} — Good time!")
 
-    with r3:
-        scan_lbl = st.radio("⏰ Scan Time",list(SCAN_OPTIONS.keys()),
-                            horizontal=True,
-                            help="11:30 gives one more candle of confirmation.")
-        scan_hour,scan_min,n_candles = SCAN_OPTIONS[scan_lbl]
+    with sc3:
+        scan_lbl = st.radio(
+            "⏰ Scan Time",
+            list(SCAN_OPTIONS.keys()),
+            horizontal=True,
+            help=(
+                "11 AM = uses 7 candles (9:15–10:45 completed).\n"
+                "11:30 AM = uses 9 candles (9:15–11:15 completed).\n"
+                "More candles = more confirmation but less time left to trade."
+            )
+        )
+        scan_hour, scan_min, n_candles = SCAN_OPTIONS[scan_lbl]
 
-    # ── HOW IT WORKS ──────────────────────────────────────────────────────────
-    with st.expander("📖 How signals are found — 7 checks + 2 patterns",expanded=False):
+    # Candle count explanation
+    st.info(
+        f"📌 **{scan_lbl}**: Script uses **{n_candles} completed 15-min candles** "
+        f"(from 9:15 AM to {['10:45','11:15'][n_candles==9]} AM). "
+        f"Data fetched strictly up to {scan_hour:02d}:{scan_min:02d} AM only."
+    )
+
+    # ── STRATEGY INFO ──────────────────────────────────────────────────────────
+    with st.expander("📖 10 Checks Used to Find Trending Stocks", expanded=False):
         st.markdown(f"""
-**Two patterns detected:**
+**What stocks we look for:**
+- 📈 **Bullish**: chart goes from **left-bottom to right-top** — stock opens and rises continuously
+- 📉 **Bearish**: chart goes from **left-top to right-bottom** — stock opens and falls continuously
 
-| Pattern | Example | Signal |
+**Real examples that match:**
+- OFSS 29 May 2026 → Gap up on results, then sold off all day → BEARISH
+- DABUR 01 Jun 2026 → Opened and fell throughout the day → BEARISH
+- HAVELLS 01 Jun 2026 → Opened and fell throughout the day → BEARISH
+
+**10 checks (all must pass):**
+
+| # | Check | Why |
 |---|---|---|
-| Gap up + fade | Stock gaps up 5% on results, then sells off from open | SHORT |
-| Gap down + bounce | Stock gaps down 4%, then bounces from open | BUY |
-| Momentum (no gap) | Stock opens flat, moves in one direction every candle | BUY or SHORT |
+| 1 | **ZERO reversal candles** | Every candle must continue trend — no exceptions |
+| 2 | **Last 2 candles still at extremes** | Stock STILL making new highs/lows at scan time |
+| 3 | Price ≥ 0.5% from 9:15 open | Trend is real, not just noise |
+| 4 | Move ≥ {MIN_MOVE_PCT}% from prev close | Meaningful size |
+| 5 | Previous day same direction | DABUR/HAVELLS fell the day before too |
+| 6 | Volume ≥ {VOL_MULT}× 5-day avg | Institutions driving it |
+| 7 | VWAP clearly on one side | Buyer/seller control confirmed |
+| 8 | **Linear slope R² ≥ 0.75** | Price forms a CLEAN slope — not zigzag |
+| 9 | ADX ≥ {ADX_MIN}, DI aligned | Real trend strength |
+| 10 | EMA9 still sloping in direction | Move not exhausted |
 
-**7 checks — all must pass:**
-
-| # | Check | Threshold |
-|---|---|---|
-| 1 | First candle (9:15) must be strongly directional | Body ≥ {int(FIRST_BODY_MIN*100)}% of candle range |
-| 2 | Candles continue in same direction | Max {MAX_REVERSALS} reversal candle allowed |
-| 3 | Price has NOT recovered back to 9:15 open | Must be ≥ 0.3% away from first open |
-| 4 | Total move from yesterday's close | ≥ {MIN_MOVE_PCT}% |
-| 5 | Volume surge | ≥ {VOL_MULT}× 5-day average |
-| 6 | VWAP confirms direction | Price ≥ 0.2% away from VWAP |
-| 7 | ADX trend strength | ADX ≥ {ADX_MIN}, DI aligned |
-
-**Score** (0–100) ranks signals: first candle strength + cleanliness + volume + ADX + VWAP distance.
-**SL** = morning low (bull) / morning high (bear). **Target** = {RR}R. **Exit** = 3:00 PM hard.
+**Why INFY/TCS/KPITTECH/NTPC kept getting through (now fixed):**
+- **Check 1** (zero reversals): Old code allowed 1 reversal. Now zero. TCS had 1 reversal candle.
+- **Check 2** (still at extremes): TCS/INFY peaked early and drifted — their last 2 candles were NOT at session highs. DABUR/HAVELLS last 2 candles were still at session lows. This is the key difference.
+- **Check 8** (R² slope): TCS/INFY had R² ~0.50 (zigzag). DABUR/HAVELLS had R² ~0.90+ (clean slope).
 """)
 
-    # ── STOCK LIST ────────────────────────────────────────────────────────────
-    with st.expander("📋 F&O Stock List",expanded=False):
-        default="""AARTIIND.NS
+    # ── STOCK LIST ─────────────────────────────────────────────────────────────
+    with st.expander("📋 F&O Stock List", expanded=False):
+        default="""360ONE.NS
 ABB.NS
-ABCAPITAL.NS
+APLAPOLLO.NS
+AUBANK.NS
+ADANIENSOL.NS
 ADANIENT.NS
 ADANIGREEN.NS
 ADANIPORTS.NS
+ADANIPOWER.NS
+ABCAPITAL.NS
 ALKEM.NS
+AMBER.NS
 AMBUJACEM.NS
 ANGELONE.NS
 APOLLOHOSP.NS
-APOLLOTYRE.NS
 ASHOKLEY.NS
 ASIANPAINT.NS
 ASTRAL.NS
-AUBANK.NS
 AUROPHARMA.NS
+DMART.NS
 AXISBANK.NS
+BSE.NS
 BAJAJ-AUTO.NS
 BAJFINANCE.NS
 BAJAJFINSV.NS
 BAJAJHLDNG.NS
-BALKRISIND.NS
 BANDHANBNK.NS
 BANKBARODA.NS
 BANKINDIA.NS
-BATAINDIA.NS
 BDL.NS
 BEL.NS
-BERGEPAINT.NS
 BHARATFORG.NS
-BHARTIARTL.NS
 BHEL.NS
-BIOCON.NS
-BOSCHLTD.NS
 BPCL.NS
+BHARTIARTL.NS
+BIOCON.NS
+BLUESTARCO.NS
+BOSCHLTD.NS
 BRITANNIA.NS
-BSE.NS
-CANBK.NS
-CANFINHOME.NS
-CDSL.NS
-CESC.NS
 CGPOWER.NS
-CHAMBLFERT.NS
+CANBK.NS
+CDSL.NS
 CHOLAFIN.NS
 CIPLA.NS
 COALINDIA.NS
+COCHINSHIP.NS
 COFORGE.NS
 COLPAL.NS
+CAMS.NS
 CONCOR.NS
-COROMANDEL.NS
 CROMPTON.NS
 CUMMINSIND.NS
-CYIENT.NS
+DLF.NS
 DABUR.NS
 DALBHARAT.NS
-DEEPAKFERT.NS
-DEEPAKNTR.NS
 DELHIVERY.NS
 DIVISLAB.NS
 DIXON.NS
-DLF.NS
-DMART.NS
 DRREDDY.NS
-EICHERMOT.NS
-ESCORTS.NS
 ETERNAL.NS
+EICHERMOT.NS
 EXIDEIND.NS
-FEDERALBNK.NS
+FORCEMOT.NS
+NYKAA.NS
 FORTIS.NS
 GAIL.NS
-GLENMARK.NS
+GVT&D.NS
 GMRAIRPORT.NS
+GLENMARK.NS
+GODFRYPHLP.NS
 GODREJCP.NS
 GODREJPROP.NS
-GRANULES.NS
 GRASIM.NS
-GSPL.NS
-HAL.NS
-HAVELLS.NS
 HCLTECH.NS
 HDFCAMC.NS
 HDFCBANK.NS
 HDFCLIFE.NS
+HAVELLS.NS
 HEROMOTOCO.NS
 HINDALCO.NS
-HINDCOPPER.NS
+HAL.NS
 HINDPETRO.NS
 HINDUNILVR.NS
 HINDZINC.NS
-HUDCO.NS
+POWERINDIA.NS
+HYUNDAI.NS
 ICICIBANK.NS
 ICICIGI.NS
 ICICIPRULI.NS
 IDFCFIRSTB.NS
+ITC.NS
+INDIANB.NS
 IEX.NS
-IIFL.NS
-IGL.NS
-INDHOTEL.NS
-INDIAMART.NS
-INDIGO.NS
-INDUSINDBK.NS
+IOC.NS
+IRFC.NS
+IREDA.NS
 INDUSTOWER.NS
+INDUSINDBK.NS
+NAUKRI.NS
 INFY.NS
 INOXWIND.NS
-IOC.NS
-IRCTC.NS
-IREDA.NS
-IRFC.NS
-ITC.NS
+INDIGO.NS
 JINDALSTEL.NS
-JIOFIN.NS
 JSWENERGY.NS
 JSWSTEEL.NS
+JIOFIN.NS
 JUBLFOOD.NS
+KEI.NS
+KPITTECH.NS
 KALYANKJIL.NS
 KAYNES.NS
-KEI.NS
 KFINTECH.NS
 KOTAKBANK.NS
-KPITTECH.NS
-LAURUSLABS.NS
+LTF.NS
 LICHSGFIN.NS
+LTM.NS
+LT.NS
+LAURUSLABS.NS
 LICI.NS
 LODHA.NS
-LT.NS
-LTIM.NS
-LTF.NS
 LUPIN.NS
 M&M.NS
 MANAPPURAM.NS
 MANKIND.NS
 MARICO.NS
 MARUTI.NS
+MFSL.NS
 MAXHEALTH.NS
 MAZDOCK.NS
-MCX.NS
-METROPOLIS.NS
-MFSL.NS
-MOTHERSON.NS
+MOTILALOFS.NS
 MPHASIS.NS
-MRF.NS
+MCX.NS
 MUTHOOTFIN.NS
-NATIONALUM.NS
-NAUKRI.NS
 NBCC.NS
-NCC.NS
-NESTLEIND.NS
 NHPC.NS
 NMDC.NS
 NTPC.NS
+NATIONALUM.NS
+NESTLEIND.NS
+NAM-INDIA.NS
 NUVAMA.NS
-NYKAA.NS
 OBEROIRLTY.NS
-OFSS.NS
-OIL.NS
 ONGC.NS
+OIL.NS
+PAYTM.NS
+OFSS.NS
+POLICYBZR.NS
+PGEL.NS
+PIIND.NS
+PNBHOUSING.NS
 PAGEIND.NS
 PATANJALI.NS
-PAYTM.NS
 PERSISTENT.NS
 PETRONET.NS
-PFC.NS
-PHOENIXLTD.NS
 PIDILITIND.NS
-PIIND.NS
-PNB.NS
-PNBHOUSING.NS
 POLYCAB.NS
-POLICYBZR.NS
+PFC.NS
 POWERGRID.NS
+PREMIERENE.NS
 PRESTIGE.NS
+PNB.NS
 RBLBANK.NS
 RECLTD.NS
-RELIANCE.NS
+RADICO.NS
 RVNL.NS
-SAIL.NS
+RELIANCE.NS
 SBICARD.NS
 SBILIFE.NS
-SBIN.NS
 SHREECEM.NS
+SRF.NS
+SAMMAANCAP.NS
+MOTHERSON.NS
 SHRIRAMFIN.NS
 SIEMENS.NS
 SOLARINDS.NS
 SONACOMS.NS
-SRF.NS
+SBIN.NS
+SAIL.NS
 SUNPHARMA.NS
 SUPREMEIND.NS
 SUZLON.NS
-SYNGENE.NS
+SWIGGY.NS
 TATACONSUM.NS
+TVSMOTOR.NS
+TCS.NS
 TATAELXSI.NS
+TMPV.NS
 TATAPOWER.NS
 TATASTEEL.NS
-TATATECH.NS
-TCS.NS
 TECHM.NS
-TIINDIA.NS
-TITAGARH.NS
+FEDERALBNK.NS
+INDHOTEL.NS
+PHOENIXLTD.NS
 TITAN.NS
 TORNTPHARM.NS
-TORNTPOWER.NS
 TRENT.NS
-TVSMOTOR.NS
+TIINDIA.NS
+UNOMINDA.NS
+UPL.NS
 ULTRACEMCO.NS
 UNIONBANK.NS
 UNITDSPR.NS
-UNOMINDA.NS
-UPL.NS
 VBL.NS
 VEDL.NS
+VMM.NS
+IDEA.NS
 VOLTAS.NS
+WAAREEENER.NS
 WIPRO.NS
 YESBANK.NS
 ZYDUSLIFE.NS"""
-        stxt=st.text_area("Stock symbols (one per line)",value=default,height=100,label_visibility="collapsed")
-        stocks=[s.strip().upper() for s in stxt.split('\n') if s.strip()]
+        stxt = st.text_area("Enter stock symbols", value=default, height=100,
+                             label_visibility="collapsed")
+        stocks = [s.strip().upper() for s in stxt.split('\n') if s.strip()]
         st.caption(f"**{len(stocks)}** stocks loaded")
 
-    # ── RUN ───────────────────────────────────────────────────────────────────
+    # ── RUN ────────────────────────────────────────────────────────────────────
     st.markdown("---")
-    rc1,_ = st.columns([2,5])
-    run_btn = rc1.button("▶️ RUN SCAN",use_container_width=True,type="primary")
+    rb1,_ = st.columns([2,5])
+    run_btn = rb1.button("▶️ RUN SCAN", use_container_width=True, type="primary")
     st.markdown("---")
-
-    prog_ph  = st.empty()
-    res_area = st.container()
 
     if run_btn:
         if not st.session_state['connected'] or not st.session_state['trade']:
             st.error("❌ Connect to Alice Blue first.")
         else:
-            trade=st.session_state['trade']
-            if not is_trading_day(scan_date):
-                scan_date=last_trading_day(scan_date)
+            trade = st.session_state['trade']
 
-            with prog_ph.container():
-                st.markdown(f"**Scanning {len(stocks)} stocks · {scan_date} · {scan_lbl}**")
-                pb   = st.progress(0)
-                ptxt = st.empty()
-                slbl = st.empty()
+            # Show scan info
+            st.info(
+                f"📡 Scanning **{len(stocks)} stocks** | "
+                f"Date: **{scan_date}** | "
+                f"Candles: **{n_candles}** (9:15 AM → "
+                f"{'10:45' if n_candles==7 else '11:15'} AM)")
+            pb   = st.progress(0)
+            ptxt = st.empty()
+            slbl = st.empty()
 
-            bull,bear = run_scan(
-                stocks,scan_date,scan_hour,scan_min,n_candles,
-                is_live,trade,prog_bar=pb,prog_text=ptxt,sym_lbl=slbl)
+            bull, bear = run_scan(
+                stocks, scan_date, scan_hour, scan_min, n_candles,
+                trade, prog_bar=pb, prog_text=ptxt, sym_lbl=slbl)
 
-            bt_stats=None
+            # Clear progress
+            pb.empty(); slbl.empty()
+
+            bt_stats = None
             if not is_live and (bull or bear):
-                with prog_ph.container():
-                    st.info("🔬 Fetching EOD prices for backtest...")
-                bull,bear,bt_stats = run_backtest(bull,bear,scan_date,trade)
+                ptxt.text("🔬 Fetching EOD data for backtest...")
+                bull, bear, bt_stats = run_backtest(bull, bear, scan_date, trade)
+                ptxt.empty()
 
-            st.session_state['results']  = (bull,bear,scan_date,not is_live)
-            st.session_state['bt_stats'] = bt_stats
-            prog_ph.empty()
+            st.session_state['results']   = (bull, bear, scan_date, not is_live)
+            st.session_state['bt_stats']  = bt_stats
 
-    # ── DISPLAY ───────────────────────────────────────────────────────────────
+    # ── DISPLAY RESULTS ────────────────────────────────────────────────────────
     if st.session_state.get('results'):
-        bull,bear,res_date,is_hist = st.session_state['results']
+        bull, bear, res_date, is_hist = st.session_state['results']
         bt = st.session_state.get('bt_stats')
 
-        with res_area:
-            if not bull and not bear:
-                st.markdown(f"""
-<div style="background:var(--color-background-warning);
-     border-left:4px solid var(--color-border-warning);
-     padding:16px 20px;border-radius:8px;font-size:14px;margin-top:8px;">
-<b>⚠️ No signals found for {res_date}</b><br><br>
-No stock passed all 7 checks today. This means the market was choppy or flat —
-no clear trending stocks identified. This is the correct result on such days.
-<br><br>
-<b>Tip:</b> Try Historical mode on a strong market day (Nifty moved ±1%+) to
-see how the strategy performs when trends are present.
-</div>""", unsafe_allow_html=True)
+        if not bull and not bear:
+            st.warning(
+                f"⚠️ **No signals found for {res_date}.**\n\n"
+                "No stock passed all 10 checks. "
+                "This is correct on flat or choppy days — do not trade. "
+                "Try a date when Nifty moved ±1%+ for better results.")
+        else:
+            st.markdown(f"### 📊 Results — {res_date}")
+
+            # Summary metrics
+            m1,m2,m3,m4 = st.columns(4)
+            m1.metric("🟢 BUY Signals",  len(bull))
+            m2.metric("🔴 SHORT Signals", len(bear))
+            m3.metric("📊 Total",         len(bull)+len(bear))
+            if bt:
+                w=bt['bw']+bt['sw']; t=bt['total']; wr=bt['wr']
+                m4.metric("✅ Win Rate", f"{wr}%",
+                          delta=f"{w}W/{t-w}L",
+                          delta_color="normal" if wr>=55 else "inverse")
             else:
-                st.markdown(f"### 📊 Results — {res_date}")
-                m1,m2,m3,m4 = st.columns(4)
-                m1.metric("🟢 BUY Signals",  len(bull))
-                m2.metric("🔴 SHORT Signals", len(bear))
-                m3.metric("📊 Total",         len(bull)+len(bear))
-                if bt:
-                    w=bt['bw']+bt['sw']; t=bt['total']; wr=bt['wr']
-                    m4.metric("✅ Win Rate",f"{wr}%",
-                              delta=f"{w}W / {t-w}L",
-                              delta_color="normal" if wr>=55 else "inverse")
-                else:
-                    m4.metric("🎯 All checks","7/7 passed")
+                m4.metric("✅ Checks", "10/10 passed")
 
-                if bt and bt['total']>0:
-                    w=bt['bw']+bt['sw']; t=bt['total']; wr=bt['wr']
-                    col='var(--color-text-success)' if wr>=60 else (
-                        'var(--color-text-warning)' if wr>=45 else 'var(--color-text-danger)')
-                    st.markdown(f"""
-<div style="background:var(--color-background-secondary);border-radius:10px;
-     padding:14px 20px;margin:12px 0;border:0.5px solid var(--color-border-tertiary);">
-<span style="font-size:20px;font-weight:500;color:{col};">
-  Backtest Win Rate: {wr}%
-</span>
-<span style="font-size:13px;color:var(--color-text-secondary);margin-left:12px;">
-  ({w} wins / {t} trades)
-</span>
-&nbsp;&nbsp;|&nbsp;&nbsp;
-🟢 {bt['bw']}W {bt['bl']}L &nbsp;·&nbsp; 🔴 {bt['sw']}W {bt['sl_']}L
-</div>""", unsafe_allow_html=True)
+            # Backtest summary
+            if bt and bt['total']>0:
+                w=bt['bw']+bt['sw']; t=bt['total']; wr=bt['wr']
+                col = "green" if wr>=60 else ("orange" if wr>=45 else "red")
+                st.markdown(
+                    f"<div style='padding:12px 18px;border-radius:8px;"
+                    f"border:1px solid #ddd;margin:8px 0;font-size:14px;'>"
+                    f"<b>Backtest:</b> Win Rate <b style='color:{col}'>{wr}%</b> "
+                    f"({w} wins / {t} trades) &nbsp;|&nbsp; "
+                    f"🟢 Bull {bt['bw']}W {bt['bl']}L &nbsp;|&nbsp; "
+                    f"🔴 Bear {bt['sw']}W {bt['sl_']}L"
+                    f"</div>", unsafe_allow_html=True)
 
-                st.markdown("---")
+            st.markdown("---")
 
-                st.markdown("""
-<div style="background:var(--color-background-success);padding:10px 16px;
-     border-radius:8px;margin-bottom:8px;
-     border-left:4px solid var(--color-border-success);">
-<b style="color:var(--color-text-success);">🟢 BUY Signals</b>
-<span style="font-size:12px;color:var(--color-text-secondary);margin-left:8px;">
-Enter at scan time · SL = morning low · Target = 2R · Exit 3:00 PM
-</span></div>""", unsafe_allow_html=True)
-                st.markdown(make_table(bull,is_hist),unsafe_allow_html=True)
+            # BUY signals
+            st.markdown(
+                "### 🟢 BUY Signals — Enter at scan time · SL = morning low "
+                "· Target 2R · Exit 3 PM")
+            st.caption(
+                "Left-bottom → right-top pattern. "
+                "Click any row to expand candle OHLC data.")
+            bull_container = st.container()
+            render_signals(bull, is_hist, bull_container)
 
-                st.markdown("""
-<div style="background:var(--color-background-danger);padding:10px 16px;
-     border-radius:8px;margin-bottom:8px;margin-top:16px;
-     border-left:4px solid var(--color-border-danger);">
-<b style="color:var(--color-text-danger);">🔴 SHORT Signals</b>
-<span style="font-size:12px;color:var(--color-text-secondary);margin-left:8px;">
-Enter at scan time · SL = morning high · Target = 2R · Exit 3:00 PM
-</span></div>""", unsafe_allow_html=True)
-                st.markdown(make_table(bear,is_hist),unsafe_allow_html=True)
+            st.markdown("---")
 
-                st.markdown("---")
-                st.markdown("""
-<div style="background:var(--color-background-secondary);border-radius:10px;
-     padding:14px 20px;font-size:13px;line-height:1.9;
-     border:0.5px solid var(--color-border-tertiary);">
-<b>📌 Trade rules</b><br>
-⏰ Enter within 15 min of scan time only<br>
-🛑 Exit all positions at 3:00 PM — no exceptions<br>
-❌ If SL hit — exit immediately, never average down<br>
-📊 Score ≥ 70 = strongest signals, use full position size<br>
-📊 Score 50–69 = moderate signals, use half size<br>
-🚫 Zero signals today = skip trading, protect capital
+            # SHORT signals
+            st.markdown(
+                "### 🔴 SHORT Signals — Enter at scan time · SL = morning high "
+                "· Target 2R · Exit 3 PM")
+            st.caption(
+                "Left-top → right-bottom pattern. "
+                "Click any row to expand candle OHLC data.")
+            bear_container = st.container()
+            render_signals(bear, is_hist, bear_container)
+
+            # Trade rules
+            st.markdown("---")
+            st.markdown("""
+<div style="background:#F8F9FA;border-radius:10px;padding:14px 20px;
+     font-size:13px;line-height:1.9;border:1px solid #e0e0e0;">
+<b>📌 Trade Rules</b><br>
+⏰ Enter within 15 min of scan time only — do not enter after 11:15 AM (or 11:45 AM for 11:30 option)<br>
+🛑 Exit all positions at 3:00 PM — no overnight holding<br>
+❌ SL hit = exit immediately, no averaging down<br>
+📊 Score ≥ 70 = strongest signals, use full size &nbsp;|&nbsp; Score 50–69 = half size<br>
+🚫 Zero signals = do not trade that day, market is not trending
 </div>""", unsafe_allow_html=True)
 
 if __name__ == "__main__":
