@@ -84,12 +84,12 @@ SCAN_OPTIONS = {
     "11:30 AM (9 candles)":  (11, 30, 9),
 }
 
-MIN_MOVE_PCT = 0.8   # min % move from prev close (lowered to catch more stocks)
-VOL_MULT     = 1.3   # volume >= 1.3x average (lowered slightly)
-ADX_MIN      = 15    # ADX threshold (lowered slightly)
-VWAP_SEP     = 0.001 # 0.1% min separation from VWAP
-R2_MIN       = 0.70  # minimum linear regression R²
-BODY_MIN     = 0.40  # first candle body >= 40% of range
+MIN_MOVE_PCT = 0.5   # min % move — lowered to catch slow-grind stocks
+VOL_MULT     = 1.0   # volume >= 1.0x — remove as hard filter, use in score
+ADX_MIN      = 12    # ADX — lowered, used in score not hard filter
+VWAP_SEP     = 0.0005 # 0.05% — very small, mainly for scoring
+R2_MIN       = 0.60  # lowered — catch stocks with minor wiggles
+BODY_MIN     = 0.30  # lowered — catch smaller first-candle stocks
 
 os.environ["TZ"] = "Asia/Kolkata"
 try:
@@ -254,8 +254,9 @@ def scan_stock(sym, scan_date, scan_hour, scan_min, n_candles, trade, cache, loc
         prev2_close = float(prev2_df['Close'].iloc[-1]) if not prev2_df.empty else None
         prev3_close = float(prev3_df['Close'].iloc[-1]) if not prev3_df.empty else None
 
-        # Today's 15-min candles (already cut at scan time by fetch window)
-        snap15 = to_15min(df_today)
+        # Today's 15-min candles, clipped strictly to the selected scan time.
+        df_today = df_today[df_today.index.time <= dt_time(scan_hour, scan_min)]
+        snap15 = to_15min(df_today, end_time=dt_time(scan_hour, scan_min))
         if snap15 is None or len(snap15) < n_candles: return None
         snap = snap15.head(n_candles).copy()
 
@@ -299,14 +300,9 @@ def scan_stock(sym, scan_date, scan_hour, scan_min, n_candles, trade, cache, loc
             for i in range(1, len(C)):
                 if C[i] > C[i-1]: return None   # any bounce = rejected
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # PILLAR 1 — CHECK B: ALL CANDLES GREEN (bull) or ALL RED (bear)
-        # Not just closes — the actual candle colour must confirm
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if direction == 'BULL':
-            if not all(C[i] >= O[i] for i in range(len(C))): return None
-        else:
-            if not all(C[i] <= O[i] for i in range(len(C))): return None
+        # Candle colour count (used for scoring only, not hard filter)
+        green_count = sum(1 for i in range(len(C)) if C[i] >= O[i])
+        red_count   = len(C) - green_count
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # PILLAR 2 — STILL AT EXTREMES AT SCAN TIME
@@ -331,14 +327,12 @@ def scan_stock(sym, scan_date, scan_hour, scan_min, n_candles, trade, cache, loc
         if direction == 'BULL' and move_pct < MIN_MOVE_PCT:  return None
         if direction == 'BEAR' and move_pct > -MIN_MOVE_PCT: return None
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # ADDITIONAL FILTER 1 — PREVIOUS DAY SAME DIRECTION
-        # DABUR fell the day before 01 Jun → continuation
-        # TCS/INFY rose the day before → their move was against their trend
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Previous day direction — used for scoring, not hard filter
+        # PATANJALI/BOSCH may have flat day before trending day
+        prev_day_aligned = False
         if prev2_close is not None:
-            if direction == 'BULL' and prev_close <= prev2_close: return None
-            if direction == 'BEAR' and prev_close >= prev2_close: return None
+            if direction == 'BULL': prev_day_aligned = prev_close > prev2_close
+            if direction == 'BEAR': prev_day_aligned = prev_close < prev2_close
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # ADDITIONAL FILTER 2 — VOLUME >= 1.3x 5-day average
@@ -353,7 +347,8 @@ def scan_stock(sym, scan_date, scan_hour, scan_min, n_candles, trade, cache, loc
         today_vol = float(np.sum(V))
         avg_vol   = float(np.mean(prev_vols)) if prev_vols else today_vol
         vol_ratio = today_vol / avg_vol if avg_vol > 0 else 1.0
-        if vol_ratio < VOL_MULT: return None
+        # Volume is used in scoring only — not a hard reject
+        # PATANJALI/POLICYBZR have naturally lower volume
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # ADDITIONAL FILTER 3 — VWAP ON CORRECT SIDE
@@ -362,8 +357,7 @@ def scan_stock(sym, scan_date, scan_hour, scan_min, n_candles, trade, cache, loc
         vol  = snap['Volume'].replace(0, np.nan)
         vwap = float((tp*vol).sum()/vol.sum()) if vol.sum() > 0 else last_close
         vwap_dist = (last_close - vwap) / vwap
-        if direction == 'BULL' and vwap_dist < VWAP_SEP:  return None
-        if direction == 'BEAR' and vwap_dist > -VWAP_SEP: return None
+        # VWAP used in scoring only
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # ADDITIONAL FILTER 4 — LINEAR REGRESSION R² >= 0.70
@@ -388,34 +382,57 @@ def scan_stock(sym, scan_date, scan_hour, scan_min, n_candles, trade, cache, loc
         df_adx = to_15min(df_raw, end_time=dt_time(scan_hour, scan_min))
         adx, pdi, ndi = calc_adx(df_adx) if (
             df_adx is not None and len(df_adx) >= 20) else (None, None, None)
-        if adx is not None:
-            if adx < ADX_MIN: return None
-            if direction == 'BULL' and pdi is not None and pdi < ndi: return None
-            if direction == 'BEAR' and ndi is not None and ndi < pdi: return None
+        # ADX used in scoring only — not a hard reject
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # ALL FILTERS PASSED — COMPUTE SCORE FOR RANKING
+        # ALL HARD FILTERS PASSED — COMPUTE SCORE FOR RANKING
+        # Hard filters: zero reversals + still at extreme + min move + R²
+        # Everything else adds to score
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         score = 0
 
-        # Slope quality R² (30 pts) — cleaner slope = higher score
+        # S1: Slope quality R² (30 pts)
         score += int(30 * min(r2, 1.0))
 
-        # Volume strength (25 pts)
-        if   vol_ratio >= 5.0: score += 25
-        elif vol_ratio >= 4.0: score += 21
-        elif vol_ratio >= 3.0: score += 17
-        elif vol_ratio >= 2.0: score += 13
-        elif vol_ratio >= 1.3: score += 8
+        # S2: Candle colour consistency (15 pts)
+        # All green/red = 15, mostly green/red = 10, partial = 5
+        if direction == 'BULL':
+            if green_count == len(C):        score += 15
+            elif green_count >= len(C)-1:    score += 10
+            else:                            score += 5
+        else:
+            if red_count == len(C):          score += 15
+            elif red_count >= len(C)-1:      score += 10
+            else:                            score += 5
 
-        # ADX (20 pts)
+        # S3: Volume strength (20 pts)
+        if   vol_ratio >= 5.0: score += 20
+        elif vol_ratio >= 4.0: score += 17
+        elif vol_ratio >= 3.0: score += 14
+        elif vol_ratio >= 2.0: score += 11
+        elif vol_ratio >= 1.5: score += 8
+        elif vol_ratio >= 1.2: score += 5
+        elif vol_ratio >= 1.0: score += 3
+        else:                  score += 1
+
+        # S4: Previous day same direction (10 pts)
+        if prev_day_aligned: score += 10
+
+        # S5: ADX strength (15 pts)
         if adx is not None:
-            if   adx >= 40: score += 20
-            elif adx >= 30: score += 15
-            elif adx >= 20: score += 10
-            else:           score += 5
+            if   adx >= 35: score += 15
+            elif adx >= 25: score += 11
+            elif adx >= 18: score += 7
+            elif adx >= 12: score += 4
 
-        # Move size (15 pts)
+        # S6: VWAP separation (10 pts)
+        vd = abs(vwap_dist)*100
+        if   vd >= 1.5: score += 10
+        elif vd >= 1.0: score += 7
+        elif vd >= 0.5: score += 4
+        elif vd >= 0.1: score += 2
+
+        # Move size factor
         mv = abs(move_pct)
         if   mv >= 5.0: score += 15
         elif mv >= 3.0: score += 11
@@ -508,23 +525,33 @@ def run_scan(stocks, scan_date, scan_hour, scan_min, n_candles,
     cntlk=threading.Lock(); done=[0]; total=len(stocks); out=[]
 
     def process(sym):
-        r = scan_stock(sym,scan_date,scan_hour,scan_min,n_candles,trade,cache,lock)
-        with cntlk:
-            done[0]+=1; pct=int(done[0]/total*100)
-            try:
-                if prog_bar:  prog_bar.progress(pct)
-                if prog_text: prog_text.text(f"⏳ {pct}% — {done[0]}/{total} stocks scanned")
-                if sym_lbl:   sym_lbl.caption(f"Scanning: {sym}")
-            except Exception: pass
-        gc.collect(); return r
+        return scan_stock(sym, scan_date, scan_hour, scan_min, n_candles,
+                          trade, cache, lock)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futs={ex.submit(process,s):s for s in stocks}
         for f in as_completed(futs):
+            sym = futs[f]
             try:
-                r=f.result()
-                if r: out.append(r)
-            except Exception: pass
+                r = f.result()
+                if r:
+                    out.append(r)
+            except Exception:
+                r = None
+            finally:
+                with cntlk:
+                    done[0] += 1
+                    pct = int(done[0] / total * 100) if total else 100
+                    try:
+                        if prog_bar:
+                            prog_bar.progress(pct)
+                        if prog_text:
+                            prog_text.text(f"⏳ {pct}% — {done[0]}/{total} stocks scanned")
+                        if sym_lbl:
+                            sym_lbl.caption(f"Scanning: {sym}")
+                    except Exception:
+                        pass
+            gc.collect()
 
     if prog_bar:  prog_bar.progress(100)
     if prog_text: prog_text.text(f"✅ Done — {len(out)} signals from {total} stocks")
@@ -976,7 +1003,8 @@ VOLTAS.NS
 WIPRO.NS
 YESBANK.NS
 ZYDUSLIFE.NS"""
-        stxt=st.text_area("",value=default,height=100,label_visibility="collapsed")
+        stxt=st.text_area("Stock symbols", value=default, height=100,
+                          label_visibility="collapsed")
         stocks=[s.strip().upper() for s in stxt.split('\n') if s.strip()]
         st.caption(f"**{len(stocks)}** stocks loaded")
 
