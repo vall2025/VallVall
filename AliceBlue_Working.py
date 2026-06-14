@@ -1,60 +1,58 @@
 # =============================================================================
-# TREND MASTER v5 — Alice Blue | NSE F&O
+# EOD TREND SCANNER v5 — Alice Blue | NSE F&O Stocks
 # =============================================================================
-# RESEARCH-BACKED STRATEGY
-# Based on analysis of OFSS (29May bearish), DABUR & HAVELLS (01Jun bearish)
 #
-# KEY INSIGHT FROM RESEARCH:
-# These stocks share ONE common pattern at 11 AM:
+#  WHY v5 EXISTS
+#  ─────────────────────────────────────────────────────────────────────────
+#  v4 removed ALL filters → every single stock that was even +0.05% up
+#  appeared in the BUY list, and every stock -0.05% down appeared in SHORT.
+#  That's 100+ stocks in each list — useless for picking real trades.
 #
-#   OFSS 29 May:
-#   - Hit 52-week high at open (buy-the-rumour sell-the-news)
-#   - Opened at ₹10,345, hit high ₹10,584 in first candle, then fell ALL day
-#   - At 11 AM: every candle since 9:15 was RED and making lower lows
-#   - The stock was BELOW its 9:15 open price by 11 AM
+#  Your requirement is "specific TRENDING stocks" — stocks that have moved
+#  in a clean, consistent direction since 9:15 AM (like your sample stocks:
+#  SOLARINDS, YESBANK, HYUNDAI, M&M etc. on their respective days), not
+#  stocks that are just randomly flickering up or down by a few paise.
 #
-#   DABUR & HAVELLS 01 Jun:
-#   - Already in multi-day downtrend (falling for 2+ days before)
-#   - Opened gap down or flat, then continued falling
-#   - At 11 AM: every candle since 9:15 was RED and making lower lows
-#   - Volume was elevated (institutional selling continuing)
+#  WHAT v5 DOES DIFFERENTLY
+#  ─────────────────────────────────────────────────────────────────────────
+#  Two BUILT-IN checks (fixed in the code, NOT sliders, NOT user-adjustable)
+#  decide whether a stock is "trending":
 #
-# WHAT TCS/INFY/KPITTECH/NTPC had that was DIFFERENT at 11 AM:
-#   - They had 1 reversal candle (closed above previous close at some point)
-#   - They were NOT consistently making new lows — they were sideways/choppy
-#   - Their VWAP was being tested (price near VWAP) — contested direction
+#    1. TREND CONSISTENCY (R² ≥ 0.55)
+#       Fit a straight line to the 5-min closes from 9:15 AM to cutoff.
+#       R² close to 1.0 = price moved in a clean line (trending).
+#       R² close to 0   = price moved randomly up/down (choppy/flat).
+#       A truly flat or noisy stock will have R² well below 0.55.
+#       A stock that opened low and climbed steadily to 11 AM (or opened
+#       high and fell steadily) will have R² well above 0.55.
 #
-# CORRECT LOGIC — 3 PILLARS:
+#    2. MEANINGFUL MOVE (≥ 0.3%)
+#       Total Move % must be at least 0.3% in magnitude. This removes
+#       stocks that are technically "positive" or "negative" by 0.02%
+#       (pure noise) but still pass the R² check by coincidence on very
+#       few candles.
 #
-# PILLAR 1: CLEAN CANDLE SLOPE (most critical)
-#   Every 15-min candle from 9:15 to scan time must:
-#   - Close in the trend direction vs previous candle
-#   - NOT have a recovery/reversal
-#   Zero reversal candles = the stock is in a clean trend
-#   Even 1 reversal = rejected (this eliminates TCS/INFY/NTPC)
+#  A stock must pass BOTH checks to appear in the BUY / SHORT lists.
+#  These numbers are fixed constants at the top of the file — change them
+#  there if you want to loosen/tighten, but there is nothing to configure
+#  in the UI.
 #
-# PILLAR 2: STILL AT EXTREMES AT SCAN TIME
-#   At 11 AM, the stock must STILL be making:
-#   - New session highs (bull) OR new session lows (bear)
-#   If the stock peaked at 9:30 and is now sideways = rejected
-#   If the stock is still making new lows at 11 AM = it will continue to EOD
+#  Every stock — trending or not — is still visible in the
+#  "📋 All Scanned Stocks" expander at the bottom, sorted by Total Move %,
+#  along with full diagnostics (why any stock failed to fetch).
 #
-# PILLAR 3: VOLUME CONFIRMATION
-#   Volume in the morning must be above the stock's normal morning volume
-#   Institutional selling/buying sustains all day = elevated volume
+#  ENTRY / SL / TARGET (your Fibonacci candle strategy — unchanged)
+#    Reference candle = 10:45–10:59 AM
+#    BUY  : Entry = high of that candle | SL = low  | Target = Entry + 2×Risk
+#    SHORT: Entry = low  of that candle | SL = high | Target = Entry − 2×Risk
 #
-# ADDITIONAL FILTERS:
-#   - Previous day must be in same direction (multi-day trend)
-#   - Linear regression R² >= 0.80 (clean slope, not zigzag)
-#   - VWAP clearly on seller/buyer side (not contested)
-#   - ADX >= 20 (confirmed trend strength)
 # =============================================================================
 
-import os, gc, json, threading, time, warnings, logging
+import os
 os.environ['STREAMLIT_SERVER_FILEWATCHERTYPE'] = 'none'
-os.environ['PYTHONWARNINGS'] = 'ignore'
+
+import warnings
 warnings.filterwarnings('ignore')
-logging.getLogger('streamlit').setLevel(logging.ERROR)
 
 import streamlit as st
 try:
@@ -63,33 +61,27 @@ except Exception:
     pass
 
 from TradeMaster.TradeSync import TradeHub, Exchange
-import pytz, pandas as pd, numpy as np
+import pytz
+import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta, time as dt_time
+import time
+import json
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
 
 # =============================================================================
-# CONFIG
+# CONSTANTS — fixed, not exposed in UI
 # =============================================================================
 CREDS_FILE   = os.path.join(os.path.expanduser('~'), 'alice_creds.json')
-TOP_N        = 10
-RR           = 2.0
-MAX_WORKERS  = 8
+RR_RATIO     = 2.0
+MAX_WORKERS  = 20
 DEBUG        = False
 
-# Corrected candle counts:
-# 9:15–10:45 = 7 candles completed before 11:00 AM
-# 9:15–11:15 = 9 candles completed before 11:30 AM
-SCAN_OPTIONS = {
-    "11:00 AM (7 candles)":  (11,  0, 7),
-    "11:30 AM (9 candles)":  (11, 30, 9),
-}
-
-MIN_MOVE_PCT = 0.5   # min % move — lowered to catch slow-grind stocks
-VOL_MULT     = 1.0   # volume >= 1.0x — remove as hard filter, use in score
-ADX_MIN      = 12    # ADX — lowered, used in score not hard filter
-VWAP_SEP     = 0.0005 # 0.05% — very small, mainly for scoring
-R2_MIN       = 0.60  # lowered — catch stocks with minor wiggles
-BODY_MIN     = 0.30  # lowered — catch smaller first-candle stocks
+# ── TREND QUALIFICATION (the only "filter" in this script) ─────────────────
+TREND_MIN_R2       = 0.55   # consistency of the move (0=random, 1=straight line)
+TREND_MIN_MOVE_PCT = 0.3    # minimum % move to be considered a real trend
 
 os.environ["TZ"] = "Asia/Kolkata"
 try:
@@ -100,993 +92,979 @@ except AttributeError:
 # =============================================================================
 # MARKET CALENDAR
 # =============================================================================
-HOLIDAYS = {
-    (1,26),(2,26),(3,15),(4,10),(5,24),(5,26),
-    (8,15),(8,27),(9,30),(10,2),(10,12),(10,24),(10,25),
-    (11,1),(11,11),(12,25)
+_HOLIDAYS = {
+    (2025,2,26),(2025,3,14),(2025,3,31),(2025,4,10),(2025,4,14),
+    (2025,4,18),(2025,5,1),(2025,8,15),(2025,8,27),(2025,10,2),
+    (2025,10,24),(2025,10,28),(2025,11,5),(2025,12,25),
+    (2026,1,26),(2026,2,26),(2026,3,20),(2026,4,2),(2026,4,3),
+    (2026,4,14),(2026,5,1),(2026,8,15),(2026,8,27),(2026,9,16),
+    (2026,10,2),(2026,10,20),(2026,10,21),(2026,11,5),(2026,12,25),
 }
+
 def is_trading_day(d):
-    return d.weekday() < 5 and (d.month, d.day) not in HOLIDAYS
+    return d.weekday() < 5 and (d.year, d.month, d.day) not in _HOLIDAYS
 
 def last_trading_day(d=None):
     tz = pytz.timezone('Asia/Kolkata')
-    if d is None: d = datetime.now(tz).date()
+    if d is None:
+        d = datetime.now(tz).date()
     c = d
-    for _ in range(15):
-        if is_trading_day(c): return c
+    for _ in range(20):
+        if is_trading_day(c):
+            return c
         c -= timedelta(days=1)
     return d
 
-# =============================================================================
-# INSTRUMENT CACHE
-# =============================================================================
-def get_inst(sym, trade, cache, lock):
-    with lock:
-        if sym in cache: return cache[sym]
-    clean = sym.replace('.NS','') if sym.upper().endswith('.NS') else sym
-    try:
-        inst = trade.get_instrument(exchange=Exchange.NSE, symbol=clean)
-        if inst:
-            with lock: cache[sym] = inst
-        return inst
-    except Exception: return None
+def prev_trading_days(d, n):
+    result, c = [], d - timedelta(days=1)
+    while len(result) < n:
+        if is_trading_day(c):
+            result.append(c)
+        c -= timedelta(days=1)
+    return result
 
 # =============================================================================
-# FETCH 1-MIN DATA
+# DATA FETCH  (proven method — DO NOT MODIFY)
 # =============================================================================
-def fetch_raw(sym, from_dt, to_dt, trade, cache, lock):
+def fetch_1min(sym, from_dt, to_dt, trade, cache, lock, retry=False):
+    """Returns (df, error_reason). df is None on failure."""
     try:
-        inst = get_inst(sym, trade, cache, lock)
-        if inst is None: return None
-        result = trade.get_HistoricalData(
-            instrument=inst, resolution="1",
-            from_datetime=from_dt, to_datetime=to_dt, indices=False)
+        sym_clean = sym.replace('.NS','').replace('.BSE','').strip()
+
+        inst = None
+        with lock:
+            if sym in cache:
+                inst = cache[sym]
+
+        if inst is None:
+            try:
+                inst = trade.get_instrument(exchange=Exchange.NSE, symbol=sym_clean)
+                if inst:
+                    with lock:
+                        cache[sym] = inst
+            except Exception as e:
+                return None, f"instrument lookup error: {e}"
+
+        if inst is None:
+            return None, "instrument not found on Alice Blue"
+
+        result = None
+        try:
+            result = trade.get_HistoricalData(
+                instrument=inst,
+                resolution="1",
+                from_datetime=from_dt,
+                to_datetime=to_dt,
+                indices=False
+            )
+        except Exception as e:
+            return None, f"API call error: {e}"
+
         df = None
         if isinstance(result, list) and result:
             df = pd.DataFrame(result)
-        elif isinstance(result, dict):
-            if result.get('stat') == 'Ok' and 'data' in result:
-                df = pd.DataFrame(result['data'])
-            else: return None
-        elif isinstance(result, pd.DataFrame): df = result.copy()
+        elif isinstance(result, list) and not result:
+            return None, "API returned empty list (no candles)"
+        elif isinstance(result, dict) and result.get('stat') == 'Ok':
+            df = pd.DataFrame(result.get('data', []))
+        elif isinstance(result, pd.DataFrame):
+            df = result.copy()
         else:
-            try: df = pd.DataFrame(result)
-            except Exception: return None
-        if df is None or df.empty: return None
-        df = df.copy()
-        if 'datetime' in list(df.columns):
+            try:
+                df = pd.DataFrame(result)
+            except Exception:
+                return None, f"unrecognised API response type: {type(result).__name__}"
+
+        if df is None or df.empty:
+            return None, "empty dataframe from API"
+
+        col_map = {}
+        for col in df.columns:
+            cl = col.lower().strip()
+            if cl == 'datetime':                    col_map[col] = 'datetime'
+            elif cl in ('open','o'):                col_map[col] = 'Open'
+            elif cl in ('high','h'):                col_map[col] = 'High'
+            elif cl in ('low','l'):                 col_map[col] = 'Low'
+            elif cl in ('close','c'):               col_map[col] = 'Close'
+            elif cl in ('volume','vol','v'):        col_map[col] = 'Volume'
+        df = df.rename(columns=col_map)
+
+        required = ['Open','High','Low','Close','Volume']
+        if not all(r in df.columns for r in required):
+            return None, f"missing columns, got: {list(df.columns)}"
+
+        if 'datetime' in df.columns:
             df['datetime'] = pd.to_datetime(df['datetime'])
-            df.set_index('datetime', inplace=True)
-        cl = {c.lower(): c for c in df.columns}
-        rn = {cl[r.lower()]: r for r in ['Open','High','Low','Close','Volume']
-              if r.lower() in cl and cl[r.lower()] != r}
-        if rn: df = df.rename(columns=rn)
-        for r in ['Open','High','Low','Close','Volume']:
-            if r not in df.columns: return None
+            df = df.set_index('datetime')
+
+        tz_str = 'Asia/Kolkata'
         try:
             if df.index.tzinfo is None:
-                df.index = pd.to_datetime(df.index).tz_localize('Asia/Kolkata')
+                df.index = pd.to_datetime(df.index).tz_localize(tz_str)
             else:
-                df.index = df.index.tz_convert('Asia/Kolkata')
-        except Exception: return None
-        df = df.sort_index()[['Open','High','Low','Close','Volume']]
+                df.index = df.index.tz_convert(tz_str)
+        except Exception:
+            try:
+                df.index = pd.to_datetime(df.index).tz_localize(tz_str)
+            except Exception as e:
+                return None, f"datetime index error: {e}"
+
+        for col in required:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        df = df[required].sort_index()
         df = df[~df.index.duplicated(keep='last')]
-        for c in ['Open','High','Low','Close','Volume']:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
         df = df.dropna(subset=['Open','High','Low','Close'])
-        return df if not df.empty else None
-    except Exception as e:
-        if DEBUG: print(f"[FETCH] {sym}: {e}")
-        return None
 
-# =============================================================================
-# RESAMPLE TO 15-MIN (anchored at 9:15, with optional time cutoff)
-# =============================================================================
-def to_15min(df, end_time=None):
-    if df is None or df.empty: return pd.DataFrame()
-    try:
-        tz = 'Asia/Kolkata'
-        if df.index.tzinfo is None:
-            df.index = df.index.tz_localize(tz)
-        elif str(df.index.tz) != tz:
-            df.index = df.index.tz_convert(tz)
-        df = df[(df.index.time >= dt_time(9,15)) & (df.index.time <= dt_time(15,30))]
-        if end_time is not None:
-            df = df[df.index.time <= end_time]
-        if df.empty: return pd.DataFrame()
-        out = df[['Open','High','Low','Close','Volume']].resample(
-            '15min', origin='start_day', offset='9h15min',
-            label='left', closed='left'
-        ).agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'})
-        return out[out['Close'].notna()]
-    except Exception: return pd.DataFrame()
+        if df.empty:
+            return None, "all rows dropped after cleaning (NaN OHLC)"
 
-# =============================================================================
-# ADX (calculated on given df15)
-# =============================================================================
-def calc_adx(df15, period=14):
-    try:
-        if len(df15) < period + 5: return None, None, None
-        h=df15['High']; l=df15['Low']; c=df15['Close']
-        tr   = pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
-        pdm  = (h-h.shift()).clip(lower=0)
-        ndm  = (l.shift()-l).clip(lower=0)
-        pdm[pdm<ndm]=0; ndm[ndm<pdm]=0
-        atr  = tr.ewm(span=period,adjust=False).mean()
-        pdi  = 100*pdm.ewm(span=period,adjust=False).mean()/atr.replace(0,np.nan)
-        ndi  = 100*ndm.ewm(span=period,adjust=False).mean()/atr.replace(0,np.nan)
-        dx   = 100*(pdi-ndi).abs()/(pdi+ndi).replace(0,np.nan)
-        adx  = dx.ewm(span=period,adjust=False).mean()
-        return float(adx.iloc[-1]), float(pdi.iloc[-1]), float(ndi.iloc[-1])
-    except Exception: return None, None, None
+        if len(df) < 5 and not retry:
+            time.sleep(0.3)
+            return fetch_1min(sym, from_dt, to_dt, trade, cache, lock, retry=True)
 
-# =============================================================================
-# CORE SCAN
-# =============================================================================
-def scan_stock(sym, scan_date, scan_hour, scan_min, n_candles, trade, cache, lock):
-    try:
-        tz  = pytz.timezone('Asia/Kolkata')
-        # Fetch window: 20 days back to exactly scan time
-        fd  = tz.localize(datetime.combine(scan_date - timedelta(days=20), dt_time(9,0)))
-        td  = tz.localize(datetime.combine(scan_date, dt_time(scan_hour, scan_min, 59)))
+        if len(df) < 5:
+            return None, f"too few candles after retry: {len(df)}"
 
-        df_raw = fetch_raw(sym, fd, td, trade, cache, lock)
-        if df_raw is None or df_raw.empty or len(df_raw) < 30: return None
-
-        # Split: today vs prior days
-        df_today = df_raw[df_raw.index.date == scan_date]
-        df_prior = df_raw[df_raw.index.date  < scan_date]
-        if df_today.empty or df_prior.empty: return None
-
-        prior_days = sorted(set(df_prior.index.date), reverse=True)
-        if len(prior_days) < 3: return None
-
-        # Yesterday OHLC
-        prev_df = df_prior[df_prior.index.date == prior_days[0]]
-        if prev_df.empty: return None
-        prev_close = float(prev_df['Close'].iloc[-1])
-        prev_high  = float(prev_df['High'].max())
-        prev_low   = float(prev_df['Low'].min())
-
-        # Day before yesterday close (for direction check)
-        prev2_df  = df_prior[df_prior.index.date == prior_days[1]]
-        prev3_df  = df_prior[df_prior.index.date == prior_days[2]]
-        prev2_close = float(prev2_df['Close'].iloc[-1]) if not prev2_df.empty else None
-        prev3_close = float(prev3_df['Close'].iloc[-1]) if not prev3_df.empty else None
-
-        # Today's 15-min candles, clipped strictly to the selected scan time.
-        df_today = df_today[df_today.index.time <= dt_time(scan_hour, scan_min)]
-        snap15 = to_15min(df_today, end_time=dt_time(scan_hour, scan_min))
-        if snap15 is None or len(snap15) < n_candles: return None
-        snap = snap15.head(n_candles).copy()
-
-        C = snap['Close'].values.astype(float)
-        O = snap['Open'].values.astype(float)
-        H = snap['High'].values.astype(float)
-        L = snap['Low'].values.astype(float)
-        V = snap['Volume'].values.astype(float)
-
-        first_open  = O[0]
-        first_close = C[0]
-        first_high  = H[0]
-        first_low   = L[0]
-        last_close  = C[-1]
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # STEP 1: DIRECTION FROM FIRST CANDLE
-        # Must have a meaningful body (>= 40% of range)
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        first_rng  = first_high - first_low
-        if first_rng <= 0: return None
-        first_body = abs(first_close - first_open)
-        first_body_ratio = first_body / first_rng
-        if first_body_ratio < BODY_MIN: return None
-
-        if   first_close > first_open: direction = 'BULL'
-        elif first_close < first_open: direction = 'BEAR'
-        else: return None
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # PILLAR 1 — CHECK A: ZERO REVERSAL CANDLES
-        # Every candle must close in trend direction vs previous candle.
-        # This is the single most important filter.
-        # DABUR/HAVELLS/OFSS: 0 reversal candles
-        # TCS/INFY: at least 1 reversal candle → rejected
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if direction == 'BULL':
-            for i in range(1, len(C)):
-                if C[i] < C[i-1]: return None   # any reversal = rejected
-        else:
-            for i in range(1, len(C)):
-                if C[i] > C[i-1]: return None   # any bounce = rejected
-
-        # Candle colour count (used for scoring only, not hard filter)
-        green_count = sum(1 for i in range(len(C)) if C[i] >= O[i])
-        red_count   = len(C) - green_count
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # PILLAR 2 — STILL AT EXTREMES AT SCAN TIME
-        # The last 2 candles must contain the session extreme
-        # If the stock peaked at 9:30 and is now at 10:30 sideways → rejected
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        session_high = float(np.max(H))
-        session_low  = float(np.min(L))
-
-        if direction == 'BULL':
-            # Last candle's high must be within 0.3% of session high
-            if H[-1] < session_high * 0.997: return None
-        else:
-            # Last candle's low must be within 0.3% of session low
-            if L[-1] > session_low * 1.003: return None
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # PILLAR 3 — TOTAL MOVE FROM YESTERDAY >= 0.8%
-        # Must be a meaningful move, not noise
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        move_pct = (last_close - prev_close) / prev_close * 100
-        if direction == 'BULL' and move_pct < MIN_MOVE_PCT:  return None
-        if direction == 'BEAR' and move_pct > -MIN_MOVE_PCT: return None
-
-        # Previous day direction — used for scoring, not hard filter
-        # PATANJALI/BOSCH may have flat day before trending day
-        prev_day_aligned = False
-        if prev2_close is not None:
-            if direction == 'BULL': prev_day_aligned = prev_close > prev2_close
-            if direction == 'BEAR': prev_day_aligned = prev_close < prev2_close
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # ADDITIONAL FILTER 2 — VOLUME >= 1.3x 5-day average
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        prev_vols = []
-        for d in prior_days[:5]:
-            ddf = df_prior[df_prior.index.date == d]
-            if not ddf.empty:
-                d15 = to_15min(ddf, end_time=dt_time(scan_hour, scan_min))
-                if d15 is not None and not d15.empty:
-                    prev_vols.append(float(d15.head(n_candles)['Volume'].sum()))
-        today_vol = float(np.sum(V))
-        avg_vol   = float(np.mean(prev_vols)) if prev_vols else today_vol
-        vol_ratio = today_vol / avg_vol if avg_vol > 0 else 1.0
-        # Volume is used in scoring only — not a hard reject
-        # PATANJALI/POLICYBZR have naturally lower volume
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # ADDITIONAL FILTER 3 — VWAP ON CORRECT SIDE
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        tp   = (snap['High'] + snap['Low'] + snap['Close']) / 3
-        vol  = snap['Volume'].replace(0, np.nan)
-        vwap = float((tp*vol).sum()/vol.sum()) if vol.sum() > 0 else last_close
-        vwap_dist = (last_close - vwap) / vwap
-        # VWAP used in scoring only
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # ADDITIONAL FILTER 4 — LINEAR REGRESSION R² >= 0.70
-        # Clean slope from left-bottom to right-top or left-top to right-bottom
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        r2 = 0.0; slope_val = 0.0
-        if len(C) >= 4:
-            x = np.arange(len(C), dtype=float)
-            coeffs = np.polyfit(x, C, 1)
-            slope_val = coeffs[0]
-            y_pred = np.polyval(coeffs, x)
-            ss_res = float(np.sum((C - y_pred)**2))
-            ss_tot = float(np.sum((C - np.mean(C))**2))
-            r2 = 1.0 - ss_res/ss_tot if ss_tot > 1e-10 else 0.0
-            if r2 < R2_MIN: return None
-            if direction == 'BULL' and slope_val <= 0: return None
-            if direction == 'BEAR' and slope_val >= 0: return None
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # ADDITIONAL FILTER 5 — ADX >= 15, DI ALIGNED (scan-time data only)
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        df_adx = to_15min(df_raw, end_time=dt_time(scan_hour, scan_min))
-        adx, pdi, ndi = calc_adx(df_adx) if (
-            df_adx is not None and len(df_adx) >= 20) else (None, None, None)
-        # ADX used in scoring only — not a hard reject
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # ALL HARD FILTERS PASSED — COMPUTE SCORE FOR RANKING
-        # Hard filters: zero reversals + still at extreme + min move + R²
-        # Everything else adds to score
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        score = 0
-
-        # S1: Slope quality R² (30 pts)
-        score += int(30 * min(r2, 1.0))
-
-        # S2: Candle colour consistency (15 pts)
-        # All green/red = 15, mostly green/red = 10, partial = 5
-        if direction == 'BULL':
-            if green_count == len(C):        score += 15
-            elif green_count >= len(C)-1:    score += 10
-            else:                            score += 5
-        else:
-            if red_count == len(C):          score += 15
-            elif red_count >= len(C)-1:      score += 10
-            else:                            score += 5
-
-        # S3: Volume strength (20 pts)
-        if   vol_ratio >= 5.0: score += 20
-        elif vol_ratio >= 4.0: score += 17
-        elif vol_ratio >= 3.0: score += 14
-        elif vol_ratio >= 2.0: score += 11
-        elif vol_ratio >= 1.5: score += 8
-        elif vol_ratio >= 1.2: score += 5
-        elif vol_ratio >= 1.0: score += 3
-        else:                  score += 1
-
-        # S4: Previous day same direction (10 pts)
-        if prev_day_aligned: score += 10
-
-        # S5: ADX strength (15 pts)
-        if adx is not None:
-            if   adx >= 35: score += 15
-            elif adx >= 25: score += 11
-            elif adx >= 18: score += 7
-            elif adx >= 12: score += 4
-
-        # S6: VWAP separation (10 pts)
-        vd = abs(vwap_dist)*100
-        if   vd >= 1.5: score += 10
-        elif vd >= 1.0: score += 7
-        elif vd >= 0.5: score += 4
-        elif vd >= 0.1: score += 2
-
-        # Move size factor
-        mv = abs(move_pct)
-        if   mv >= 5.0: score += 15
-        elif mv >= 3.0: score += 11
-        elif mv >= 2.0: score += 8
-        elif mv >= 1.0: score += 5
-        else:           score += 2
-
-        # VWAP separation (10 pts)
-        vd = abs(vwap_dist)*100
-        if   vd >= 1.5: score += 10
-        elif vd >= 1.0: score += 7
-        elif vd >= 0.5: score += 4
-        else:           score += 2
-
-        score = max(0, min(score, 100))
-
-        # ── GAP TYPE ─────────────────────────────────────────────────────────
-        gap_pct = (first_open - prev_close) / prev_close * 100
-        if abs(gap_pct) >= 1.0:
-            if direction == 'BULL':
-                pattern = f"Gap+{gap_pct:.1f}% Bull" if gap_pct>0 else f"Gap{gap_pct:.1f}% Bounce"
-            else:
-                pattern = f"Gap{gap_pct:.1f}% Bear" if gap_pct<0 else f"Gap+{gap_pct:.1f}% Fade"
-        else:
-            pattern = "Momentum " + ("Bull" if direction=='BULL' else "Bear")
-
-        # ── ENTRY / SL / TARGET ───────────────────────────────────────────────
-        entry = last_close
-        if direction == 'BULL':
-            sl     = round(float(np.min(L)) * 0.999, 2)
-            risk   = max(entry - sl, entry * 0.004)
-            sl     = round(entry - risk, 2)
-            target = round(entry + RR * risk, 2)
-        else:
-            sl     = round(float(np.max(H)) * 1.001, 2)
-            risk   = max(sl - entry, entry * 0.004)
-            sl     = round(entry + risk, 2)
-            target = round(entry - RR * risk, 2)
-
-        # ── CANDLE DETAILS ────────────────────────────────────────────────────
-        candles = []
-        for i in range(len(snap)):
-            candles.append({
-                'time':  snap.index[i].strftime('%H:%M'),
-                'open':  round(O[i],2), 'high': round(H[i],2),
-                'low':   round(L[i],2), 'close':round(C[i],2),
-                'vol':   int(V[i]),
-                'icon':  '🟢' if C[i]>=O[i] else '🔴',
-            })
-
-        return {
-            'Symbol':     sym,
-            'Direction':  direction,
-            'Signal':     '🟢 BUY' if direction=='BULL' else '🔴 SHORT',
-            'Pattern':    pattern,
-            'Score':      score,
-            'Entry':      round(entry,2),
-            'SL':         sl,
-            'Target':     target,
-            'Risk ₹':     round(abs(risk),2),
-            'Reward ₹':   round(abs(target-entry),2),
-            'Move%':      round(move_pct,2),
-            'Gap%':       round(gap_pct,2),
-            'Vol Ratio':  round(vol_ratio,2),
-            'ADX':        round(adx,1) if adx else None,
-            '+DI':        round(pdi,1) if pdi else None,
-            '-DI':        round(ndi,1) if ndi else None,
-            'VWAP':       round(vwap,2),
-            'VWAP%':      round(vwap_dist*100,2),
-            'R2':         round(r2,3),
-            'Body%':      round(first_body_ratio*100,1),
-            'Prev Close': round(prev_close,2),
-            'Prev High':  round(prev_high,2),
-            'Prev Low':   round(prev_low,2),
-            'Candles':    candles,
-        }
+        return df, None
 
     except Exception as e:
         if DEBUG:
             import traceback
-            print(f"[SCAN] {sym}: {e}\n{traceback.format_exc()[-300:]}")
-        return None
+            print(f"[FETCH ERR] {sym}: {e}\n{traceback.format_exc()}")
+        return None, f"unexpected error: {e}"
 
 # =============================================================================
-# RUN SCAN
+# RESAMPLE 1-MIN → 5-MIN  (anchored at 9:15 AM)
 # =============================================================================
-def run_scan(stocks, scan_date, scan_hour, scan_min, n_candles,
-             trade, prog_bar=None, prog_text=None, sym_lbl=None):
-    cache={}; lock=threading.Lock()
-    cntlk=threading.Lock(); done=[0]; total=len(stocks); out=[]
-
-    def process(sym):
-        return scan_stock(sym, scan_date, scan_hour, scan_min, n_candles,
-                          trade, cache, lock)
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs={ex.submit(process,s):s for s in stocks}
-        for f in as_completed(futs):
-            sym = futs[f]
-            try:
-                r = f.result()
-                if r:
-                    out.append(r)
-            except Exception:
-                r = None
-            finally:
-                with cntlk:
-                    done[0] += 1
-                    pct = int(done[0] / total * 100) if total else 100
-                    try:
-                        if prog_bar:
-                            prog_bar.progress(pct)
-                        if prog_text:
-                            prog_text.text(f"⏳ {pct}% — {done[0]}/{total} stocks scanned")
-                        if sym_lbl:
-                            sym_lbl.caption(f"Scanning: {sym}")
-                    except Exception:
-                        pass
-            gc.collect()
-
-    if prog_bar:  prog_bar.progress(100)
-    if prog_text: prog_text.text(f"✅ Done — {len(out)} signals from {total} stocks")
-    if sym_lbl:   sym_lbl.empty()
-
-    bull=sorted([r for r in out if r['Direction']=='BULL'],key=lambda r:r['Score'],reverse=True)[:TOP_N]
-    bear=sorted([r for r in out if r['Direction']=='BEAR'],key=lambda r:r['Score'],reverse=True)[:TOP_N]
-    return bull, bear
+def to_5min(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    try:
+        tz_str = 'Asia/Kolkata'
+        if df.index.tzinfo is None:
+            df.index = df.index.tz_localize(tz_str)
+        df = df[(df.index.time >= dt_time(9,15)) &
+                (df.index.time <= dt_time(15,30))].copy()
+        if df.empty:
+            return pd.DataFrame()
+        out = df[['Open','High','Low','Close','Volume']].resample(
+            '5min', origin='start_day', offset='9h15min',
+            label='left', closed='left'
+        ).agg({'Open':'first','High':'max','Low':'min',
+               'Close':'last','Volume':'sum'})
+        return out[out['Close'].notna()].copy()
+    except Exception:
+        return pd.DataFrame()
 
 # =============================================================================
-# BACKTEST
+# HELPERS
 # =============================================================================
-def run_backtest(bull, bear, scan_date, trade):
-    tz=pytz.timezone('Asia/Kolkata')
-    fd=tz.localize(datetime.combine(scan_date-timedelta(days=3),dt_time(9,0)))
-    td=tz.localize(datetime.combine(scan_date,dt_time(15,35)))
-    cache={}; lock=threading.Lock()
+def calc_vwap(df):
+    try:
+        if df.empty:
+            return pd.Series(dtype=float, index=df.index)
+        tp  = (df['High'] + df['Low'] + df['Close']) / 3.0
+        vol = df['Volume'].clip(lower=0)
+        return ((tp * vol).cumsum() / vol.cumsum().replace(0, np.nan)).rename('VWAP')
+    except Exception:
+        return pd.Series(dtype=float, index=df.index)
 
-    def eod(sym):
-        df=fetch_raw(sym,fd,td,trade,cache,lock)
-        if df is not None and not df.empty:
-            df=df[df.index.date==scan_date]
-        return float(df['Close'].iloc[-1]) if df is not None and not df.empty else None
 
-    stats=dict(bw=0,bl=0,sw=0,sl_=0,total=0)
-    for r in bull+bear:
-        e=eod(r['Symbol']); ib=r['Direction']=='BULL'
-        r['EOD Close']=round(e,2) if e else None
-        if e:
-            if ib:
-                if e>=r['Target']:   r['Result']='✅ Target Hit';  stats['bw']+=1
-                elif e<=r['SL']:     r['Result']='❌ SL Hit';      stats['bl']+=1
-                elif e>r['Entry']:   r['Result']='🟡 Partial Win'; stats['bw']+=1
-                else:                r['Result']='❌ Loss';         stats['bl']+=1
-            else:
-                if e<=r['Target']:   r['Result']='✅ Target Hit';  stats['sw']+=1
-                elif e>=r['SL']:     r['Result']='❌ SL Hit';      stats['sl_']+=1
-                elif e<r['Entry']:   r['Result']='🟡 Partial Win'; stats['sw']+=1
-                else:                r['Result']='❌ Loss';         stats['sl_']+=1
+def trend_r2_slope(closes):
+    """
+    Linear regression of closes vs candle-index.
+    Returns (r2, slope).  r2 ∈ [0,1] — how close to a straight line.
+    slope sign matches direction (positive = uptrend, negative = downtrend).
+    """
+    n = len(closes)
+    if n < 4:
+        return 0.0, 0.0
+    try:
+        x = np.arange(n, dtype=float)
+        slope, intercept = np.polyfit(x, closes, 1)
+        fitted = slope * x + intercept
+        ss_res = float(np.sum((closes - fitted) ** 2))
+        ss_tot = float(np.sum((closes - closes.mean()) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        return max(0.0, r2), slope
+    except Exception:
+        return 0.0, 0.0
+
+# =============================================================================
+# SCAN ONE STOCK
+# =============================================================================
+def scan_one(sym, scan_date, cutoff_dt, trade, cache, lock):
+    """
+    Returns (result_dict_or_None, status_string).
+    result_dict always includes 'IsTrending' (bool) based on the two
+    built-in checks (R² and Move%) — the UI splits on this flag.
+    """
+    tz = pytz.timezone('Asia/Kolkata')
+    try:
+        from_dt = tz.localize(datetime.combine(
+            scan_date - timedelta(days=12), dt_time(9, 14)
+        ))
+        df1, err = fetch_1min(sym, from_dt, cutoff_dt, trade, cache, lock)
+        if df1 is None:
+            return None, f"FAILED: {err}"
+
+        day_start = tz.localize(datetime.combine(scan_date, dt_time(9, 15)))
+        df_today  = df1[
+            (df1.index >= day_start) &
+            (df1.index <= cutoff_dt)
+        ].copy()
+
+        if df_today.empty:
+            return None, "FAILED: no candles for today in [9:15, cutoff]"
+        if len(df_today) < 10:
+            return None, f"FAILED: only {len(df_today)} candles today (need ≥10)"
+
+        curr_price = float(df_today['Close'].iloc[-1])
+        open_price = float(df_today['Open'].iloc[0])
+
+        pdays = prev_trading_days(scan_date, 1)
+        if not pdays:
+            return None, "FAILED: could not determine previous trading day"
+        pday = pdays[0]
+        df_prev = df1[df1.index.date == pday]
+        if df_prev.empty:
+            return None, f"FAILED: no candles found for previous day ({pday})"
+
+        prev_close = float(df_prev['Close'].iloc[-1])
+        prev_high  = float(df_prev['High'].max())
+        prev_low   = float(df_prev['Low'].min())
+
+        if prev_close <= 0:
+            return None, "FAILED: previous close is zero/invalid"
+
+        total_move_pct   = (curr_price - prev_close) / prev_close * 100
+        morning_move_pct = (curr_price - open_price) / open_price * 100
+        gap_pct          = (open_price - prev_close) / prev_close * 100
+
+        direction = 'BULL' if total_move_pct > 0 else ('BEAR' if total_move_pct < 0 else 'FLAT')
+
+        # ── RVOL — display only ──────────────────────────────────────────
+        today_vol = float(df_today['Volume'].sum())
+        cutoff_t  = cutoff_dt.time()
+        hist_vols = []
+        for hd in prev_trading_days(scan_date, 5):
+            dh = df1[df1.index.date == hd]
+            if not dh.empty:
+                win = dh[(dh.index.time >= dt_time(9,15)) &
+                         (dh.index.time <= cutoff_t)]
+                if not win.empty:
+                    hist_vols.append(float(win['Volume'].sum()))
+        if hist_vols:
+            avg_vol   = float(np.mean(hist_vols))
+            vol_ratio = today_vol / avg_vol if avg_vol > 0 else None
         else:
-            r['Result']='❓ No Data'
-        stats['total']+=1
-    w=stats['bw']+stats['sw']; t=stats['total']
-    stats['wr']=round(w/t*100,1) if t else 0
+            vol_ratio = None
+
+        # ── TREND QUALITY — R² + slope direction ─────────────────────────
+        df5_today = to_5min(df_today)
+        r2, slope = 0.0, 0.0
+        vwap_val  = None
+        vwap_side = '—'
+
+        if not df5_today.empty and len(df5_today) >= 4:
+            closes = df5_today['Close'].values.astype(float)
+            r2, slope = trend_r2_slope(closes)
+            vwap_series = calc_vwap(df5_today)
+            if not vwap_series.empty:
+                vwap_val = float(vwap_series.iloc[-1])
+                if direction == 'BULL':
+                    vwap_side = '✅ Above' if curr_price > vwap_val else '⚠️ Below'
+                elif direction == 'BEAR':
+                    vwap_side = '✅ Below' if curr_price < vwap_val else '⚠️ Above'
+
+        # ── IS THIS A "TRENDING" STOCK? (the only filter) ────────────────
+        slope_matches_dir = (
+            (direction == 'BULL' and slope > 0) or
+            (direction == 'BEAR' and slope < 0)
+        )
+        is_trending = (
+            direction in ('BULL', 'BEAR') and
+            r2 >= TREND_MIN_R2 and
+            abs(total_move_pct) >= TREND_MIN_MOVE_PCT and
+            slope_matches_dir
+        )
+
+        # ── ENTRY / SL / TARGET (10:45–10:59 candle) ─────────────────────
+        entry_candles = pd.DataFrame()
+        if not df5_today.empty:
+            entry_candles = df5_today[
+                (df5_today.index.time >= dt_time(10, 45)) &
+                (df5_today.index.time <  dt_time(11,  0))
+            ]
+            if entry_candles.empty:
+                entry_candles = df5_today.iloc[[-1]]
+
+        entry = sl = target = risk = None
+        ec_str = '—'
+        if not entry_candles.empty:
+            ec_high = float(entry_candles['High'].max())
+            ec_low  = float(entry_candles['Low'].min())
+            ec_str  = f"H:{round(ec_high,2)} / L:{round(ec_low,2)}"
+
+            if direction == 'BULL':
+                entry = round(ec_high, 2)
+                sl    = round(ec_low,  2)
+            elif direction == 'BEAR':
+                entry = round(ec_low,  2)
+                sl    = round(ec_high, 2)
+
+            if entry is not None and sl is not None:
+                risk = abs(entry - sl)
+                if risk < entry * 0.001:
+                    risk = entry * 0.003
+                if direction == 'BULL':
+                    target = round(entry + RR_RATIO * risk, 2)
+                else:
+                    target = round(entry - RR_RATIO * risk, 2)
+
+        candle_str = ''
+        if not df5_today.empty:
+            last6 = df5_today.tail(6)
+            parts = []
+            for i in range(len(last6)):
+                o = float(last6['Open'].iloc[i])
+                c = float(last6['Close'].iloc[i])
+                t = last6.index[i].strftime('%H:%M')
+                parts.append(f"{'🟢' if c>=o else '🔴'}{t}")
+            candle_str = ' '.join(parts)
+
+        result = {
+            'Symbol':        sym,
+            'Direction':     direction,
+            'IsTrending':    is_trending,
+            'Signal':        ('🟢 BUY'   if direction == 'BULL' else
+                              '🔴 SHORT' if direction == 'BEAR' else '⚪ FLAT'),
+            'TotalMove%':    round(total_move_pct,   2),
+            'MorningMove%':  round(morning_move_pct, 2),
+            'Gap%':          round(gap_pct,           2),
+            'CurrPrice':     round(curr_price,        2),
+            'PrevClose':     round(prev_close,        2),
+            'VolRatio':      round(vol_ratio, 2) if vol_ratio is not None else None,
+            'TrendR2':       round(r2,                2),
+            'VWAP':          round(vwap_val, 2) if vwap_val else None,
+            'VWAPSide':      vwap_side,
+            'Entry':         entry,
+            'SL':            sl,
+            'Target':        target,
+            'Risk':          round(risk, 2) if risk is not None else None,
+            'EntryCandle':   ec_str,
+            'Candles':       candle_str,
+            'PrevHigh':      round(prev_high, 2),
+            'PrevLow':       round(prev_low,  2),
+        }
+        tag = "TRENDING" if is_trending else "weak/choppy"
+        return result, f"OK ({direction}, {total_move_pct:+.2f}%, R²={r2:.2f}, {tag})"
+
+    except Exception as e:
+        if DEBUG:
+            import traceback
+            print(f"[SCAN] {sym}: {e}\n{traceback.format_exc()}")
+        return None, f"FAILED: unexpected error: {e}"
+
+# =============================================================================
+# PARALLEL FULL SCAN
+# =============================================================================
+def run_scan(stocks, scan_date, cutoff_h, cutoff_m, trade, status_cb=None):
+    tz        = pytz.timezone('Asia/Kolkata')
+    cutoff_dt = tz.localize(datetime.combine(
+        scan_date, dt_time(cutoff_h, cutoff_m)
+    ))
+
+    cache     = {}
+    lock      = threading.Lock()
+    done_lock = threading.Lock()
+    all_res   = []
+    diag      = {}
+    done_ctr  = [0]
+    total     = len(stocks)
+
+    def _proc(sym):
+        r, status = scan_one(sym, scan_date, cutoff_dt, trade, cache, lock)
+        gc.collect()
+        return sym, r, status
+
+    workers = min(MAX_WORKERS, max(4, (os.cpu_count() or 4) * 3))
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_proc, s): s for s in stocks}
+        for f in as_completed(futs):
+            sym_done = futs[f]
+            try:
+                sym_done, r, status = f.result()
+                diag[sym_done] = status
+                if r:
+                    all_res.append(r)
+            except Exception as e:
+                diag[sym_done] = f"FAILED: thread error: {e}"
+            finally:
+                with done_lock:
+                    done_ctr[0] += 1
+                if status_cb:
+                    status_cb(done_ctr[0], total, sym_done)
+
+    # Trending-only lists (the MAIN output)
+    trend_bull = sorted(
+        [r for r in all_res if r['Direction'] == 'BULL' and r['IsTrending']],
+        key=lambda r: r['TotalMove%'], reverse=True
+    )
+    trend_bear = sorted(
+        [r for r in all_res if r['Direction'] == 'BEAR' and r['IsTrending']],
+        key=lambda r: r['TotalMove%']
+    )
+
+    # Full reference lists (everything, for the expander)
+    all_bull = sorted(
+        [r for r in all_res if r['Direction'] == 'BULL'],
+        key=lambda r: r['TotalMove%'], reverse=True
+    )
+    all_bear = sorted(
+        [r for r in all_res if r['Direction'] == 'BEAR'],
+        key=lambda r: r['TotalMove%']
+    )
+
+    return trend_bull, trend_bear, all_bull, all_bear, diag
+
+# =============================================================================
+# BACKTEST VERIFICATION
+# =============================================================================
+def verify_backtest(bull, bear, scan_date, trade, cache, lock):
+    tz = pytz.timezone('Asia/Kolkata')
+    fd = tz.localize(datetime.combine(scan_date - timedelta(days=2), dt_time(9, 0)))
+    td = tz.localize(datetime.combine(scan_date,                     dt_time(15, 35)))
+
+    def eod_close(sym):
+        df1, _ = fetch_1min(sym, fd, td, trade, cache, lock)
+        if df1 is not None and not df1.empty:
+            df1 = df1[df1.index.date == scan_date]
+        if df1 is None or df1.empty:
+            return None
+        return float(df1['Close'].iloc[-1])
+
+    stats = dict(bw=0, bl=0, sw=0, sl=0, total=0)
+
+    for r in bull:
+        if r['Entry'] is None:
+            r['EOD'] = None; r['Result'] = '—'; continue
+        eod = eod_close(r['Symbol'])
+        if eod is not None:
+            r['EOD'] = round(eod, 2)
+            chg = (eod - r['Entry']) / r['Entry'] * 100
+            if eod >= r['Target']:
+                r['Result'] = '✅ Target Hit'; stats['bw'] += 1
+            elif eod <= r['SL']:
+                r['Result'] = '❌ SL Hit';     stats['bl'] += 1
+            elif eod > r['Entry']:
+                r['Result'] = f'🟡 +{chg:.1f}% (3PM)'; stats['bw'] += 1
+            else:
+                r['Result'] = f'❌ {chg:.1f}% (3PM)';  stats['bl'] += 1
+        else:
+            r['EOD'] = None; r['Result'] = '❓ No Data'
+        stats['total'] += 1
+
+    for r in bear:
+        if r['Entry'] is None:
+            r['EOD'] = None; r['Result'] = '—'; continue
+        eod = eod_close(r['Symbol'])
+        if eod is not None:
+            r['EOD'] = round(eod, 2)
+            chg = (r['Entry'] - eod) / r['Entry'] * 100
+            if eod <= r['Target']:
+                r['Result'] = '✅ Target Hit'; stats['sw'] += 1
+            elif eod >= r['SL']:
+                r['Result'] = '❌ SL Hit';     stats['sl'] += 1
+            elif eod < r['Entry']:
+                r['Result'] = f'🟡 +{chg:.1f}% (3PM)'; stats['sw'] += 1
+            else:
+                r['Result'] = f'❌ {chg:.1f}% (3PM)';  stats['sl'] += 1
+        else:
+            r['EOD'] = None; r['Result'] = '❓ No Data'
+        stats['total'] += 1
+
+    w = stats['bw'] + stats['sw']
+    t = stats['total']
+    stats['win_rate'] = round(w / t * 100, 1) if t > 0 else 0.0
     return bull, bear, stats
 
 # =============================================================================
-# CANDLE TABLE HTML
+# HTML RESULT TABLE
 # =============================================================================
-def candle_html(candles, direction):
-    if not candles: return ""
-    hdr = '#1B5E20' if direction=='BULL' else '#7F0000'
-    th  = f"background:{hdr};color:white;padding:6px 8px;font-size:11px;text-align:left;"
-    rows=[]
-    for c in candles:
-        bg  = '#E8F5E9' if c['icon']=='🟢' else '#FFEBEE'
-        txt = '#1B5E20' if c['icon']=='🟢' else '#B71C1C'
-        td  = f"padding:5px 8px;color:{txt};font-size:12px;"
-        rows.append(
-            f"<tr style='background:{bg};'>"
-            f"<td style='{td}font-weight:500;'>{c['icon']} {c['time']}</td>"
-            f"<td style='{td}'>₹{c['open']}</td>"
-            f"<td style='{td}'>₹{c['high']}</td>"
-            f"<td style='{td}'>₹{c['low']}</td>"
-            f"<td style='{td}font-weight:600;'>₹{c['close']}</td>"
-            f"<td style='{td}'>{c['vol']:,}</td>"
-            f"</tr>")
-    return (f"<table style='border-collapse:collapse;width:100%;font-size:12px;'>"
-            f"<thead><tr>"
-            f"<th style='{th}'>Candle</th><th style='{th}'>Open</th>"
-            f"<th style='{th}'>High</th><th style='{th}'>Low</th>"
-            f"<th style='{th}'>Close</th><th style='{th}'>Volume</th>"
-            f"</tr></thead><tbody>{''.join(rows)}</tbody></table>")
-
-# =============================================================================
-# RENDER SIGNALS
-# =============================================================================
-def render_signals(results, is_bt, container):
+def build_table(results, is_bull, is_backtest=False, show_trend_badge=False):
     if not results:
-        container.info("No signals found.")
-        return
-    for r in results:
-        ib   = r['Direction']=='BULL'
-        icon = '🟢' if ib else '🔴'
-        with container:
-            with st.expander(
-                f"{icon} **{r['Symbol']}** — {r['Signal']} — "
-                f"Score {r['Score']} | Move {r['Move%']:+.2f}% | "
-                f"Vol {r['Vol Ratio']:.1f}× | R²={r['R2']:.2f} | {r['Pattern']}",
-                expanded=False):
-                c1,c2,c3,c4,c5,c6 = st.columns(6)
-                c1.metric("Entry ₹",  f"₹{r['Entry']}")
-                c2.metric("SL ₹",     f"₹{r['SL']}")
-                c3.metric("Target ₹", f"₹{r['Target']}")
-                c4.metric("Risk",     f"₹{r['Risk ₹']}")
-                c5.metric("Reward",   f"₹{r['Reward ₹']}")
-                if is_bt and r.get('Result'):
-                    c6.metric("Result", r['Result'],
-                              delta=f"EOD ₹{r.get('EOD Close','—')}")
-                else:
-                    c6.metric("R:R", f"1:{RR}")
+        return "<p style='color:var(--muted);padding:12px 0;'>No stocks in this list.</p>"
 
-                i1,i2,i3,i4,i5 = st.columns(5)
-                i1.metric("ADX",       f"{r['ADX']}" if r['ADX'] else "—")
-                i2.metric("+DI/-DI",   f"{r['+DI']}/{r['-DI']}" if r['+DI'] else "—")
-                i3.metric("VWAP%",     f"{r['VWAP%']:+.2f}%")
-                i4.metric("Prev Close",f"₹{r['Prev Close']}")
-                i5.metric("Slope R²",  f"{r['R2']:.3f}")
+    hdr_bg = '#1B5E20' if is_bull else '#B71C1C'
+    row_bg = '#F1F8E9' if is_bull else '#FCE4EC'
+    row_fg = '#1B5E20' if is_bull else '#880E4F'
 
-                st.markdown("**📊 Morning Candles (9:15 AM → Scan Time) — All must be same colour**")
-                st.markdown(candle_html(r['Candles'], r['Direction']), unsafe_allow_html=True)
+    bt_th = (
+        '<th style="padding:9px 12px;border:1px solid #999;">EOD Close</th>'
+        '<th style="padding:9px 12px;border:1px solid #999;">Result</th>'
+    ) if is_backtest else ''
+
+    trend_th = '<th style="padding:9px 12px;border:1px solid #999;">Trending?</th>' if show_trend_badge else ''
+
+    def th(txt):
+        return f'<th style="padding:9px 12px;border:1px solid #999;">{txt}</th>'
+
+    header = (
+        th('#') + th('Symbol') + th('Signal') +
+        th('Total Move%') + th('Morning Move%') + th('Gap%') +
+        th('Price ₹') + th('Vol Ratio') + th('Trend R²') +
+        th('VWAP Side') +
+        th('Entry ₹') + th('SL ₹') + th('Target ₹') +
+        th('Last 6 Candles') +
+        trend_th + bt_th
+    )
+
+    rows = []
+    for i, r in enumerate(results, 1):
+        sym   = r['Symbol'].replace('.NS','')
+        vwap_s = r.get('VWAPSide', '—')
+
+        r2    = r.get('TrendR2', 0)
+        r2col = '#00C853' if r2 >= 0.7 else ('#FF8F00' if r2 >= 0.5 else '#D50000')
+        r2bar = (f'<div style="display:flex;align-items:center;gap:6px">'
+                 f'<div style="height:6px;width:{int(r2*60)}px;background:{r2col};'
+                 f'border-radius:3px;min-width:4px"></div>'
+                 f'<span>{r2:.2f}</span></div>')
+
+        vr = r.get('VolRatio')
+        if vr is None:
+            vr_str = '—'
+        else:
+            vrcol = '#00C853' if vr >= 2.0 else ('#FF8F00' if vr >= 1.2 else '#888')
+            vr_str = f'<b style="color:{vrcol}">{vr:.2f}×</b>'
+
+        trend_td = ''
+        if show_trend_badge:
+            if r.get('IsTrending'):
+                trend_td = '<td style="padding:9px 12px;border:1px solid #ddd;color:#00C853;font-weight:bold;">✅ Yes</td>'
+            else:
+                trend_td = '<td style="padding:9px 12px;border:1px solid #ddd;color:#999;">— No</td>'
+
+        bt_td = ''
+        if is_backtest:
+            eod = r.get('EOD','—')
+            res = r.get('Result','—')
+            rc  = ('#00C853' if '✅' in res else '#D50000' if '❌' in res else '#FF8F00')
+            bt_td = (
+                f'<td style="padding:9px 12px;border:1px solid #ddd;">{eod if eod else "—"}</td>'
+                f'<td style="padding:9px 12px;border:1px solid #ddd;color:{rc};font-weight:bold;">{res}</td>'
+            )
+
+        def td(val, extra=''):
+            return f'<td style="padding:9px 12px;border:1px solid #ddd;{extra}">{val}</td>'
+
+        tm = r['TotalMove%']; mm = r['MorningMove%']; gp = r['Gap%']
+        tm_col = '#00C853' if tm > 0 else '#D50000'
+        mm_col = '#00C853' if mm > 0 else '#D50000'
+        gp_col = '#00C853' if gp > 0 else '#D50000'
+
+        entry_str  = f'₹{r["Entry"]}'  if r["Entry"]  is not None else '—'
+        sl_str     = f'₹{r["SL"]}'     if r["SL"]     is not None else '—'
+        target_str = f'₹{r["Target"]}' if r["Target"] is not None else '—'
+
+        rows.append(
+            f'<tr style="background:{row_bg};color:{row_fg};">'
+            + td(i,          'font-weight:900;')
+            + td(sym,        'font-weight:900;font-size:14px;')
+            + td(r['Signal'])
+            + td(f'<b style="color:{tm_col}">{tm:+.2f}%</b>', 'font-size:13px;')
+            + td(f'<span style="color:{mm_col}">{mm:+.2f}%</span>', 'font-size:13px;')
+            + td(f'<span style="color:{gp_col}">{gp:+.2f}%</span>', 'font-size:12px;')
+            + td(f'₹{r["CurrPrice"]}')
+            + td(vr_str)
+            + td(r2bar)
+            + td(vwap_s,     'font-size:12px;')
+            + td(f'<b>{entry_str}</b>',  'font-weight:bold;')
+            + td(sl_str,    'color:#D50000;font-weight:bold;')
+            + td(target_str,'color:#00796B;font-weight:bold;')
+            + td(r.get('Candles',''), 'font-size:11px;white-space:nowrap;')
+            + trend_td
+            + bt_td
+            + '</tr>'
+        )
+
+    return f"""
+<div style="overflow-x:auto;margin-bottom:20px;">
+<table style="width:100%;border-collapse:collapse;font-size:12px;">
+<thead>
+  <tr style="background:{hdr_bg};color:white;font-size:12px;">{header}</tr>
+</thead>
+<tbody>{''.join(rows)}</tbody>
+</table>
+</div>"""
 
 # =============================================================================
 # STREAMLIT UI
 # =============================================================================
 def main():
-    st.set_page_config(page_title="Trend Master v5", page_icon="📈",
-                       layout="wide", initial_sidebar_state="collapsed")
-    st.markdown("""<style>
-.block-container{padding-top:.7rem;padding-bottom:.7rem;}
-.stButton>button{border-radius:8px;font-weight:600;height:44px;font-size:15px;}
-div[data-testid="metric-container"]{
-  background:white;border-radius:8px;padding:10px 14px;
-  box-shadow:0 1px 4px rgba(0,0,0,0.08);border:1px solid #e0e0e0;}
-</style>""", unsafe_allow_html=True)
+    st.set_page_config(page_title="EOD Trend Scanner", layout="wide", page_icon="📈")
+    st.title("📈 EOD Trend Scanner")
+    st.caption(
+        "Run at 11:00 AM → only stocks with a clean, consistent trend since "
+        "9:15 AM appear in BUY / SHORT. No sliders to configure."
+    )
 
-    st.markdown("""
-<div style="background:linear-gradient(135deg,#0D47A1,#1976D2);
-     padding:16px 24px;border-radius:12px;margin-bottom:14px;color:white;">
-  <h2 style="margin:0;font-size:20px;color:white;">📈 Trend Master v5</h2>
-  <p style="margin:3px 0 0;opacity:.85;font-size:12px;">
-    ZERO reversal candles · Still at extremes at 11 AM · Clean slope (R²≥0.70) ·
-    Based on OFSS/DABUR/HAVELLS pattern analysis
-  </p>
-</div>""", unsafe_allow_html=True)
-
-    # Session state
-    for k,v in [('trade',None),('connected',False),('results',None),
-                ('bt_stats',None),('uid',''),('auth',''),('skey','')]:
-        if k not in st.session_state: st.session_state[k]=v
+    for k, v in dict(trade=None, connected=False,
+                     results=None, bt_stats=None,
+                     uid='', auth='', skey='').items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
     try:
         if os.path.exists(CREDS_FILE):
-            with open(CREDS_FILE) as f: c=json.load(f)
-            st.session_state.update({'uid':c.get('user_id',''),
-                                     'auth':c.get('auth_code',''),
-                                     'skey':c.get('secret_key','')})
-    except Exception: pass
+            with open(CREDS_FILE) as f:
+                c = json.load(f)
+            st.session_state['uid']  = c.get('user_id','')
+            st.session_state['auth'] = c.get('auth_code','')
+            st.session_state['skey'] = c.get('secret_key','')
+    except Exception:
+        pass
 
-    # LOGIN
-    conn_ph=st.empty()
-    if st.session_state['connected']:
-        conn_ph.success("✅ Alice Blue Connected")
+    # ── LOGIN ─────────────────────────────────────────────────────────────
+    with st.expander("🔐 Alice Blue Login", expanded=not st.session_state['connected']):
+        c1, c2, c3 = st.columns(3)
+        uid  = c1.text_input("User ID",    value=st.session_state['uid'])
+        auth = c2.text_input("Auth Code",  value=st.session_state['auth'])
+        skey = c3.text_input("Secret Key", value=st.session_state['skey'], type="password")
 
-    with st.expander("🔐 Login", expanded=not st.session_state['connected']):
-        lc1,lc2,lc3=st.columns(3)
-        uid  = lc1.text_input("User ID",   value=st.session_state['uid'])
-        auth = lc2.text_input("Auth Code", value=st.session_state['auth'])
-        skey = lc3.text_input("Secret Key",value=st.session_state['skey'],type="password")
-        lb1,lb2,lb3,_=st.columns([3,1,1,3]); lmsg=st.empty()
-        if lb1.button("🔌 Connect",use_container_width=True):
-            if not all([uid,auth,skey]): lmsg.error("All fields required.")
+        b1, _, b2, b3 = st.columns([3,2,1,1])
+        ph = st.empty()
+
+        if b1.button("🔌 Connect", use_container_width=True):
+            if not (uid and auth and skey):
+                ph.error("All three fields are required.")
             else:
-                ok=False
-                for fn in [lambda:TradeHub(user_id=uid,auth_code=auth,secret_key=skey),
-                           lambda:TradeHub(user_id=uid,auth_code=skey,secret_key=auth),
-                           lambda:TradeHub(uid,auth,skey)]:
+                ok = False
+                for fn in [
+                    lambda: TradeHub(user_id=uid, auth_code=auth,  secret_key=skey),
+                    lambda: TradeHub(user_id=uid, auth_code=skey,  secret_key=auth),
+                    lambda: TradeHub(uid, auth, skey),
+                ]:
                     try:
-                        t=fn(); s=t.get_session_id()
+                        t = fn()
+                        s = t.get_session_id()
                         if s and 'Not_ok' not in str(s):
-                            st.session_state.update({'trade':t,'connected':True})
-                            conn_ph.success("✅ Alice Blue Connected")
-                            lmsg.success("Connected!")
+                            st.session_state.update(trade=t, connected=True)
+                            ph.success("✅ Connected!")
                             try:
                                 with open(CREDS_FILE,'w') as f:
-                                    json.dump({'user_id':uid,'auth_code':auth,'secret_key':skey},f)
-                            except Exception: pass
-                            ok=True; break
-                    except Exception: continue
-                if not ok: lmsg.error("❌ Auth failed.")
-        if lb2.button("💾 Save",use_container_width=True):
+                                    json.dump(dict(user_id=uid,auth_code=auth,secret_key=skey),f)
+                            except Exception:
+                                pass
+                            ok = True
+                            break
+                    except Exception:
+                        continue
+                if not ok:
+                    ph.error("❌ Authentication failed.")
+
+        if b2.button("💾 Save", use_container_width=True):
             try:
                 with open(CREDS_FILE,'w') as f:
-                    json.dump({'user_id':uid,'auth_code':auth,'secret_key':skey},f)
-                st.toast("✅ Saved!")
-            except Exception as e: st.error(str(e))
-        if lb3.button("🗑️",use_container_width=True):
-            try: os.remove(CREDS_FILE); st.toast("Cleared")
-            except Exception: pass
+                    json.dump(dict(user_id=uid,auth_code=auth,secret_key=skey),f)
+                st.success("Saved!")
+            except Exception as e:
+                st.error(str(e))
 
-    # SETTINGS
-    st.markdown("---")
-    sc1,sc2,sc3=st.columns([2,2,3])
-    with sc1:
-        mode=st.radio("Mode",["🔴 Live","📅 Historical"],horizontal=True)
-        is_live=mode=="🔴 Live"
-    with sc2:
-        if not is_live:
-            sd=st.date_input("Historical Date",
-                             value=last_trading_day()-timedelta(days=1))
-            scan_date=sd if is_trading_day(sd) else last_trading_day(sd)
-            if scan_date!=sd: st.caption(f"Adjusted: {scan_date}")
-        else:
-            tz=pytz.timezone('Asia/Kolkata'); now=datetime.now(tz)
-            scan_date=last_trading_day(now.date())
-            if now.time()<dt_time(11,0):
-                rem=int((datetime.combine(now.date(),dt_time(11,0))
-                         -now.replace(tzinfo=None)).total_seconds()/60)
-                st.warning(f"⏰ Run at 11:00 AM. {rem} min remaining.")
-            else:
-                st.success(f"✅ {now.strftime('%H:%M')} — Good time!")
-    with sc3:
-        scan_lbl=st.radio("⏰ Scan Time",list(SCAN_OPTIONS.keys()),horizontal=True)
-        scan_hour,scan_min,n_candles=SCAN_OPTIONS[scan_lbl]
+        if b3.button("🗑️", use_container_width=True):
+            try:
+                os.remove(CREDS_FILE); st.info("Cleared.")
+            except Exception:
+                pass
 
-    st.info(f"📌 Using **{n_candles} candles** (9:15 AM → "
-            f"{'10:45' if n_candles==7 else '11:15'} AM). "
-            f"Data fetched strictly up to **{scan_hour:02d}:{scan_min:02d} AM** only.")
+        if st.session_state['connected']:
+            ph.success("✅ Alice Blue: Connected")
 
-    with st.expander("📖 How This Finds OFSS/DABUR/HAVELLS Type Stocks",expanded=False):
+    # ── HOW IT WORKS ──────────────────────────────────────────────────────
+    with st.expander("📖 How 'trending' is decided (no sliders — fixed logic)", expanded=False):
         st.markdown(f"""
-**Pattern identified from your examples:**
+A stock appears in **BUY** or **SHORT** only if **ALL** of these are true:
 
-| Stock | Date | What happened |
+| Check | Rule | Why |
 |---|---|---|
-| OFSS | 29 May | Hit 52-week high at open, then sold off all 7 candles consecutively |
-| DABUR | 01 Jun | Already falling for days, opened weak, fell every candle |
-| HAVELLS | 01 Jun | Same as DABUR — continuous downtrend from first candle |
+| **Direction** | Total Move % from yesterday's close is positive (BUY) or negative (SHORT) | Basic direction |
+| **Consistency** | Trend R² ≥ **{TREND_MIN_R2}** | The 9:15→cutoff price move is a fairly straight line, not random zig-zag |
+| **Magnitude** | \\|Total Move %\\| ≥ **{TREND_MIN_MOVE_PCT}%** | The move is real, not 0.05% noise |
+| **Slope direction** | Regression slope matches the move direction | Confirms the trend is still developing the same way at cutoff |
 
-**What all 3 had in common at 11 AM:**
-1. Every 15-min candle from 9:15 was red (bear) or green (bull) — zero exceptions
-2. The last candle was STILL making a new session low/high — still trending
-3. The move was a clean slope (not zigzag) — R² ≥ 0.70
-4. Volume was elevated — institutional selling/buying
+**Total Move % = (Price at cutoff − Yesterday's Close) ÷ Yesterday's Close × 100**
 
-**Why TCS/INFY/NTPC kept getting through (now fixed):**
-- They had at least 1 reversal candle (now = zero allowed)
-- Their last candles were NOT at session extremes (peaked early, drifted)
-- Their slope R² was low (~0.40-0.50) — zigzag pattern
+Stocks that fail any check still appear in the **"All Scanned Stocks"** expander at the
+bottom (sorted by Move %) so you can see everything — but only the trend-qualified
+stocks are in the main BUY/SHORT lists.
 
-**Filters applied:**
-| Filter | Threshold |
-|---|---|
-| Zero reversal candles | Absolute — even 1 rejected |
-| All candles same colour (green/red) | No mixed candles |
-| Last candle at session extreme | Within 0.3% of high/low |
-| Move from prev close | ≥ {MIN_MOVE_PCT}% |
-| Previous day same direction | Continuation only |
-| Volume | ≥ {VOL_MULT}× 5-day average |
-| VWAP separation | ≥ 0.1% on correct side |
-| Linear slope R² | ≥ {R2_MIN} |
-| ADX + DI aligned | ADX ≥ {ADX_MIN} |
+**Entry / SL / Target** — based on the 10:45–10:59 AM candle:
+- BUY: Entry = candle HIGH, SL = candle LOW, Target = Entry + 2×Risk
+- SHORT: Entry = candle LOW, SL = candle HIGH, Target = Entry − 2×Risk
 """)
 
-    with st.expander("📋 F&O Stock List",expanded=False):
-        default="""AARTIIND.NS
-ABB.NS
-ABCAPITAL.NS
-ADANIENT.NS
-ADANIGREEN.NS
-ADANIPORTS.NS
-ALKEM.NS
-AMBUJACEM.NS
-ANGELONE.NS
-APOLLOHOSP.NS
-APOLLOTYRE.NS
-ASHOKLEY.NS
-ASIANPAINT.NS
-ASTRAL.NS
-AUBANK.NS
-AUROPHARMA.NS
-AXISBANK.NS
-BAJAJ-AUTO.NS
-BAJFINANCE.NS
-BAJAJFINSV.NS
-BAJAJHLDNG.NS
-BALKRISIND.NS
-BANDHANBNK.NS
-BANKBARODA.NS
-BANKINDIA.NS
-BDL.NS
-BEL.NS
-BERGEPAINT.NS
-BHARATFORG.NS
-BHARTIARTL.NS
-BHEL.NS
-BIOCON.NS
-BOSCHLTD.NS
-BPCL.NS
-BRITANNIA.NS
-BSE.NS
-CANBK.NS
-CDSL.NS
-CGPOWER.NS
-CHOLAFIN.NS
-CIPLA.NS
-COALINDIA.NS
-COFORGE.NS
-COLPAL.NS
-CONCOR.NS
-CROMPTON.NS
-CUMMINSIND.NS
-CYIENT.NS
-DABUR.NS
-DALBHARAT.NS
-DELHIVERY.NS
-DIVISLAB.NS
-DIXON.NS
-DLF.NS
-DMART.NS
-DRREDDY.NS
-EICHERMOT.NS
-ESCORTS.NS
-ETERNAL.NS
-EXIDEIND.NS
-FEDERALBNK.NS
-FORTIS.NS
-GAIL.NS
-GLENMARK.NS
-GMRAIRPORT.NS
-GODREJCP.NS
-GODREJPROP.NS
-GRASIM.NS
-HAL.NS
-HAVELLS.NS
-HCLTECH.NS
-HDFCAMC.NS
-HDFCBANK.NS
-HDFCLIFE.NS
-HEROMOTOCO.NS
-HINDALCO.NS
-HINDPETRO.NS
-HINDUNILVR.NS
-HINDZINC.NS
-HUDCO.NS
-ICICIBANK.NS
-ICICIGI.NS
-ICICIPRULI.NS
-IDFCFIRSTB.NS
-IEX.NS
-IGL.NS
-INDHOTEL.NS
-INDIGO.NS
-INDUSINDBK.NS
-INDUSTOWER.NS
-INFY.NS
-IOC.NS
-IRCTC.NS
-IREDA.NS
-IRFC.NS
-ITC.NS
-JINDALSTEL.NS
-JIOFIN.NS
-JSWENERGY.NS
-JSWSTEEL.NS
-JUBLFOOD.NS
-KALYANKJIL.NS
-KAYNES.NS
-KEI.NS
-KFINTECH.NS
-KOTAKBANK.NS
-KPITTECH.NS
-LAURUSLABS.NS
-LICHSGFIN.NS
-LICI.NS
-LODHA.NS
-LT.NS
-LTIM.NS
-LTF.NS
-LUPIN.NS
-M&M.NS
-MANAPPURAM.NS
-MANKIND.NS
-MARICO.NS
-MARUTI.NS
-MAXHEALTH.NS
-MAZDOCK.NS
-MCX.NS
-MFSL.NS
-MOTHERSON.NS
-MPHASIS.NS
-MRF.NS
-MUTHOOTFIN.NS
-NATIONALUM.NS
-NAUKRI.NS
-NBCC.NS
-NCC.NS
-NESTLEIND.NS
-NHPC.NS
-NMDC.NS
-NTPC.NS
-NUVAMA.NS
-NYKAA.NS
-OBEROIRLTY.NS
-OFSS.NS
-OIL.NS
-ONGC.NS
-PAGEIND.NS
-PATANJALI.NS
-PAYTM.NS
-PERSISTENT.NS
-PETRONET.NS
-PFC.NS
-PHOENIXLTD.NS
-PIDILITIND.NS
-PIIND.NS
-PNB.NS
-POLYCAB.NS
-POWERGRID.NS
-PRESTIGE.NS
-RBLBANK.NS
-RECLTD.NS
-RELIANCE.NS
-RVNL.NS
-SAIL.NS
-SBICARD.NS
-SBILIFE.NS
-SBIN.NS
-SHREECEM.NS
-SHRIRAMFIN.NS
-SIEMENS.NS
-SOLARINDS.NS
-SONACOMS.NS
-SRF.NS
-SUNPHARMA.NS
-SUPREMEIND.NS
-SUZLON.NS
-TATACONSUM.NS
-TATAELXSI.NS
-TATAPOWER.NS
-TATASTEEL.NS
-TATATECH.NS
-TCS.NS
-TECHM.NS
-TIINDIA.NS
-TITAGARH.NS
-TITAN.NS
-TORNTPHARM.NS
-TORNTPOWER.NS
-TRENT.NS
-TVSMOTOR.NS
-ULTRACEMCO.NS
-UNIONBANK.NS
-UNOMINDA.NS
-UPL.NS
-VBL.NS
-VEDL.NS
-VOLTAS.NS
-WIPRO.NS
-YESBANK.NS
-ZYDUSLIFE.NS"""
-        stxt=st.text_area("Stock symbols", value=default, height=100,
-                          label_visibility="collapsed")
-        stocks=[s.strip().upper() for s in stxt.split('\n') if s.strip()]
-        st.caption(f"**{len(stocks)}** stocks loaded")
+    st.divider()
 
-    st.markdown("---")
-    rb1,_=st.columns([2,5])
-    run_btn=rb1.button("▶️ RUN SCAN",use_container_width=True,type="primary")
-    st.markdown("---")
+    # ── CONFIG — only Mode + Cutoff ─────────────────────────────────────
+    st.markdown("### ⚙️ Settings")
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        mode    = st.radio("Mode", ["🔴 Live", "📅 Historical"], horizontal=True)
+        is_live = mode == "🔴 Live"
+
+    scan_date_input = None
+    with c2:
+        if not is_live:
+            scan_date_input = st.date_input("Historical Date", value=last_trading_day())
+        else:
+            tz  = pytz.timezone('Asia/Kolkata')
+            now = datetime.now(tz)
+            st.info(f"🕐 **{now.strftime('%H:%M:%S')}**  |  {now.strftime('%d-%b-%Y')}")
+            if not is_trading_day(now.date()):
+                st.warning("📅 Market holiday today.")
+            elif now.time() < dt_time(10, 30):
+                st.warning("⏰ Wait till 10:30 AM before scanning.")
+            else:
+                st.success("✅ Ready to scan!")
+
+    with c3:
+        cutoff_opt = st.radio(
+            "Data Cutoff", ["11:00 AM", "11:30 AM"], horizontal=True,
+            help="Data fetched ONLY up to this time, even if you run later."
+        )
+        cutoff_h = 11
+        cutoff_m = 0 if cutoff_opt == "11:00 AM" else 30
+
+    # ── STOCK LIST ────────────────────────────────────────────────────────
+    st.markdown("### 📋 Stocks to Scan")
+    fo_stocks = [
+        "360ONE","ABB","APLAPOLLO","AUBANK","ADANIENSOL","ADANIENT",
+        "ADANIGREEN","ADANIPORTS","ABCAPITAL","ALKEM","AMBER","AMBUJACEM",
+        "ANGELONE","APOLLOHOSP","ASHOKLEY","ASIANPAINT","ASTRAL",
+        "AUROPHARMA","DMART","AXISBANK","BSE","BAJAJ-AUTO","BAJFINANCE",
+        "BAJAJFINSV","BANDHANBNK","BANKBARODA","BANKINDIA","BDL","BEL",
+        "BHARATFORG","BHEL","BPCL","BHARTIARTL","BIOCON","BLUESTARCO",
+        "BOSCHLTD","BRITANNIA","CGPOWER","CANBK","CDSL","CHOLAFIN",
+        "CIPLA","COALINDIA","COFORGE","COLPAL","CAMS","CONCOR",
+        "CROMPTON","CUMMINSIND","CYIENT","DLF","DABUR","DALBHARAT",
+        "DELHIVERY","DIVISLAB","DIXON","DRREDDY","ETERNAL","EICHERMOT",
+        "EXIDEIND","NYKAA","FORTIS","GAIL","GMRAIRPORT","GLENMARK",
+        "GODREJCP","GODREJPROP","GRASIM","HCLTECH","HDFCAMC","HDFCBANK",
+        "HDFCLIFE","HFCL","HAVELLS","HEROMOTOCO","HINDALCO","HAL",
+        "HINDPETRO","HINDUNILVR","HINDZINC","POWERINDIA","HUDCO",
+        "ICICIBANK","ICICIGI","ICICIPRULI","IDFCFIRSTB","IIFL","ITC",
+        "INDIANB","IEX","IOC","IRCTC","IRFC","IREDA","IGL",
+        "INDUSTOWER","INDUSINDBK","NAUKRI","INFY","INOXWIND","INDIGO",
+        "JINDALSTEL","JSWENERGY","JSWSTEEL","JIOFIN","JUBLFOOD","KEI",
+        "KPITTECH","KALYANKJIL","KAYNES","KFINTECH","KOTAKBANK","LTF",
+        "LICHSGFIN","LTIM","LT","LAURUSLABS","LICI","LODHA","LUPIN",
+        "M&M","MANAPPURAM","MANKIND","MARICO","MARUTI","MFSL",
+        "MAXHEALTH","MAZDOCK","MPHASIS","MCX","MUTHOOTFIN","NBCC",
+        "NCC","NHPC","NMDC","NTPC","NATIONALUM","NESTLEIND","NUVAMA",
+        "OBEROIRLTY","ONGC","OIL","PAYTM","OFSS","POLICYBZR","PGEL",
+        "PIIND","PNBHOUSING","PAGEIND","PATANJALI","PERSISTENT",
+        "PETRONET","PIDILITIND","PPLPHARMA","POLYCAB","PFC","POWERGRID",
+        "PRESTIGE","PNB","RBLBANK","RECLTD","RVNL","RELIANCE",
+        "SBICARD","SBILIFE","SHREECEM","SRF","SAMMAANCAP","MOTHERSON",
+        "SHRIRAMFIN","SIEMENS","SOLARINDS","SONACOMS","SBIN","SAIL",
+        "SUNPHARMA","SUPREMEIND","SUZLON","SYNGENE","TATACONSUM",
+        "TITAGARH","TVSMOTOR","TCS","TATAELXSI","TATAPOWER","TATASTEEL",
+        "TATATECH","TECHM","FEDERALBNK","INDHOTEL","PHOENIXLTD","TITAN",
+        "TORNTPHARM","TORNTPOWER","TRENT","TIINDIA","UNOMINDA","UPL",
+        "ULTRACEMCO","UNIONBANK","UNITDSPR","VBL","VEDL","IDEA",
+        "VOLTAS","WIPRO","YESBANK","ZYDUSLIFE",
+        "HYUNDAI","SWIGGY","PREMIERENE",
+    ]
+
+    stocks_txt = st.text_area("Stocks (one per line)", value="\n".join(fo_stocks), height=80)
+    stocks = [s.strip().upper() for s in stocks_txt.split('\n') if s.strip()]
+    st.caption(f"**{len(stocks)}** stocks in scan universe.")
+
+    st.divider()
+
+    run_btn   = st.button("▶️ RUN SCAN", use_container_width=True, type="primary")
+    result_ph = st.empty()
 
     if run_btn:
         if not st.session_state['connected'] or not st.session_state['trade']:
             st.error("❌ Connect to Alice Blue first.")
         else:
-            trade=st.session_state['trade']
-            st.info(f"📡 Scanning **{len(stocks)} stocks** | **{scan_date}** | "
-                    f"**{n_candles} candles** (9:15→{'10:45' if n_candles==7 else '11:15'} AM)")
-            pb=st.progress(0); ptxt=st.empty(); slbl=st.empty()
+            trade = st.session_state['trade']
+            holiday_msg = None
 
-            bull,bear=run_scan(stocks,scan_date,scan_hour,scan_min,n_candles,
-                               trade,prog_bar=pb,prog_text=ptxt,sym_lbl=slbl)
-            pb.empty(); slbl.empty()
-
-            bt_stats=None
-            if not is_live and (bull or bear):
-                ptxt.text("🔬 Fetching EOD data for backtest...")
-                bull,bear,bt_stats=run_backtest(bull,bear,scan_date,trade)
-                ptxt.empty()
-
-            st.session_state['results']  =(bull,bear,scan_date,not is_live)
-            st.session_state['bt_stats'] =bt_stats
-
-    if st.session_state.get('results'):
-        bull,bear,res_date,is_hist=st.session_state['results']
-        bt=st.session_state.get('bt_stats')
-
-        if not bull and not bear:
-            st.warning(
-                f"⚠️ **No signals for {res_date}.** No stock had zero reversal candles "
-                f"AND was still at session extremes at scan time. "
-                f"This is correct — on choppy days there are no clean trend stocks. "
-                f"Try 29 May, 01 Jun, or any day when a stock had strong news/results.")
-        else:
-            st.markdown(f"### 📊 Results — {res_date}")
-            m1,m2,m3,m4=st.columns(4)
-            m1.metric("🟢 BUY",  len(bull))
-            m2.metric("🔴 SHORT",len(bear))
-            m3.metric("📊 Total",len(bull)+len(bear))
-            if bt:
-                w=bt['bw']+bt['sw']; t=bt['total']; wr=bt['wr']
-                m4.metric("✅ Win Rate",f"{wr}%",delta=f"{w}W/{t-w}L",
-                          delta_color="normal" if wr>=55 else "inverse")
+            if is_live:
+                today = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+                if is_trading_day(today):
+                    scan_date = today
+                else:
+                    scan_date = last_trading_day(today)
+                    holiday_msg = (f"📅 Today is a holiday. "
+                                   f"Scanning {scan_date.strftime('%d-%b-%Y')} instead.")
             else:
-                m4.metric("✅ Filters","All passed")
+                scan_date = scan_date_input
+                if not is_trading_day(scan_date):
+                    holiday_msg = (f"⚠️ {scan_date.strftime('%d-%b-%Y')} "
+                                   f"may be a holiday — data could be limited.")
 
-            if bt and bt['total']>0:
-                w=bt['bw']+bt['sw']; t=bt['total']; wr=bt['wr']
-                col="green" if wr>=60 else ("orange" if wr>=45 else "red")
-                st.markdown(
-                    f"<div style='padding:12px 18px;border-radius:8px;"
-                    f"border:1px solid #ddd;margin:8px 0;font-size:14px;'>"
-                    f"Backtest: <b style='color:{col}'>Win Rate {wr}%</b> "
-                    f"({w} wins/{t} trades) | "
-                    f"🟢 {bt['bw']}W {bt['bl']}L | 🔴 {bt['sw']}W {bt['sl_']}L"
-                    f"</div>",unsafe_allow_html=True)
+            prog = st.progress(0)
+            ptxt = st.empty()
 
-            st.markdown("---")
-            st.markdown("### 🟢 BUY — Enter at scan time · SL=morning low · 2R · Exit 3PM")
-            st.caption("All candles green · Still at session high · R²≥0.70 · Clean upslope")
-            render_signals(bull,is_hist,st.container())
+            def on_progress(done, total, sym):
+                pct = int(done / total * 100)
+                prog.progress(pct)
+                ptxt.text(f"⏳ {done}/{total}  ({pct}%)  ← {sym}")
 
-            st.markdown("---")
-            st.markdown("### 🔴 SHORT — Enter at scan time · SL=morning high · 2R · Exit 3PM")
-            st.caption("All candles red · Still at session low · R²≥0.70 · Clean downslope")
-            render_signals(bear,is_hist,st.container())
+            with st.spinner(f"Scanning {len(stocks)} stocks…"):
+                trend_bull, trend_bear, all_bull, all_bear, diag = run_scan(
+                    stocks, scan_date, cutoff_h, cutoff_m,
+                    trade, status_cb=on_progress
+                )
 
-            st.markdown("---")
+            prog.progress(100)
+            ptxt.text(
+                f"✅ Done — {len(trend_bull)} trending BUY  |  "
+                f"{len(trend_bear)} trending SHORT  |  "
+                f"{len(all_bull)+len(all_bear)} total movers"
+            )
+
+            bt_stats = None
+            if not is_live and (trend_bull or trend_bear):
+                with st.spinner("Checking actual EOD results…"):
+                    c2_, l2_ = {}, threading.Lock()
+                    trend_bull, trend_bear, bt_stats = verify_backtest(
+                        trend_bull, trend_bear, scan_date, trade, c2_, l2_
+                    )
+
+            st.session_state['results'] = (
+                trend_bull, trend_bear, all_bull, all_bear, diag,
+                scan_date, not is_live, holiday_msg, cutoff_opt
+            )
+            st.session_state['bt_stats'] = bt_stats
+
+    # ── SHOW RESULTS ──────────────────────────────────────────────────────
+    if st.session_state.get('results') is not None:
+        (trend_bull, trend_bear, all_bull, all_bear, diag,
+         scan_date, is_hist, holiday_msg, cutoff_opt) = st.session_state['results']
+        bt_stats = st.session_state.get('bt_stats')
+
+        if holiday_msg:
+            st.warning(holiday_msg)
+
+        with result_ph.container():
+            n_fail = sum(1 for v in diag.values() if v.startswith('FAILED'))
+            n_ok   = len(diag) - n_fail
+
+            st.markdown(f"## Results — {scan_date.strftime('%d %B %Y')}  |  Cutoff: {cutoff_opt}")
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("🟢 Trending BUY",   len(trend_bull))
+            m2.metric("🔴 Trending SHORT", len(trend_bear))
+            m3.metric("📈 All movers",     len(all_bull)+len(all_bear))
+            m4.metric("✅ Fetched OK",     f"{n_ok}/{n_ok+n_fail}")
+
+            if bt_stats and bt_stats['total'] > 0:
+                st.divider()
+                st.markdown("### 🔬 Backtest Result")
+                bc1,bc2,bc3,bc4,bc5,bc6 = st.columns(6)
+                bc1.metric("Trades",    bt_stats['total'])
+                bc2.metric("🟢 Buy Win", bt_stats['bw'])
+                bc3.metric("❌ Buy Loss",bt_stats['bl'])
+                bc4.metric("🟢 Sell Win",bt_stats['sw'])
+                bc5.metric("❌ Sell Loss",bt_stats['sl'])
+                bc6.metric("🏆 Win Rate", f"{bt_stats['win_rate']}%")
+
+            st.divider()
+
+            # ── TRENDING BUY ──
+            st.markdown(f"## 🟢 BULLISH TRENDING STOCKS — BUY  ({len(trend_bull)})")
+            st.caption(
+                f"R² ≥ {TREND_MIN_R2} and move ≥ +{TREND_MIN_MOVE_PCT}% since 9:15 AM, sorted by move. "
+                "Enter on breakout of 10:45–10:59 candle HIGH. Exit 3:00 PM."
+            )
+            if trend_bull:
+                st.markdown(build_table(trend_bull, is_bull=True, is_backtest=is_hist),
+                            unsafe_allow_html=True)
+            else:
+                st.info(
+                    "No bullish stock met the trend-consistency check today. "
+                    "Check **All Scanned Stocks** below to see how close any "
+                    "candidates were (their R² and Move% are shown there)."
+                )
+
+            st.divider()
+
+            # ── TRENDING SHORT ──
+            st.markdown(f"## 🔴 BEARISH TRENDING STOCKS — SHORT  ({len(trend_bear)})")
+            st.caption(
+                f"R² ≥ {TREND_MIN_R2} and move ≤ -{TREND_MIN_MOVE_PCT}% since 9:15 AM, sorted by move. "
+                "Enter on breakdown of 10:45–10:59 candle LOW. Exit 3:00 PM."
+            )
+            if trend_bear:
+                st.markdown(build_table(trend_bear, is_bull=False, is_backtest=is_hist),
+                            unsafe_allow_html=True)
+            else:
+                st.info(
+                    "No bearish stock met the trend-consistency check today. "
+                    "Check **All Scanned Stocks** below to see how close any "
+                    "candidates were (their R² and Move% are shown there)."
+                )
+
+            st.divider()
+
             st.markdown("""
-<div style="background:#F8F9FA;border-radius:10px;padding:14px 20px;
-     font-size:13px;line-height:1.9;border:1px solid #e0e0e0;">
-<b>📌 Trade Rules</b><br>
-⏰ Enter within 15 min of scan time · 🛑 Exit 3:00 PM hard ·
-❌ SL hit = exit immediately · 📊 Score≥70 = full size · 🚫 0 signals = skip day
-</div>""",unsafe_allow_html=True)
+### 📌 Trade Execution (Quick Reference)
 
-if __name__=="__main__":
+| | BUY | SHORT |
+|---|---|---|
+| **Candle** | 10:45–10:59 AM | Same |
+| **Entry** | Above candle HIGH | Below candle LOW |
+| **Stop Loss** | Candle LOW | Candle HIGH |
+| **Target** | 2× Risk extension | Same |
+| **Exit time** | 3:00 PM hard stop | Same |
+""")
+
+            st.divider()
+
+            # ── ALL SCANNED STOCKS (reference) ──
+            with st.expander(
+                f"📋 All Scanned Stocks — {len(all_bull)} up, {len(all_bear)} down "
+                f"(sorted by Move%, includes non-trending)",
+                expanded=False
+            ):
+                st.markdown("**All stocks that moved UP (Move% > 0)**")
+                st.markdown(build_table(all_bull, is_bull=True, show_trend_badge=True),
+                            unsafe_allow_html=True)
+                st.markdown("**All stocks that moved DOWN (Move% < 0)**")
+                st.markdown(build_table(all_bear, is_bull=False, show_trend_badge=True),
+                            unsafe_allow_html=True)
+
+            # ── DIAGNOSTICS ──
+            with st.expander(
+                f"🔧 Scan Diagnostics — {n_ok} OK, {n_fail} Failed",
+                expanded=(n_fail > 0)
+            ):
+                diag_rows = [{'Symbol': s, 'Status': diag[s]} for s in sorted(diag.keys())]
+                df_diag = pd.DataFrame(diag_rows)
+
+                fails_only = st.checkbox("Show only failed stocks", value=(n_fail > 0))
+                if fails_only:
+                    df_diag = df_diag[df_diag['Status'].str.startswith('FAILED')]
+
+                st.dataframe(df_diag, use_container_width=True, height=400)
+
+                if n_fail > 0:
+                    st.markdown("""
+**Common reasons & fixes:**
+- `instrument not found on Alice Blue` → symbol name doesn't match Alice Blue's master.
+- `API returned empty list` → no data for that stock in this window.
+- `too few candles` → market may not have opened yet, or stock is illiquid pre-cutoff.
+- `no candles found for previous day` → previous trading day calc may be off for new listings.
+""")
+
+
+if __name__ == "__main__":
     main()
