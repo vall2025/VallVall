@@ -1,50 +1,55 @@
 # =============================================================================
-# EOD TREND SCANNER v5 — Alice Blue | NSE F&O Stocks
+# NSE F&O Momentum Scanner v2 — MRTQ Enhanced
 # =============================================================================
 #
-#  WHY v5 EXISTS
+#  MRTQ v2: Momentum Rank with Trend Quality — Enhanced
+#  ──────────────────────────────────────────────────────────────────────────
+#  Objective: Identify Top Gainer Bullish / Top Loser Bearish F&O stocks
+#  at 11:00–11:45 AM that continue trending strongly until EOD.
+#
+#  WHAT CHANGED FROM MRTQ v1
+#  ──────────────────────────────────────────────────────────────────────────
+#  v1 Condition               v2 Improvement
 #  ─────────────────────────────────────────────────────────────────────────
-#  v4 removed ALL filters → every single stock that was even +0.05% up
-#  appeared in the BUY list, and every stock -0.05% down appeared in SHORT.
-#  That's 100+ stocks in each list — useless for picking real trades.
+#  1. Move % from Prev Close  → KEPT (primary signal, unchanged)
+#  2. Candle Direction %      → UPGRADED to Candle Body Strength Score
+#                               (quality of candles, not just green/red count)
+#  3. Trend Persistence %     → UPGRADED to Trend Efficiency Ratio (TER)
+#                               (measures how straight the move is, not just
+#                               how many closes are in trend direction)
+#  4. Relative Volume         → UPGRADED to Same-Window RVOL
+#                               (compares same time-window vs historical,
+#                               not time-fraction of daily volume)
 #
-#  Your requirement is "specific TRENDING stocks" — stocks that have moved
-#  in a clean, consistent direction since 9:15 AM (like your sample stocks:
-#  SOLARINDS, YESBANK, HYUNDAI, M&M etc. on their respective days), not
-#  stocks that are just randomly flickering up or down by a few paise.
+#  NEW CONDITIONS ADDED
+#  ──────────────────────────────────────────────────────────────────────────
+#  5. Momentum State          → Is buying/selling pressure sustaining?
+#                               Rejects stocks that spiked early and stalled.
+#  6. Shadow Quality          → Are opposing wicks rejecting the trend?
+#                               Long upper wicks in bullish = selling at highs.
+#                               Long lower wicks in bearish = buying at lows.
+#                               Both are early EOD-reversal signals.
 #
-#  WHAT v5 DOES DIFFERENTLY
-#  ─────────────────────────────────────────────────────────────────────────
-#  Two BUILT-IN checks (fixed in the code, NOT sliders, NOT user-adjustable)
-#  decide whether a stock is "trending":
+#  NEW RANKING METHOD
+#  ──────────────────────────────────────────────────────────────────────────
+#  v1: Ranked by Move% only
+#  v2: Ranked by EOD Continuation Score (0–100 composite) then Move%
+#      Score = Move%(30) + TER(25) + RVOL(20) + BodyStr(15) + Momentum(10)
+#      This surfaces the stock with the highest EOD continuation probability,
+#      not just the biggest early mover.
 #
-#    1. TREND CONSISTENCY (R² ≥ 0.55)
-#       Fit a straight line to the 5-min closes from 9:15 AM to cutoff.
-#       R² close to 1.0 = price moved in a clean line (trending).
-#       R² close to 0   = price moved randomly up/down (choppy/flat).
-#       A truly flat or noisy stock will have R² well below 0.55.
-#       A stock that opened low and climbed steadily to 11 AM (or opened
-#       high and fell steadily) will have R² well above 0.55.
+#  DATA FETCHING (from reference EOD_Trend_Scanner_v8)
+#  ──────────────────────────────────────────────────────────────────────────
+#  Uses TradeMaster.TradeSync TradeHub — same API as your existing scripts.
+#  Fetches 1-min data (resolution="1"), resamples to 15-min anchored 9:15AM.
+#  One wide API call per stock, reused for all metrics.
+#  Same sliding-window rate limiter + retry-with-backoff infrastructure.
+#  History reduced to 15 calendar days (no EMA warmup needed) → faster scan.
 #
-#    2. MEANINGFUL MOVE (≥ 0.3%)
-#       Total Move % must be at least 0.3% in magnitude. This removes
-#       stocks that are technically "positive" or "negative" by 0.02%
-#       (pure noise) but still pass the R² check by coincidence on very
-#       few candles.
-#
-#  A stock must pass BOTH checks to appear in the BUY / SHORT lists.
-#  These numbers are fixed constants at the top of the file — change them
-#  there if you want to loosen/tighten, but there is nothing to configure
-#  in the UI.
-#
-#  Every stock — trending or not — is still visible in the
-#  "📋 All Scanned Stocks" expander at the bottom, sorted by Total Move %,
-#  along with full diagnostics (why any stock failed to fetch).
-#
-#  ENTRY / SL / TARGET (your Fibonacci candle strategy — unchanged)
-#    Reference candle = 10:45–10:59 AM
-#    BUY  : Entry = high of that candle | SL = low  | Target = Entry + 2×Risk
-#    SHORT: Entry = low  of that candle | SL = high | Target = Entry − 2×Risk
+#  CUTOFF RULE (unchanged)
+#  ──────────────────────────────────────────────────────────────────────────
+#  to_dt = cutoff_dt is passed directly to the API — no candle after the
+#  selected cutoff is ever used. Applies identically to Live and Historical.
 #
 # =============================================================================
 
@@ -68,20 +73,147 @@ from datetime import datetime, timedelta, time as dt_time
 import time
 import json
 import threading
+import collections
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import gc
 
 # =============================================================================
-# CONSTANTS — fixed, not exposed in UI
+# CONSTANTS
 # =============================================================================
 CREDS_FILE   = os.path.join(os.path.expanduser('~'), 'alice_creds.json')
 RR_RATIO     = 2.0
-MAX_WORKERS  = 20
 DEBUG        = False
 
-# ── TREND QUALIFICATION (the only "filter" in this script) ─────────────────
-TREND_MIN_R2       = 0.55   # consistency of the move (0=random, 1=straight line)
-TREND_MIN_MOVE_PCT = 0.3    # minimum % move to be considered a real trend
+# ── Candle timeframe ─────────────────────────────────────────────────────────
+CANDLE_MIN   = 15        # 15-min candles, anchored at 9:15 AM
+MIN_CANDLES  = 4         # minimum candles needed for any metric
+
+# ── MRTQ v2 qualifying thresholds (all conditions must pass) ─────────────────
+MIN_MOVE_PCT   = 0.5     # % move from prev close (Condition 1)
+MIN_GREEN_PCT  = 0.55    # min fraction of green/red candles (Condition 2)
+MIN_BODY_STR   = 0.35    # min avg body-to-range ratio of directional candles (Condition 2 upgrade)
+MIN_TER        = 0.45    # min Trend Efficiency Ratio (Condition 3 upgrade)
+MIN_RVOL       = 1.2     # min same-window RVOL (Condition 4 upgrade)
+MIN_MOMENTUM   = 0.20    # min momentum ratio — second half >= 20% of first half (Condition 5)
+MAX_SHADOW_RATIO = 1.20  # max opposing shadow / avg body ratio (Condition 6)
+
+# ── EOD Score weights (must sum to 100) ──────────────────────────────────────
+# Weights redistributed to:
+#   (a) give quality metrics more influence than raw price move
+#   (b) incorporate three new components: PBQ, LRS, TMS
+#   (c) add Shadow Quality to the score (was gate-only before)
+W_MOVE   = 22   # weight: move magnitude   (reduced — raw move ≠ continuation)
+W_TER    = 20   # weight: trend efficiency (unchanged core predictor)
+W_RVOL   = 18   # weight: volume quality   (unchanged — institutional confirms)
+W_BODY   = 10   # weight: candle body str  (reduced — PBQ now captures this better)
+W_MOMEN  = 10   # weight: momentum state
+W_SHADOW =  6   # weight: shadow quality   (NEW in score — was gate-only before)
+W_PBQ    =  8   # weight: pullback quality (NEW — shallow pullbacks = continuation)
+W_LRS    =  4   # weight: LR slope score   (NEW — trend steepness × fit quality)
+W_TMS    =  2   # weight: trend maturity   (NEW — penalise overextended moves)
+# Sum: 22+20+18+10+10+6+8+4+2 = 100
+
+# ── History / RVOL ───────────────────────────────────────────────────────────
+FETCH_LOOKBACK_DAYS = 8    # 8 calendar days covers 5 trading days for RVOL + 1 prev close
+RVOL_LOOKBACK       = 5    # trading days for same-window volume baseline
+
+# ── API reliability ───────────────────────────────────────────────────────────
+MAX_WORKERS       = 8      # 8 workers — safe with direct _api_call (no pool saturation)
+REQUESTS_PER_SEC  = 8      # 8 RPS — direct calls handle this safely
+MAX_FETCH_RETRIES = 2      # 2 retries — fast-fail on permanent errors
+RETRY_BACKOFF     = [0.5, 1.5]   # shorter backoff = faster scan
+
+# Try NSE first, then BSE; also expand common symbol suffix forms.
+EXCHANGE_ORDER = [Exchange.NSE, Exchange.BSE]
+SYMBOL_SUFFIXES = {
+    # '-EQ' is the standard Alice Blue format for NSE equity stocks.
+    # It goes FIRST so we find the correct instrument in one API call
+    # instead of wasting a failed attempt on the bare name first.
+    Exchange.NSE: ['-EQ', '', '-BE', '.NS'],
+    Exchange.BSE: ['-EQ', '', '-BE', '.BSE'],
+}
+
+# ── Symbol name map: NSE official → Alice Blue internal name ─────────────────
+# Some symbols in NSE's F&O list have different names inside Alice Blue.
+# This map is checked FIRST, before any variant generation or API call.
+# Add entries here whenever you encounter a symbol that consistently fails.
+# ── Symbol name map ──────────────────────────────────────────────────────────
+# Maps NSE official symbol → Alice Blue internal name.
+# Each entry is a list so multiple candidates are tried in order.
+# Add entries here whenever you find a symbol that consistently fails.
+SYMBOL_MAP = {
+    # Special characters
+    'M&M'         : ['M&M',         'MM'],
+    'GVT&D'       : ['GVT&D',       'GVTD',        'GVT'],
+
+    # Hyphenated symbols
+    'BAJAJ-AUTO'  : ['BAJAJ-AUTO',  'BAJAJAUTO'],
+    'NAM-INDIA'   : ['NAM-INDIA',   'NAMINDIA',    'NAМИНDIA'],
+
+    # Zomato rebranded to Eternal in 2025; Alice Blue may use either name
+    'ETERNAL'     : ['ETERNAL',     'ZOMATO'],
+
+    # Tata Motors DVR — exact Alice Blue name varies by version
+    'TMPV'        : ['TATAMTRDVR',  'TATAMOTORS-DVR', 'TATAMTRDVREQ', 'TATAMOTDVR'],
+
+    # LTI Mindtree — listed as LTIM on NSE but some versions use LTM
+    'LTM'         : ['LTIM',        'LTM',         'LTIMINDTREE'],
+
+    # Motilal Oswal Financial Services
+    'MOTILALOFS'  : ['MOTILALOFIN', 'MOTILALOFS',  'MOFSL'],
+
+    # Vishal Mega Mart
+    'VMM'         : ['VMM',         'VISHAL',      'VISHALMEGAMART'],
+
+    # Jio Financial Services
+    'JIOFIN'      : ['JIOFIN',      'JIOFINANCE',  'JIOFINSVC'],
+
+    # Hitachi Energy India (formerly ABB Power Products India)
+    'POWERINDIA'  : ['POWERINDIA',  'HITACHIENER', 'ABBPOWER'],
+
+    # Amber Enterprises India
+    'AMBER'       : ['AMBERENTER',  'AMBER',       'AMBERENT'],
+
+    # Godfrey Phillips — Alice Blue may use shorter form
+    'GODFRYPHLP'  : ['GODFRYPHLP',  'GODFREYPHIL', 'GODFREY'],
+
+    # Mazagon Dock Shipbuilders
+    'MAZDOCK'     : ['MAZDOCK',     'MAZAGONDOCK', 'MAZGONDOCK'],
+
+    # Cochin Shipyard
+    'COCHINSHIP'  : ['COCHINSHIP',  'COCHIN',      'CSHL'],
+
+    # Force Motors
+    'FORCEMOT'    : ['FORCEMOT',    'FORCEMOTOR',  'FORCEMOTORS'],
+
+    # PG Electroplast
+    'PGEL'        : ['PGEL',        'PGELECTROPL', 'PGELECT'],
+
+    # Kaynes Technology
+    'KAYNES'      : ['KAYNES',      'KAYNESTEC',   'KAYNESTECH'],
+
+    # Radico Khaitan
+    'RADICO'      : ['RADICO',      'RADICOKH',    'RADIKHAI'],
+
+    # Waaree Energies
+    'WAAREEENER'  : ['WAAREEENER',  'WAAREE',      'WAAREEEN'],
+
+    # Patanjali Foods
+    'PATANJALI'   : ['PATANJALI',   'PATANJALIF',  'PATFOODS'],
+
+    # Nuvama Wealth Management
+    'NUVAMA'      : ['NUVAMA',      'NUVAMAWEALTH','EDELWEISS'],
+
+    # Rail Vikas Nigam
+    'RVNL'        : ['RVNL',        'RAILVIKAS'],
+
+    # BDL — Bharat Dynamics
+    'BDL'         : ['BDL',         'BHARATDYN'],
+
+    # Standard entries (stored same in Alice Blue)
+    'LICI'        : ['LICI'],
+    'ADANIGREEN'  : ['ADANIGREEN'],
+    'ADANIPOWER'  : ['ADANIPOWER'],
+}
 
 os.environ["TZ"] = "Asia/Kolkata"
 try:
@@ -124,47 +256,377 @@ def prev_trading_days(d, n):
     return result
 
 # =============================================================================
-# DATA FETCH  (proven method — DO NOT MODIFY)
+# RATE LIMITER — sliding window (same as reference EOD_Trend_Scanner_v8)
 # =============================================================================
-def fetch_1min(sym, from_dt, to_dt, trade, cache, lock, retry=False):
-    """Returns (df, error_reason). df is None on failure."""
+_rate_lock = threading.Lock()
+_req_times = collections.deque()
+
+def _throttle():
+    while True:
+        with _rate_lock:
+            now = time.time()
+            while _req_times and now - _req_times[0] > 1.0:
+                _req_times.popleft()
+            if len(_req_times) < REQUESTS_PER_SEC:
+                _req_times.append(now)
+                return
+            wait = 1.0 - (now - _req_times[0])
+        if wait > 0:
+            time.sleep(wait)
+
+# =============================================================================
+# TIMEOUT EXECUTOR  (Fix 2: every broker call gets a hard wall-clock timeout)
+# Previously a single hung call blocked ALL workers via the api_lock indefinitely.
+# =============================================================================
+# API CALL WRAPPER  — direct call, NO thread pool, NO saturation risk
+# =============================================================================
+# Root cause of 182/210 failures:
+#   _API_EXEC = ThreadPoolExecutor(max_workers=30)
+#   10 scan workers × 6 variants × 2 exchanges = up to 60 concurrent tasks.
+#   Pool saturates after 30.  Remaining tasks queue.  fut.result(timeout=12)
+#   fires and the scan worker moves on — but the task KEEPS RUNNING in the
+#   pool thread.  Within ~3 scan rounds ALL 30 pool threads are stuck on
+#   abandoned tasks.  Every subsequent API call then times out instantly.
+#
+# Fix: call the API directly — no inner executor, no saturation.
+#   The rate limiter (_throttle) already controls frequency correctly.
+#   Alice Blue's SDK has its own TCP timeout built in.
+def _api_call(fn):
+    """Execute fn() directly. Returns (result, error_msg)."""
     try:
-        sym_clean = sym.replace('.NS','').replace('.BSE','').strip()
+        return fn(), None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _is_retryable(err: str) -> bool:
+    """
+    Classify whether an error is worth retrying.
+
+    Non-retryable (fail fast — retrying wastes seconds per stock):
+        instrument not found, missing columns, unrecognised response type
+
+    Retryable (transient — try again with backoff):
+        timeout, network reset, empty response, generic API errors
+    """
+    if not err:
+        return True
+    e = err.lower()
+    if 'instrument lookup failed' in e:   return False   # symbol not in broker DB
+    if 'missing columns' in e:            return False   # permanent schema issue
+    if 'unrecognised response type' in e: return False   # permanent API contract issue
+    return True   # timeout / empty / network → worth retrying
+
+
+# =============================================================================
+# INSTRUMENT MASTER PRE-FETCH
+# =============================================================================
+# Root cause of remaining fetch failures:
+#   trade.get_instrument(exchange, symbol) requires the EXACT Alice Blue symbol
+#   name. 66 stocks fail because their Alice Blue name differs from the NSE
+#   official symbol (e.g. company renamed, suffix required, different format).
+#
+# Fix:  Download Alice Blue's complete instrument list ONCE before the scan.
+#       Then every stock lookup is an O(1) local dict search — no per-stock
+#       API call needed. We normalize all keys so symbol-format mismatches
+#       are handled automatically.
+# =============================================================================
+
+def _normalise_sym(s: str) -> str:
+    """Normalise a symbol string for fuzzy matching."""
+    s = str(s).strip().upper()
+    for sfx in ('-EQ', '-BE', '-SM', '-IL', '-BL', '.NS', '.BSE', '-N', '-B'):
+        if s.endswith(sfx):
+            s = s[:-len(sfx)]
+            break
+    return s.replace(' ', '').replace('-', '').replace('&', 'AND').replace('.', '')
+
+
+def _store_master_entry(master, exch, inst):
+    """
+    Add one instrument to the master dict under every key variant.
+    Called from prefetch_instrument_master() for each instrument record.
+    """
+    raw_sym = None
+    for attr in ('symbol', 'Symbol', 'tradingsymbol',
+                 'scripShortName', 'name', 'Name', 'scrip'):
+        if hasattr(inst, attr):
+            raw_sym = getattr(inst, attr)
+        elif isinstance(inst, dict):
+            raw_sym = inst.get(attr)
+        if raw_sym:
+            break
+    if not raw_sym:
+        return
+
+    raw_sym = str(raw_sym).strip().upper()
+
+    # Store under exact name
+    master[(exch.name, raw_sym)] = (exch, inst)
+
+    # Store under normalised base (strips -EQ, -BE, hyphens, spaces, &→AND)
+    norm = _normalise_sym(raw_sym)
+    if (exch.name, norm) not in master:
+        master[(exch.name, norm)] = (exch, inst)
+
+    # Extra: if name has -EQ, also store without it explicitly
+    for sfx in ('-EQ', '-BE', '-SM', '-BL'):
+        if raw_sym.endswith(sfx):
+            bare = raw_sym[:-len(sfx)]
+            if (exch.name, bare) not in master:
+                master[(exch.name, bare)] = (exch, inst)
+
+
+def prefetch_instrument_master(trade, cache, cache_lock, timeout_sec=90):
+    """
+    Download ALL NSE/BSE instruments from Alice Blue and store them in
+    cache['__MASTER__'] for O(1) lookups during the scan.
+
+    Tries every known TradeHub / Alice Blue API method for fetching the
+    scrip master — different library versions expose different names.
+
+    Returns the number of instruments loaded (0 = none worked, fallback
+    to per-symbol get_instrument() calls — this is what shows the
+    "Master unavailable" warning in the UI).
+    """
+    master = {}
+
+    for exch in [Exchange.NSE, Exchange.BSE]:
+        result = None
+
+        # ── Try every known method / attribute name ───────────────────────
+        candidates = [
+            # Method calls (most common)
+            lambda e=exch: trade.get_all_instruments(exchange=e),
+            lambda e=exch: trade.get_all_instruments(e),
+            lambda e=exch: trade.get_master_contract(exchange=e),
+            lambda e=exch: trade.get_master_contract(e),
+            lambda e=exch: trade.get_instrument_list(exchange=e),
+            lambda e=exch: trade.get_instrument_list(e),
+            lambda e=exch: trade.get_all_scrip(exchange=e),
+            lambda e=exch: trade.scripmaster(exchange=e),
+        ]
+        # Attribute access (no call)
+        attr_names = ('master', 'scripmaster', 'master_contract',
+                      'instruments', 'all_instruments')
+
+        for fn in candidates:
+            if result:
+                break
+            try:
+                result = fn()
+                if not result:
+                    result = None
+            except Exception:
+                result = None
+            except Exception:
+                result = None
+
+        if not result:
+            for attr in attr_names:
+                try:
+                    val = getattr(trade, attr, None)
+                    if callable(val):
+                        val = val()
+                    if val:
+                        result = val
+                        break
+                except Exception:
+                    pass
+
+        if not result:
+            continue   # this exchange not available — try next
+
+        instruments = result if isinstance(result, (list, tuple)) else [result]
+        for inst in instruments:
+            _store_master_entry(master, exch, inst)
+
+    with cache_lock:
+        cache['__MASTER__'] = master
+
+    return len(master)
+
+
+def _lookup_in_master(master, base_variants):
+    """
+    Search the pre-fetched master for any of the provided base variants.
+    Tries exact names, normalised keys, and truncated prefix matches.
+    Returns (exchange_enum, instrument_object) or (None, None).
+    """
+    if not master:
+        return None, None
+
+    for exch_name in ('NSE', 'BSE'):
+        for b in base_variants:
+            b_up = b.upper()
+            # 1. Exact match with standard Alice Blue suffixes
+            for suffix in ('-EQ', '', '-BE', '-SM', '-BL'):
+                key = (exch_name, b_up + suffix)
+                if key in master:
+                    return master[key]
+            # 2. Normalised match (handles &, hyphens, spaces, suffix stripping)
+            norm = _normalise_sym(b_up)
+            key  = (exch_name, norm)
+            if key in master:
+                return master[key]
+
+    return None, None
+
+
+
+# =============================================================================
+# DATA FETCH — 1-min resolution (same methodology as reference)
+# =============================================================================
+def _fetch_1min_attempt(sym, from_dt, to_dt, trade, cache, cache_lock):
+    # NOTE: api_lock removed — it was serialising all 5 workers to 1 at a time.
+    # The rate limiter (_throttle) already handles concurrency correctly.
+    """Single fetch attempt. Returns (df, error_string)."""
+    try:
+        # Build a set of candidate base symbols (handle punctuation, hyphens, ampersand, common variants)
+        orig = (sym or '').strip()
+        if not orig:
+            return None, "instrument lookup failed: empty symbol"
+
+        up = orig.upper()
+        # common base (strip typical NSE/BSE suffixes if present)
+        base = up.replace('.NS', '').replace('.BSE', '')
+
+        # ── Build candidate base names from SYMBOL_MAP + variants ─────────────
+        # SYMBOL_MAP values are now lists of candidates (ordered best-first).
+        # For each candidate we also generate derived variants.
+        mapped_list = SYMBOL_MAP.get(orig.upper())
+        if mapped_list:
+            candidates = [c.strip().upper() for c in mapped_list if c]
+        else:
+            candidates = [base]
+        # Always include the original symbol as a final fallback
+        candidates.append(orig.upper())
+
+        base_variants = set()
+        for cand in candidates:
+            base_variants.add(cand)
+            base_variants.add(cand.replace('-', ''))       # BAJAJ-AUTO → BAJAJAUTO
+            base_variants.add(cand.replace('&', 'AND'))    # M&M → MANDM
+            base_variants.add(cand.replace('&', ''))       # GVT&D → GVTD
+            base_variants.add(cand.replace(' ', ''))       # trailing spaces
+            base_variants.add(cand.replace('.', ''))       # dots
+        base_variants = {v for v in base_variants if v}
+
+        # Use first candidate as 'base' for cache-key labelling
+        base = candidates[0]
 
         inst = None
-        with lock:
-            if sym in cache:
-                inst = cache[sym]
+        lookup_error = None
+        attempts = []
+
+        # ── FAST PATH 1: per-symbol cache (no API call) ──────────────────────
+        with cache_lock:
+            for exch in EXCHANGE_ORDER:
+                for suffix in SYMBOL_SUFFIXES[exch]:
+                    for b in base_variants:
+                        ck = f"{exch.name}:{b + suffix}"
+                        if ck in cache and ck != '__MASTER__':
+                            inst = cache[ck]
+                            break
+                    if inst is not None:
+                        break
+                if inst is not None:
+                    break
+
+        # ── FAST PATH 2: pre-fetched instrument master (O(1) dict lookup) ──────
+        # Resolves symbol-name mismatches without any extra API call.
+        # Alice Blue may store "M&M-EQ" while our list has "M&M" — master handles it.
+        if inst is None:
+            master = cache.get('__MASTER__', {})
+            if master:
+                _exch, inst = _lookup_in_master(master, base_variants)
+                if inst is not None:
+                    with cache_lock:
+                        cache[f"{_exch.name}:{base}"] = inst
+
+        # ── SLOW PATH A: per-symbol get_instrument() API call ─────────────────
+        # Only reached when master dict is unavailable (older TradeHub builds).
+        if inst is None:
+            for exch in EXCHANGE_ORDER:
+                for suffix in SYMBOL_SUFFIXES[exch]:
+                    for b in base_variants:
+                        cand_sym = b + suffix
+                        cache_key = f"{exch.name}:{cand_sym}"
+                        attempts.append(cache_key)
+                        _throttle()
+                        inst, _lerr = _api_call(
+                            lambda _e=exch, _s=cand_sym: trade.get_instrument(exchange=_e, symbol=_s)
+                        )
+                        if _lerr:
+                            lookup_error = _lerr
+                            inst = None
+                        if isinstance(inst, dict) and inst.get('stat') == 'Not_ok':
+                            lookup_error = inst.get('emsg', 'Not_ok')
+                            inst = None
+                        if inst:
+                            with cache_lock:
+                                cache[cache_key] = inst
+                            break
+                    if inst is not None:
+                        break
+                if inst is not None:
+                    break
+
+        # ── SLOW PATH B: search_instruments() fuzzy fallback ──────────────────
+        # Final resort: Alice Blue's search API does partial/fuzzy matching and
+        # can find stocks that exact get_instrument() calls miss.
+        if inst is None:
+            for exch in EXCHANGE_ORDER:
+                try:
+                    _throttle()
+                    results, _serr = _api_call(
+                        lambda _e=exch, _b=base: trade.search_instruments(
+                            exchange=_e, symbol=_b
+                        )
+                    )
+                    if not _serr and results and isinstance(results, list):
+                        best = None
+                        best_score = -1
+                        for r in results:
+                            rsym = str(getattr(r, 'symbol', '') or
+                                       (r.get('symbol', '') if isinstance(r, dict) else '')).upper()
+                            norm_r    = _normalise_sym(rsym)
+                            norm_base = _normalise_sym(base)
+                            if norm_r == norm_base:
+                                best = r; best_score = 2; break
+                            if norm_base in norm_r and 1 > best_score:
+                                best = r; best_score = 1
+                        if best:
+                            inst = best
+                            with cache_lock:
+                                cache[f"{exch.name}:{base}"] = inst
+                            break
+                except Exception:
+                    pass  # search_instruments not supported — silent skip
 
         if inst is None:
-            try:
-                inst = trade.get_instrument(exchange=Exchange.NSE, symbol=sym_clean)
-                if inst:
-                    with lock:
-                        cache[sym] = inst
-            except Exception as e:
-                return None, f"instrument lookup error: {e}"
+            err_text = lookup_error or 'not found via master, get_instrument, or search_instruments'
+            return None, f"instrument lookup failed for '{sym}' (tried: {attempts[:6]}; {err_text})"
 
-        if inst is None:
-            return None, "instrument not found on Alice Blue"
-
-        result = None
-        try:
-            result = trade.get_HistoricalData(
+        _throttle()
+        result, _ferr = _api_call(
+            lambda: trade.get_HistoricalData(
                 instrument=inst,
                 resolution="1",
                 from_datetime=from_dt,
                 to_datetime=to_dt,
-                indices=False
+                indices=False,
             )
-        except Exception as e:
-            return None, f"API call error: {e}"
+        )
+        if _ferr:
+            return None, f"API call error: {_ferr}"
 
+        # ── Normalise response ───────────────────────────────────────────────
         df = None
         if isinstance(result, list) and result:
             df = pd.DataFrame(result)
         elif isinstance(result, list) and not result:
-            return None, "API returned empty list (no candles)"
+            return None, "API returned empty list"
         elif isinstance(result, dict) and result.get('stat') == 'Ok':
             df = pd.DataFrame(result.get('data', []))
         elif isinstance(result, pd.DataFrame):
@@ -173,20 +635,21 @@ def fetch_1min(sym, from_dt, to_dt, trade, cache, lock, retry=False):
             try:
                 df = pd.DataFrame(result)
             except Exception:
-                return None, f"unrecognised API response type: {type(result).__name__}"
+                return None, f"unrecognised response type: {type(result).__name__}"
 
         if df is None or df.empty:
             return None, "empty dataframe from API"
 
+        # ── Column rename ────────────────────────────────────────────────────
         col_map = {}
         for col in df.columns:
             cl = col.lower().strip()
-            if cl == 'datetime':                    col_map[col] = 'datetime'
-            elif cl in ('open','o'):                col_map[col] = 'Open'
-            elif cl in ('high','h'):                col_map[col] = 'High'
-            elif cl in ('low','l'):                 col_map[col] = 'Low'
-            elif cl in ('close','c'):               col_map[col] = 'Close'
-            elif cl in ('volume','vol','v'):        col_map[col] = 'Volume'
+            if   cl == 'datetime':           col_map[col] = 'datetime'
+            elif cl in ('open','o'):         col_map[col] = 'Open'
+            elif cl in ('high','h'):         col_map[col] = 'High'
+            elif cl in ('low','l'):          col_map[col] = 'Low'
+            elif cl in ('close','c'):        col_map[col] = 'Close'
+            elif cl in ('volume','vol','v'): col_map[col] = 'Volume'
         df = df.rename(columns=col_map)
 
         required = ['Open','High','Low','Close','Volume']
@@ -197,6 +660,7 @@ def fetch_1min(sym, from_dt, to_dt, trade, cache, lock, retry=False):
             df['datetime'] = pd.to_datetime(df['datetime'])
             df = df.set_index('datetime')
 
+        # ── Timezone handling ─────────────────────────────────────────────────
         tz_str = 'Asia/Kolkata'
         try:
             if df.index.tzinfo is None:
@@ -217,14 +681,9 @@ def fetch_1min(sym, from_dt, to_dt, trade, cache, lock, retry=False):
         df = df.dropna(subset=['Open','High','Low','Close'])
 
         if df.empty:
-            return None, "all rows dropped after cleaning (NaN OHLC)"
-
-        if len(df) < 5 and not retry:
-            time.sleep(0.3)
-            return fetch_1min(sym, from_dt, to_dt, trade, cache, lock, retry=True)
-
+            return None, "all rows dropped after cleaning"
         if len(df) < 5:
-            return None, f"too few candles after retry: {len(df)}"
+            return None, f"too few 1-min bars: {len(df)}"
 
         return df, None
 
@@ -234,10 +693,24 @@ def fetch_1min(sym, from_dt, to_dt, trade, cache, lock, retry=False):
             print(f"[FETCH ERR] {sym}: {e}\n{traceback.format_exc()}")
         return None, f"unexpected error: {e}"
 
-# =============================================================================
-# RESAMPLE 1-MIN → 5-MIN  (anchored at 9:15 AM)
-# =============================================================================
-def to_5min(df):
+
+def fetch_1min(sym, from_dt, to_dt, trade, cache, cache_lock):
+    """Fetch with retry-and-backoff (smart: non-retryable errors fail fast)."""
+    last_err = "unknown"
+    for attempt in range(MAX_FETCH_RETRIES):
+        df, err = _fetch_1min_attempt(sym, from_dt, to_dt, trade, cache, cache_lock)
+        if df is not None:
+            return df, None
+        last_err = err or "unknown"
+        if not _is_retryable(last_err):
+            break   # instrument not found / schema issue — retrying is pointless
+        if attempt < MAX_FETCH_RETRIES - 1:
+            time.sleep(RETRY_BACKOFF[attempt])
+    return None, f"{last_err} (after {attempt+1} attempts)"
+
+
+def to_Nmin(df, n_min):
+    """Resample 1-min DataFrame to n-min, anchored at 9:15 AM."""
     if df is None or df.empty:
         return pd.DataFrame()
     try:
@@ -249,8 +722,11 @@ def to_5min(df):
         if df.empty:
             return pd.DataFrame()
         out = df[['Open','High','Low','Close','Volume']].resample(
-            '5min', origin='start_day', offset='9h15min',
-            label='left', closed='left'
+            f'{n_min}min',
+            origin='start_day',
+            offset='9h15min',
+            label='left',
+            closed='left'
         ).agg({'Open':'first','High':'max','Low':'min',
                'Close':'last','Volume':'sum'})
         return out[out['Close'].notna()].copy()
@@ -258,208 +734,588 @@ def to_5min(df):
         return pd.DataFrame()
 
 # =============================================================================
-# HELPERS
+# MRTQ v2 — METRIC COMPUTATION
 # =============================================================================
-def calc_vwap(df):
-    try:
-        if df.empty:
-            return pd.Series(dtype=float, index=df.index)
-        tp  = (df['High'] + df['Low'] + df['Close']) / 3.0
-        vol = df['Volume'].clip(lower=0)
-        return ((tp * vol).cumsum() / vol.cumsum().replace(0, np.nan)).rename('VWAP')
-    except Exception:
-        return pd.Series(dtype=float, index=df.index)
+def compute_mrtq_metrics(df15_today: pd.DataFrame) -> dict:
+    """
+    Compute all six MRTQ v2 metrics from today's 15-min candles up to cutoff.
+
+    Parameters
+    ----------
+    df15_today : DataFrame with columns Open/High/Low/Close/Volume,
+                 already filtered to the cutoff window.
+
+    Returns
+    -------
+    dict of all raw metric values, or None if data insufficient.
+    """
+    n = len(df15_today)
+    if n < MIN_CANDLES:
+        return None
+
+    opens  = df15_today['Open'].values.astype(float)
+    highs  = df15_today['High'].values.astype(float)
+    lows   = df15_today['Low'].values.astype(float)
+    closes = df15_today['Close'].values.astype(float)
+
+    ref_price = closes[-1]  # for % floors
+    floor     = max(ref_price * 0.00001, 1e-6)
+
+    # ── CONDITION 2a: Candle direction count ──────────────────────────────────
+    green_mask  = closes > opens
+    red_mask    = closes < opens
+    green_count = int(green_mask.sum())
+    red_count   = int(red_mask.sum())
+    green_pct   = green_count / n
+    red_pct     = red_count   / n
+
+    # ── CONDITION 2b: Body Strength ───────────────────────────────────────────
+    # Measures the QUALITY of directional candles, not just their count.
+    # A green candle where body = 90% of range signals strong conviction.
+    # A green candle where body = 5% of range (near-doji) signals indecision.
+    bodies   = np.abs(closes - opens)
+    ranges_  = np.maximum(highs - lows, floor)
+    body_ratios = bodies / ranges_
+
+    bull_body_str = float(body_ratios[green_mask].mean()) if green_count > 0 else 0.0
+    bear_body_str = float(body_ratios[red_mask].mean())   if red_count  > 0 else 0.0
+
+    # ── CONDITION 3: Trend Efficiency Ratio (TER) ─────────────────────────────
+    # Measures how straight-line the move is.
+    # net_move / total_path  →  1.0 = perfect straight line, 0 = choppy oscillation
+    # A stock moving lower-left to upper-right cleanly has TER close to 1.
+    # A choppy, oscillating stock has TER close to 0 even if it ends up.
+    close_diffs = np.diff(closes)
+    path_length = float(np.sum(np.abs(close_diffs)))
+
+    net_bull = float(closes[-1] - closes[0])   # positive = overall up
+    net_bear = float(closes[0]  - closes[-1])  # positive = overall down
+
+    ter_bull = net_bull / path_length if path_length > floor else 0.0
+    ter_bear = net_bear / path_length if path_length > floor else 0.0
+    # Note: TER is signed. For bullish we need ter_bull > 0 (and ideally >= MIN_TER).
+
+    # ── CONDITION 5: Momentum State ───────────────────────────────────────────
+    # Compares price movement in the SECOND half of the session window vs FIRST half.
+    # If second_half_move >= threshold × first_half_move, momentum is sustained.
+    # Filters stocks that spiked at open and are now stalling / pulling back.
+    if n >= 6:
+        half = n // 2
+        first_net_bull = closes[half - 1] - closes[0]
+        last_net_bull  = closes[-1]       - closes[half]
+
+        first_net_bear = closes[0]    - closes[half - 1]
+        last_net_bear  = closes[half] - closes[-1]
+
+        denom_bull = abs(first_net_bull) if abs(first_net_bull) > floor else floor
+        denom_bear = abs(first_net_bear) if abs(first_net_bear) > floor else floor
+
+        momentum_bull = last_net_bull / denom_bull
+        momentum_bear = last_net_bear / denom_bear
+    else:
+        # Not enough candles to split — pass through with neutral value
+        momentum_bull = 1.0
+        momentum_bear = 1.0
+
+    # ── CONDITION 6: Shadow Quality ───────────────────────────────────────────
+    # For bullish: upper wicks (high - max(open,close)) reflect selling pressure.
+    # Large upper wicks mean the market is rejecting higher prices — bearish sign
+    # within an otherwise bullish candle set.
+    # For bearish: lower wicks reflect buying support — a bearish reversal signal.
+    upper_shadows = highs - np.maximum(opens, closes)
+    lower_shadows = np.minimum(opens, closes) - lows
+
+    avg_body         = float(bodies.mean()) if len(bodies) > 0 else floor
+    avg_body         = max(avg_body, floor)
+    avg_upper_shadow = float(upper_shadows.mean())
+    avg_lower_shadow = float(lower_shadows.mean())
+
+    # Shadow ratio: shadow / body. > 1 = shadow larger than body (rejection signal)
+    bull_shadow_ratio = avg_upper_shadow / avg_body  # ideally low for bullish
+    bear_shadow_ratio = avg_lower_shadow / avg_body  # ideally low for bearish
+
+    # ── NEW: Pullback Quality Score ─────────────────────────────────────────
+    # Measures how CLEAN the intraday trend is by examining pullback depth and
+    # frequency.  Shallow, infrequent pullbacks → high EOD continuation.
+    # Deep or frequent pullbacks → sellers still active → reversal risk.
+    closes_arr = df15_today['Close'].values.astype(float)
+    diffs      = np.diff(closes_arr)                          # close-to-close changes
+
+    # Bullish PBQ: penalise downward moves (bounces against the bull trend)
+    if closes_arr[-1] > closes_arr[0]:
+        total_up_bull  = closes_arr[-1] - closes_arr[0]
+        down_moves     = np.maximum(-diffs, 0.0)              # magnitude of each dip
+        avg_pb_bull    = float(np.mean(down_moves)) / total_up_bull
+        max_pb_bull    = float(np.max(down_moves))  / total_up_bull
+        pb_freq_bull   = float(np.sum(down_moves > 0)) / len(diffs)
+        pbq_bull       = max(0.0, 1.0 - 0.4*min(avg_pb_bull, 1.0)
+                                      - 0.4*min(max_pb_bull, 1.0)
+                                      - 0.2*pb_freq_bull)
+    else:
+        pbq_bull = 0.0   # not a bullish move
+
+    # Bearish PBQ: penalise upward bounces (against the bear trend)
+    if closes_arr[-1] < closes_arr[0]:
+        total_dn_bear  = closes_arr[0] - closes_arr[-1]
+        up_moves       = np.maximum(diffs, 0.0)               # magnitude of each bounce
+        avg_pb_bear    = float(np.mean(up_moves)) / total_dn_bear
+        max_pb_bear    = float(np.max(up_moves))  / total_dn_bear
+        pb_freq_bear   = float(np.sum(up_moves > 0)) / len(diffs)
+        pbq_bear       = max(0.0, 1.0 - 0.4*min(avg_pb_bear, 1.0)
+                                      - 0.4*min(max_pb_bear, 1.0)
+                                      - 0.2*pb_freq_bear)
+    else:
+        pbq_bear = 0.0
+
+    # ── NEW: Linear Regression Slope Score ──────────────────────────────────
+    # Measures HOW STEEPLY the trend is moving, combined with how well the
+    # price action fits a straight line (R²).
+    # Score = (slope% per candle × R²) / reference  — linear, no reshaping.
+    # Reference: 0.25% per candle is a strong institutional trend.
+    _x         = np.arange(n, dtype=float)
+    slope, icp = np.polyfit(_x, closes_arr, 1)
+    avg_px     = float(closes_arr.mean())
+    slope_pct  = slope / avg_px if avg_px > 0 else 0.0        # % per candle
+
+    y_pred  = slope * _x + icp
+    ss_res  = float(np.sum((closes_arr - y_pred) ** 2))
+    ss_tot  = float(np.sum((closes_arr - closes_arr.mean()) ** 2))
+    r2      = max(0.0, 1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else 0.0
+
+    REF_SLOPE = 0.0025   # 0.25% per 15-min candle = strong trend reference
+    lrs_bull  = min(max( slope_pct, 0.0) / REF_SLOPE, 1.0) * r2   # bull: rising
+    lrs_bear  = min(max(-slope_pct, 0.0) / REF_SLOPE, 1.0) * r2   # bear: falling
+
+    return {
+        'n_candles'       : n,
+        # Condition 2
+        'green_count'     : green_count,
+        'red_count'       : red_count,
+        'green_pct'       : round(green_pct, 3),
+        'red_pct'         : round(red_pct, 3),
+        'bull_body_str'   : round(bull_body_str, 3),
+        'bear_body_str'   : round(bear_body_str, 3),
+        # Condition 3
+        'ter_bull'        : round(ter_bull, 3),
+        'ter_bear'        : round(ter_bear, 3),
+        # Condition 5
+        'momentum_bull'   : round(momentum_bull, 3),
+        'momentum_bear'   : round(momentum_bear, 3),
+        # Condition 6
+        'bull_shadow_ratio': round(bull_shadow_ratio, 3),
+        'bear_shadow_ratio': round(bear_shadow_ratio, 3),
+        # NEW: Pullback Quality (0-1, higher = cleaner trend)
+        'pbq_bull'        : round(pbq_bull, 3),
+        'pbq_bear'        : round(pbq_bear, 3),
+        # NEW: Linear Regression Slope × R² (0-1)
+        'lrs_bull'        : round(lrs_bull, 3),
+        'lrs_bear'        : round(lrs_bear, 3),
+    }
+
+# =============================================================================
+# MRTQ v2 — QUALIFICATION GATES
+# =============================================================================
+def qualify_bull(m: dict, move_pct: float, rvol) -> tuple:
+    """
+    Bullish qualification: all 6 conditions must pass.
+    Returns (qualified: bool, fail_reasons: list[str]).
+
+    Condition 1: Move % >= MIN_MOVE_PCT
+    Condition 2: Green % >= MIN_GREEN_PCT  AND  Body Strength >= MIN_BODY_STR
+    Condition 3: TER (bull direction) >= MIN_TER
+    Condition 4: Same-Window RVOL >= MIN_RVOL
+    Condition 5: Momentum ratio >= MIN_MOMENTUM
+    Condition 6: Upper shadow ratio <= MAX_SHADOW_RATIO
+    """
+    reasons = []
+
+    # 1. Move %
+    if move_pct < MIN_MOVE_PCT:
+        reasons.append(
+            f"Move {move_pct:+.2f}% < {MIN_MOVE_PCT}% (not a strong enough early mover)"
+        )
+
+    # 2a. Candle direction majority
+    if m['green_pct'] < MIN_GREEN_PCT:
+        reasons.append(
+            f"Green {m['green_count']}/{m['n_candles']} "
+            f"({m['green_pct']*100:.0f}% < {MIN_GREEN_PCT*100:.0f}%)"
+        )
+
+    # 2b. Body strength
+    if m['bull_body_str'] < MIN_BODY_STR:
+        reasons.append(
+            f"Body strength {m['bull_body_str']:.2f} < {MIN_BODY_STR} "
+            f"(green candles too small/doji-like)"
+        )
+
+    # 3. Trend Efficiency
+    if m['ter_bull'] < MIN_TER:
+        reasons.append(
+            f"TER {m['ter_bull']:.2f} < {MIN_TER} "
+            f"(choppy, not a clean directional move)"
+        )
+
+    # 4. RVOL
+    if rvol is not None and rvol < MIN_RVOL:
+        reasons.append(
+            f"RVOL {rvol:.2f}× < {MIN_RVOL}× (volume not confirming the move)"
+        )
+
+    # 5. Momentum
+    if m['momentum_bull'] < MIN_MOMENTUM:
+        reasons.append(
+            f"Momentum {m['momentum_bull']:.2f} < {MIN_MOMENTUM} "
+            f"(buying pressure decelerating)"
+        )
+
+    # 6. Shadow quality
+    if m['bull_shadow_ratio'] > MAX_SHADOW_RATIO:
+        reasons.append(
+            f"Upper shadow ratio {m['bull_shadow_ratio']:.2f} > {MAX_SHADOW_RATIO} "
+            f"(sellers rejecting highs — EOD reversal risk)"
+        )
+
+    return len(reasons) == 0, reasons
 
 
-def trend_r2_slope(closes):
+def qualify_bear(m: dict, move_pct: float, rvol) -> tuple:
+    """Symmetric bearish qualification."""
+    reasons = []
+
+    if move_pct > -MIN_MOVE_PCT:
+        reasons.append(
+            f"Move {move_pct:+.2f}% > -{MIN_MOVE_PCT}% (not a strong enough loser)"
+        )
+
+    if m['red_pct'] < MIN_GREEN_PCT:
+        reasons.append(
+            f"Red {m['red_count']}/{m['n_candles']} "
+            f"({m['red_pct']*100:.0f}% < {MIN_GREEN_PCT*100:.0f}%)"
+        )
+
+    if m['bear_body_str'] < MIN_BODY_STR:
+        reasons.append(
+            f"Body strength {m['bear_body_str']:.2f} < {MIN_BODY_STR} "
+            f"(red candles too small/doji-like)"
+        )
+
+    if m['ter_bear'] < MIN_TER:
+        reasons.append(
+            f"TER {m['ter_bear']:.2f} < {MIN_TER} "
+            f"(choppy, not a clean directional move)"
+        )
+
+    if rvol is not None and rvol < MIN_RVOL:
+        reasons.append(
+            f"RVOL {rvol:.2f}× < {MIN_RVOL}× (volume not confirming the move)"
+        )
+
+    if m['momentum_bear'] < MIN_MOMENTUM:
+        reasons.append(
+            f"Momentum {m['momentum_bear']:.2f} < {MIN_MOMENTUM} "
+            f"(selling pressure decelerating)"
+        )
+
+    if m['bear_shadow_ratio'] > MAX_SHADOW_RATIO:
+        reasons.append(
+            f"Lower shadow ratio {m['bear_shadow_ratio']:.2f} > {MAX_SHADOW_RATIO} "
+            f"(buyers supporting lows — EOD reversal risk)"
+        )
+
+    return len(reasons) == 0, reasons
+
+# =============================================================================
+# MRTQ v2+ — EOD CONTINUATION SCORE  (0–100)
+# Transparent linear normalization. No nonlinear reshaping. No saturation caps
+# that artificially equalise stocks — every increment always increases the score.
+# =============================================================================
+# _clamp is kept as a utility but is NOT used for score shaping —
+# only to keep component contributions within [0, 1] for legibility.
+def _clamp(val, lo=0.0, hi=1.0):
+    return max(lo, min(hi, float(val)))
+
+
+def eod_score_bull(m: dict, move_pct: float, rvol) -> float:
     """
-    Linear regression of closes vs candle-index.
-    Returns (r2, slope).  r2 ∈ [0,1] — how close to a straight line.
-    slope sign matches direction (positive = uptrend, negative = downtrend).
+    MRTQ v2+ EOD Continuation Score — BULL (0–100).
+
+    All components use LINEAR normalization with TRANSPARENT reference bounds.
+    No score-shaping curves, no arbitrary saturation caps.
+    Higher raw metric value ALWAYS produces a proportionally higher score.
+
+    Component          Weight  Normalization                  Bound rationale
+    ─────────────────  ──────  ─────────────────────────────  ────────────────
+    Move %              22 pt  |move| / 6.0  (6% = 1.0)     6% = very strong
+    Trend Eff. (TER)    20 pt  ter_bull       [natural 0-1]  inherent [0-1]
+    Same-Window RVOL    18 pt  (rv-1) / 4.0  (5× = 1.0)    5× = max observed
+    Body Strength       10 pt  bull_body_str  [natural 0-1]  inherent [0-1]
+    Momentum State      10 pt  momentum / 2.0 (2.0 = 1.0)   2.0 = accelerating
+    Shadow Quality       6 pt  1 - shadow_ratio              lower wick = cleaner
+    Pullback Quality     8 pt  pbq_bull       [natural 0-1]  inherent [0-1] NEW
+    LR Slope × R²        4 pt  lrs_bull       [natural 0-1]  inherent [0-1] NEW
+    Trend Maturity       2 pt  tms            [natural 0-1]  inherent [0-1] NEW
+    ─────────────────  ──────
+    Total              100 pt
     """
-    n = len(closes)
-    if n < 4:
-        return 0.0, 0.0
-    try:
-        x = np.arange(n, dtype=float)
-        slope, intercept = np.polyfit(x, closes, 1)
-        fitted = slope * x + intercept
-        ss_res = float(np.sum((closes - fitted) ** 2))
-        ss_tot = float(np.sum((closes - closes.mean()) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-        return max(0.0, r2), slope
-    except Exception:
-        return 0.0, 0.0
+    rv = float(rvol) if rvol is not None else 1.0
+
+    move_n   = _clamp(abs(move_pct)              / 6.0)  # 6% move = full
+    ter_n    = _clamp(m['ter_bull'])                      # already [0,1]
+    rvol_n   = _clamp((rv - 1.0)                 / 4.0)  # 5× - 1 = 4 = full
+    body_n   = _clamp(m['bull_body_str'])                 # already [0,1]
+    mom_n    = _clamp(m['momentum_bull']          / 2.0)  # 2.0 = full
+    shadow_n = _clamp(1.0 - m['bull_shadow_ratio'])       # inverted: low wick = good
+    pbq_n    = _clamp(m.get('pbq_bull', 0.5))             # [0,1] NEW
+    lrs_n    = _clamp(m.get('lrs_bull', 0.0))             # [0,1] NEW
+    tms_n    = _clamp(m.get('tms', 0.5))                  # [0,1] NEW
+
+    return round(
+        move_n   * W_MOVE   +
+        ter_n    * W_TER    +
+        rvol_n   * W_RVOL   +
+        body_n   * W_BODY   +
+        mom_n    * W_MOMEN  +
+        shadow_n * W_SHADOW +
+        pbq_n    * W_PBQ    +
+        lrs_n    * W_LRS    +
+        tms_n    * W_TMS,
+        1
+    )
+
+
+def eod_score_bear(m: dict, move_pct: float, rvol) -> float:
+    """MRTQ v2+ EOD Continuation Score — BEAR (symmetric, 0–100)."""
+    rv = float(rvol) if rvol is not None else 1.0
+
+    move_n   = _clamp(abs(move_pct)              / 6.0)
+    ter_n    = _clamp(m['ter_bear'])
+    rvol_n   = _clamp((rv - 1.0)                 / 4.0)
+    body_n   = _clamp(m['bear_body_str'])
+    mom_n    = _clamp(m['momentum_bear']          / 2.0)
+    shadow_n = _clamp(1.0 - m['bear_shadow_ratio'])
+    pbq_n    = _clamp(m.get('pbq_bear', 0.5))
+    lrs_n    = _clamp(m.get('lrs_bear', 0.0))
+    tms_n    = _clamp(m.get('tms', 0.5))
+
+    return round(
+        move_n   * W_MOVE   +
+        ter_n    * W_TER    +
+        rvol_n   * W_RVOL   +
+        body_n   * W_BODY   +
+        mom_n    * W_MOMEN  +
+        shadow_n * W_SHADOW +
+        pbq_n    * W_PBQ    +
+        lrs_n    * W_LRS    +
+        tms_n    * W_TMS,
+        1
+    )
 
 # =============================================================================
 # SCAN ONE STOCK
 # =============================================================================
-def scan_one(sym, scan_date, cutoff_dt, trade, cache, lock):
+def scan_one(sym, scan_date, cutoff_dt, trade, cache, cache_lock):
     """
-    Returns (result_dict_or_None, status_string).
-    result_dict always includes 'IsTrending' (bool) based on the two
-    built-in checks (R² and Move%) — the UI splits on this flag.
+    Full MRTQ v2 pipeline for one stock.
+    Returns (result_dict | None, status_string).
     """
     tz = pytz.timezone('Asia/Kolkata')
     try:
+        # ── 1. FETCH  (one wide call, reused for all metrics) ────────────────
         from_dt = tz.localize(datetime.combine(
-            scan_date - timedelta(days=12), dt_time(9, 14)
+            scan_date - timedelta(days=FETCH_LOOKBACK_DAYS), dt_time(9, 14)
         ))
-        df1, err = fetch_1min(sym, from_dt, cutoff_dt, trade, cache, lock)
+        df1, err = fetch_1min(sym, from_dt, cutoff_dt, trade, cache, cache_lock)
         if df1 is None:
             return None, f"FAILED: {err}"
 
-        day_start = tz.localize(datetime.combine(scan_date, dt_time(9, 15)))
-        df_today  = df1[
-            (df1.index >= day_start) &
-            (df1.index <= cutoff_dt)
-        ].copy()
+        # ── 2. RESAMPLE 1-MIN → 15-MIN ────────────────────────────────────────
+        df15 = to_Nmin(df1, CANDLE_MIN)
+        if df15.empty:
+            return None, "FAILED: empty after resample to 15-min"
 
-        if df_today.empty:
-            return None, "FAILED: no candles for today in [9:15, cutoff]"
-        if len(df_today) < 10:
-            return None, f"FAILED: only {len(df_today)} candles today (need ≥10)"
-
-        curr_price = float(df_today['Close'].iloc[-1])
-        open_price = float(df_today['Open'].iloc[0])
-
+        # ── 3. PREVIOUS DAY CLOSE ─────────────────────────────────────────────
         pdays = prev_trading_days(scan_date, 1)
         if not pdays:
-            return None, "FAILED: could not determine previous trading day"
-        pday = pdays[0]
-        df_prev = df1[df1.index.date == pday]
+            return None, "FAILED: no previous trading day found"
+        pday      = pdays[0]
+        df_prev   = df1[df1.index.date == pday]
         if df_prev.empty:
-            return None, f"FAILED: no candles found for previous day ({pday})"
-
+            return None, f"FAILED: no 1-min bars for prev day {pday}"
         prev_close = float(df_prev['Close'].iloc[-1])
-        prev_high  = float(df_prev['High'].max())
-        prev_low   = float(df_prev['Low'].min())
-
         if prev_close <= 0:
-            return None, "FAILED: previous close is zero/invalid"
+            return None, "FAILED: prev close invalid"
 
-        total_move_pct   = (curr_price - prev_close) / prev_close * 100
-        morning_move_pct = (curr_price - open_price) / open_price * 100
-        gap_pct          = (open_price - prev_close) / prev_close * 100
+        # ── 4. TODAY'S 15-MIN CANDLES ─────────────────────────────────────────
+        df15_today = df15[df15.index.date == scan_date].copy()
+        if len(df15_today) < MIN_CANDLES:
+            return None, (
+                f"FAILED: only {len(df15_today)} × {CANDLE_MIN}-min candles today "
+                f"(need ≥{MIN_CANDLES})"
+            )
 
-        direction = 'BULL' if total_move_pct > 0 else ('BEAR' if total_move_pct < 0 else 'FLAT')
+        curr_price     = float(df15_today['Close'].iloc[-1])
+        total_move_pct = (curr_price - prev_close) / prev_close * 100
 
-        # ── RVOL — display only ──────────────────────────────────────────
-        today_vol = float(df_today['Volume'].sum())
-        cutoff_t  = cutoff_dt.time()
+        # ── 5. SAME-WINDOW RVOL (Condition 4 upgrade) ────────────────────────
+        # Compare today's cumulative volume to the SAME N candles on past 5 days.
+        # Avoids the time-of-day volume bias in v1's time-fraction approach.
+        n_today   = len(df15_today)
+        today_vol = float(df15_today['Volume'].sum())
+
         hist_vols = []
-        for hd in prev_trading_days(scan_date, 5):
-            dh = df1[df1.index.date == hd]
-            if not dh.empty:
-                win = dh[(dh.index.time >= dt_time(9,15)) &
-                         (dh.index.time <= cutoff_t)]
-                if not win.empty:
-                    hist_vols.append(float(win['Volume'].sum()))
+        for hd in prev_trading_days(scan_date, RVOL_LOOKBACK):
+            dh = df15[df15.index.date == hd]
+            if len(dh) >= n_today:
+                # Use same number of candles as today (apples-to-apples)
+                same_window_vol = float(dh.iloc[:n_today]['Volume'].sum())
+                if same_window_vol > 0:
+                    hist_vols.append(same_window_vol)
+
         if hist_vols:
-            avg_vol   = float(np.mean(hist_vols))
-            vol_ratio = today_vol / avg_vol if avg_vol > 0 else None
+            avg_hist_vol = float(np.mean(hist_vols))
+            rvol = today_vol / avg_hist_vol if avg_hist_vol > 0 else None
         else:
-            vol_ratio = None
+            rvol = None
 
-        # ── TREND QUALITY — R² + slope direction ─────────────────────────
-        df5_today = to_5min(df_today)
-        r2, slope = 0.0, 0.0
-        vwap_val  = None
-        vwap_side = '—'
+        # ── 6. COMPUTE MRTQ v2 METRICS ───────────────────────────────────────
+        m = compute_mrtq_metrics(df15_today)
+        if m is None:
+            return None, "FAILED: insufficient candles for metric computation"
 
-        if not df5_today.empty and len(df5_today) >= 4:
-            closes = df5_today['Close'].values.astype(float)
-            r2, slope = trend_r2_slope(closes)
-            vwap_series = calc_vwap(df5_today)
-            if not vwap_series.empty:
-                vwap_val = float(vwap_series.iloc[-1])
-                if direction == 'BULL':
-                    vwap_side = '✅ Above' if curr_price > vwap_val else '⚠️ Below'
-                elif direction == 'BEAR':
-                    vwap_side = '✅ Below' if curr_price < vwap_val else '⚠️ Above'
+        # ── 6b. TREND MATURITY SCORE (needs historical df15) ────────────────
+        # Compares today's move to the stock's own typical move in the same
+        # time window over the last 5 trading days.
+        # Rationale: a stock moving 3× its historical average by 11 AM is
+        # statistically more likely to consolidate or reverse by EOD.
+        # Higher TMS = NOT overextended = more room to continue.
+        _hist_moves = []
+        for _hd in prev_trading_days(scan_date, RVOL_LOOKBACK):
+            _dh = df15[df15.index.date == _hd]
+            if len(_dh) >= n_today:
+                _w = _dh.iloc[:n_today]
+                _open = float(_w['Open'].iloc[0])
+                if _open > 0:
+                    _hist_move = abs(float(_w['Close'].iloc[-1]) - _open) / _open * 100
+                    _hist_moves.append(_hist_move)
+        if _hist_moves:
+            _avg_hist = max(float(np.mean(_hist_moves)), 0.1)  # floor avoids div/0
+            _maturity_ratio = abs(total_move_pct) / _avg_hist
+            # Linear: ratio≤1 → TMS=1.0 | ratio=2 → TMS=0.5 | ratio≥3 → TMS=0.0
+            _tms = max(0.0, 1.0 - max(0.0, _maturity_ratio - 1.0) / 2.0)
+        else:
+            _tms = 0.5   # neutral if no history
 
-        # ── IS THIS A "TRENDING" STOCK? (the only filter) ────────────────
-        slope_matches_dir = (
-            (direction == 'BULL' and slope > 0) or
-            (direction == 'BEAR' and slope < 0)
-        )
-        is_trending = (
-            direction in ('BULL', 'BEAR') and
-            r2 >= TREND_MIN_R2 and
-            abs(total_move_pct) >= TREND_MIN_MOVE_PCT and
-            slope_matches_dir
-        )
+        m['tms'] = round(_tms, 3)   # inject into metrics dict for scoring
 
-        # ── ENTRY / SL / TARGET (10:45–10:59 candle) ─────────────────────
-        entry_candles = pd.DataFrame()
-        if not df5_today.empty:
-            entry_candles = df5_today[
-                (df5_today.index.time >= dt_time(10, 45)) &
-                (df5_today.index.time <  dt_time(11,  0))
-            ]
-            if entry_candles.empty:
-                entry_candles = df5_today.iloc[[-1]]
+        # ── 7. QUALIFY ────────────────────────────────────────────────────────
+        bull_ok, bull_reasons = qualify_bull(m, total_move_pct, rvol)
+        bear_ok, bear_reasons = qualify_bear(m, total_move_pct, rvol)
+
+        if bull_ok:
+            qualified = 'BULL'
+        elif bear_ok:
+            qualified = 'BEAR'
+        else:
+            qualified = None
+
+        # ── 8. EOD CONTINUATION SCORE ─────────────────────────────────────────
+        if qualified == 'BULL':
+            score = eod_score_bull(m, total_move_pct, rvol)
+        elif qualified == 'BEAR':
+            score = eod_score_bear(m, total_move_pct, rvol)
+        else:
+            # Compute for diagnostics (show score even for non-qualifiers)
+            if total_move_pct >= 0:
+                score = eod_score_bull(m, total_move_pct, rvol)
+            else:
+                score = eod_score_bear(m, total_move_pct, rvol)
+
+        # ── 9. ENTRY / SL / TARGET (last candle = entry candle at cutoff) ─────
+        entry_cdl = df15_today.iloc[-1]
+        ec_high   = float(entry_cdl['High'])
+        ec_low    = float(entry_cdl['Low'])
 
         entry = sl = target = risk = None
-        ec_str = '—'
-        if not entry_candles.empty:
-            ec_high = float(entry_candles['High'].max())
-            ec_low  = float(entry_candles['Low'].min())
-            ec_str  = f"H:{round(ec_high,2)} / L:{round(ec_low,2)}"
+        if qualified == 'BULL':
+            entry = round(ec_high, 2)
+            sl    = round(ec_low,  2)
+        elif qualified == 'BEAR':
+            entry = round(ec_low,  2)
+            sl    = round(ec_high, 2)
 
-            if direction == 'BULL':
-                entry = round(ec_high, 2)
-                sl    = round(ec_low,  2)
-            elif direction == 'BEAR':
-                entry = round(ec_low,  2)
-                sl    = round(ec_high, 2)
+        if entry is not None and sl is not None:
+            risk = abs(entry - sl)
+            if risk < entry * 0.001:
+                risk = entry * 0.003
+            if qualified == 'BULL':
+                target = round(entry + RR_RATIO * risk, 2)
+            else:
+                target = round(entry - RR_RATIO * risk, 2)
 
-            if entry is not None and sl is not None:
-                risk = abs(entry - sl)
-                if risk < entry * 0.001:
-                    risk = entry * 0.003
-                if direction == 'BULL':
-                    target = round(entry + RR_RATIO * risk, 2)
-                else:
-                    target = round(entry - RR_RATIO * risk, 2)
-
+        # ── 10. CANDLE DISPLAY STRING ─────────────────────────────────────────
         candle_str = ''
-        if not df5_today.empty:
-            last6 = df5_today.tail(6)
-            parts = []
-            for i in range(len(last6)):
-                o = float(last6['Open'].iloc[i])
-                c = float(last6['Close'].iloc[i])
-                t = last6.index[i].strftime('%H:%M')
-                parts.append(f"{'🟢' if c>=o else '🔴'}{t}")
-            candle_str = ' '.join(parts)
+        for i in range(len(df15_today)):
+            cdl = df15_today.iloc[i]
+            o, c = float(cdl['Open']), float(cdl['Close'])
+            t    = df15_today.index[i].strftime('%H:%M')
+            candle_str += f"{'🟢' if c >= o else '🔴'}{t} "
+
+        n_bull_cond = 6 - len(bull_reasons)
+        n_bear_cond = 6 - len(bear_reasons)
+        tag = (
+            f"QUALIFIED {qualified} (Score:{score})" if qualified
+            else f"no qualify (bull:{n_bull_cond}/6, bear:{n_bear_cond}/6)"
+        )
 
         result = {
-            'Symbol':        sym,
-            'Direction':     direction,
-            'IsTrending':    is_trending,
-            'Signal':        ('🟢 BUY'   if direction == 'BULL' else
-                              '🔴 SHORT' if direction == 'BEAR' else '⚪ FLAT'),
-            'TotalMove%':    round(total_move_pct,   2),
-            'MorningMove%':  round(morning_move_pct, 2),
-            'Gap%':          round(gap_pct,           2),
-            'CurrPrice':     round(curr_price,        2),
-            'PrevClose':     round(prev_close,        2),
-            'VolRatio':      round(vol_ratio, 2) if vol_ratio is not None else None,
-            'TrendR2':       round(r2,                2),
-            'VWAP':          round(vwap_val, 2) if vwap_val else None,
-            'VWAPSide':      vwap_side,
-            'Entry':         entry,
-            'SL':            sl,
-            'Target':        target,
-            'Risk':          round(risk, 2) if risk is not None else None,
-            'EntryCandle':   ec_str,
-            'Candles':       candle_str,
-            'PrevHigh':      round(prev_high, 2),
-            'PrevLow':       round(prev_low,  2),
+            'Symbol'         : sym,
+            'Qualified'      : qualified,
+            'Signal'         : ('🟢 BUY'   if qualified == 'BULL' else
+                                '🔴 SHORT' if qualified == 'BEAR' else '⚪ —'),
+            'EODScore'       : score,
+            'TotalMove%'     : round(total_move_pct, 2),
+            'CurrPrice'      : round(curr_price, 2),
+            'PrevClose'      : round(prev_close, 2),
+            # Condition 2
+            'GreenCount'     : m['green_count'],
+            'RedCount'       : m['red_count'],
+            'BullBodyStr'    : round(m['bull_body_str'], 2),
+            'BearBodyStr'    : round(m['bear_body_str'], 2),
+            # Condition 3
+            'TER_Bull'       : round(m['ter_bull'], 2),
+            'TER_Bear'       : round(m['ter_bear'], 2),
+            # Condition 4
+            'VolRatio'       : round(rvol, 2) if rvol is not None else None,
+            # Condition 5
+            'MomBull'        : round(m['momentum_bull'], 2),
+            'MomBear'        : round(m['momentum_bear'], 2),
+            # Condition 6
+            'ShadowBull'     : round(m['bull_shadow_ratio'], 2),
+            'ShadowBear'     : round(m['bear_shadow_ratio'], 2),
+            # Candles
+            'NCandles'       : m['n_candles'],
+            'Candles'        : candle_str.strip(),
+            # Entry
+            'Entry'          : entry,
+            'SL'             : sl,
+            'Target'         : target,
+            'Risk'           : round(risk, 2) if risk is not None else None,
+            'EntryCandle'    : f"H:{round(ec_high,2)} / L:{round(ec_low,2)}",
+            # New MRTQ v2+ metrics (for display and transparency)
+            'PBQ_Bull'       : round(m.get('pbq_bull', 0.5), 2),
+            'PBQ_Bear'       : round(m.get('pbq_bear', 0.5), 2),
+            'LRS_Bull'       : round(m.get('lrs_bull', 0.0), 2),
+            'LRS_Bear'       : round(m.get('lrs_bear', 0.0), 2),
+            'TMS'            : round(m.get('tms', 0.5), 2),
+            # Diagnostics
+            'BullReasons'    : bull_reasons,
+            'BearReasons'    : bear_reasons,
+            'BullScore'      : n_bull_cond,
+            'BearScore'      : n_bear_cond,
         }
-        tag = "TRENDING" if is_trending else "weak/choppy"
-        return result, f"OK ({direction}, {total_move_pct:+.2f}%, R²={r2:.2f}, {tag})"
+
+        return result, f"OK ({total_move_pct:+.2f}%, {tag})"
 
     except Exception as e:
         if DEBUG:
@@ -476,20 +1332,50 @@ def run_scan(stocks, scan_date, cutoff_h, cutoff_m, trade, status_cb=None):
         scan_date, dt_time(cutoff_h, cutoff_m)
     ))
 
-    cache     = {}
-    lock      = threading.Lock()
-    done_lock = threading.Lock()
-    all_res   = []
-    diag      = {}
-    done_ctr  = [0]
-    total     = len(stocks)
+    # ── PERSISTENT INSTRUMENT CACHE ──────────────────────────────────────────
+    # cache is stored in st.session_state so it SURVIVES across re-runs.
+    # Root cause of 142→45 inconsistency: cache was re-created empty on each run.
+    # First run now populates the cache. Every subsequent run in the same
+    # browser session reuses all resolved instruments instantly — zero API calls
+    # needed for instrument lookup on the second scan.
+    import streamlit as _st
+    if 'inst_cache' not in _st.session_state:
+        _st.session_state['inst_cache'] = {}
+    cache = _st.session_state['inst_cache']   # shared, persistent reference
+
+    cache_lock = threading.Lock()
+    done_lock  = threading.Lock()
+    all_res    = []
+    diag       = {}
+    done_ctr   = [0]
+    total      = len(stocks)
+
+    # ── PRE-FETCH INSTRUMENT MASTER ───────────────────────────────────────────
+    # Only attempt master download if it hasn't been done yet this session
+    # (or if the last attempt returned 0 instruments).
+    master_already_loaded = bool(cache.get('__MASTER__'))
+    if not master_already_loaded:
+        if status_cb:
+            status_cb(0, total, "⏳ Loading Alice Blue instrument master…")
+        n_master = prefetch_instrument_master(trade, cache, cache_lock)
+        if status_cb:
+            label = (f"✅ Instrument master: {n_master} instruments loaded"
+                     if n_master > 0
+                     else "⚠️ Master unavailable — using cached per-symbol lookup")
+            status_cb(0, total, label)
+    else:
+        n_master = len(cache.get('__MASTER__', {}))
+        if status_cb:
+            n_cached = sum(1 for k in cache if k != '__MASTER__')
+            status_cb(0, total,
+                      f"✅ Using session cache: {n_cached} instruments + "
+                      f"{n_master} master entries")
 
     def _proc(sym):
-        r, status = scan_one(sym, scan_date, cutoff_dt, trade, cache, lock)
-        gc.collect()
+        r, status = scan_one(sym, scan_date, cutoff_dt, trade, cache, cache_lock)
         return sym, r, status
 
-    workers = min(MAX_WORKERS, max(4, (os.cpu_count() or 4) * 3))
+    workers = MAX_WORKERS   # full parallelism — per-call timeout guards each request
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_proc, s): s for s in stocks}
@@ -508,38 +1394,28 @@ def run_scan(stocks, scan_date, cutoff_h, cutoff_m, trade, status_cb=None):
                 if status_cb:
                     status_cb(done_ctr[0], total, sym_done)
 
-    # Trending-only lists (the MAIN output)
-    trend_bull = sorted(
-        [r for r in all_res if r['Direction'] == 'BULL' and r['IsTrending']],
-        key=lambda r: r['TotalMove%'], reverse=True
+    # ── Sort: primary by EOD Score (higher=better), secondary by Move% ────────
+    top_bull = sorted(
+        [r for r in all_res if r['Qualified'] == 'BULL'],
+        key=lambda r: (r['EODScore'], r['TotalMove%']), reverse=True
     )
-    trend_bear = sorted(
-        [r for r in all_res if r['Direction'] == 'BEAR' and r['IsTrending']],
-        key=lambda r: r['TotalMove%']
-    )
-
-    # Full reference lists (everything, for the expander)
-    all_bull = sorted(
-        [r for r in all_res if r['Direction'] == 'BULL'],
-        key=lambda r: r['TotalMove%'], reverse=True
-    )
-    all_bear = sorted(
-        [r for r in all_res if r['Direction'] == 'BEAR'],
-        key=lambda r: r['TotalMove%']
+    top_bear = sorted(
+        [r for r in all_res if r['Qualified'] == 'BEAR'],
+        key=lambda r: (r['EODScore'], -r['TotalMove%']), reverse=True
     )
 
-    return trend_bull, trend_bear, all_bull, all_bear, diag
+    return top_bull, top_bear, all_res, diag
 
 # =============================================================================
-# BACKTEST VERIFICATION
+# BACKTEST VERIFICATION  (same logic as reference)
 # =============================================================================
-def verify_backtest(bull, bear, scan_date, trade, cache, lock):
+def verify_backtest(bull, bear, scan_date, trade, cache, cache_lock):
     tz = pytz.timezone('Asia/Kolkata')
     fd = tz.localize(datetime.combine(scan_date - timedelta(days=2), dt_time(9, 0)))
     td = tz.localize(datetime.combine(scan_date,                     dt_time(15, 35)))
 
     def eod_close(sym):
-        df1, _ = fetch_1min(sym, fd, td, trade, cache, lock)
+        df1, _ = fetch_1min(sym, fd, td, trade, cache, cache_lock)
         if df1 is not None and not df1.empty:
             df1 = df1[df1.index.date == scan_date]
         if df1 is None or df1.empty:
@@ -594,151 +1470,234 @@ def verify_backtest(bull, bear, scan_date, trade, cache, lock):
 # =============================================================================
 # HTML RESULT TABLE
 # =============================================================================
-def build_table(results, is_bull, is_backtest=False, show_trend_badge=False):
+def build_table(results, is_bull, is_backtest=False, show_diag=False):
     if not results:
-        return "<p style='color:var(--muted);padding:12px 0;'>No stocks in this list.</p>"
+        return "<p style='padding:12px 0;'>No stocks in this list.</p>"
 
     hdr_bg = '#1B5E20' if is_bull else '#B71C1C'
     row_bg = '#F1F8E9' if is_bull else '#FCE4EC'
     row_fg = '#1B5E20' if is_bull else '#880E4F'
 
-    bt_th = (
-        '<th style="padding:9px 12px;border:1px solid #999;">EOD Close</th>'
-        '<th style="padding:9px 12px;border:1px solid #999;">Result</th>'
-    ) if is_backtest else ''
-
-    trend_th = '<th style="padding:9px 12px;border:1px solid #999;">Trending?</th>' if show_trend_badge else ''
-
     def th(txt):
-        return f'<th style="padding:9px 12px;border:1px solid #999;">{txt}</th>'
+        return (f'<th style="padding:8px 10px;border:1px solid #999;'
+                f'background:{hdr_bg};color:#fff;white-space:nowrap;">{txt}</th>')
+
+    def td(val, extra=''):
+        return f'<td style="padding:8px 10px;border:1px solid #ddd;{extra}">{val}</td>'
+
+    bt_th = (th('EOD Close') + th('Result')) if is_backtest else ''
+    diag_th = (th('Bull/6') + th('Bear/6') + th('Fail Reasons')) if show_diag else ''
 
     header = (
         th('#') + th('Symbol') + th('Signal') +
-        th('Total Move%') + th('Morning Move%') + th('Gap%') +
-        th('Price ₹') + th('Vol Ratio') + th('Trend R²') +
-        th('VWAP Side') +
+        th('EOD Score') + th('Move %') + th('Price ₹') +
+        th('RVOL') + th('Green/Red') + th('Body Str') +
+        th('TER') + th('Momentum') + th('Shadow') +
         th('Entry ₹') + th('SL ₹') + th('Target ₹') +
-        th('Last 6 Candles') +
-        trend_th + bt_th
+        th('Candles') +
+        diag_th + bt_th
     )
 
     rows = []
     for i, r in enumerate(results, 1):
-        sym   = r['Symbol'].replace('.NS','')
-        vwap_s = r.get('VWAPSide', '—')
+        sym = r['Symbol'].replace('.NS','')
 
-        r2    = r.get('TrendR2', 0)
-        r2col = '#00C853' if r2 >= 0.7 else ('#FF8F00' if r2 >= 0.5 else '#D50000')
-        r2bar = (f'<div style="display:flex;align-items:center;gap:6px">'
-                 f'<div style="height:6px;width:{int(r2*60)}px;background:{r2col};'
-                 f'border-radius:3px;min-width:4px"></div>'
-                 f'<span>{r2:.2f}</span></div>')
+        # Score colour: green ≥ 65, amber ≥ 45, red < 45
+        sc = r['EODScore']
+        sc_col = '#00C853' if sc >= 65 else ('#FF8F00' if sc >= 45 else '#D50000')
+        sc_str = f'<b style="color:{sc_col}">{sc}</b>'
+
+        tm     = r['TotalMove%']
+        tm_col = '#00C853' if tm > 0 else '#D50000'
+        tm_str = f'<b style="color:{tm_col}">{tm:+.2f}%</b>'
 
         vr = r.get('VolRatio')
         if vr is None:
             vr_str = '—'
         else:
-            vrcol = '#00C853' if vr >= 2.0 else ('#FF8F00' if vr >= 1.2 else '#888')
-            vr_str = f'<b style="color:{vrcol}">{vr:.2f}×</b>'
+            vr_col = '#00C853' if vr >= 2.0 else ('#FF8F00' if vr >= MIN_RVOL else '#D50000')
+            vr_str = f'<b style="color:{vr_col}">{vr:.2f}×</b>'
 
-        trend_td = ''
-        if show_trend_badge:
-            if r.get('IsTrending'):
-                trend_td = '<td style="padding:9px 12px;border:1px solid #ddd;color:#00C853;font-weight:bold;">✅ Yes</td>'
-            else:
-                trend_td = '<td style="padding:9px 12px;border:1px solid #ddd;color:#999;">— No</td>'
+        gr_str = f"{r['GreenCount']}🟢 / {r['RedCount']}🔴"
+
+        bs = r['BullBodyStr'] if is_bull else r['BearBodyStr']
+        bs_col = '#00C853' if bs >= 0.55 else ('#FF8F00' if bs >= MIN_BODY_STR else '#D50000')
+        bs_str = f'<span style="color:{bs_col}">{bs:.2f}</span>'
+
+        ter = r['TER_Bull'] if is_bull else r['TER_Bear']
+        ter_col = '#00C853' if ter >= 0.65 else ('#FF8F00' if ter >= MIN_TER else '#D50000')
+        ter_str = f'<span style="color:{ter_col}">{ter:.2f}</span>'
+
+        mom = r['MomBull'] if is_bull else r['MomBear']
+        mom_col = '#00C853' if mom >= 0.8 else ('#FF8F00' if mom >= MIN_MOMENTUM else '#D50000')
+        mom_str = f'<span style="color:{mom_col}">{mom:.2f}</span>'
+
+        shd = r['ShadowBull'] if is_bull else r['ShadowBear']
+        shd_col = '#00C853' if shd <= 0.5 else ('#FF8F00' if shd <= MAX_SHADOW_RATIO else '#D50000')
+        shd_str = f'<span style="color:{shd_col}">{shd:.2f}</span>'
+
+        entry_str  = f'₹{r["Entry"]}'  if r.get("Entry")  else '—'
+        sl_str     = f'₹{r["SL"]}'     if r.get("SL")     else '—'
+        target_str = f'₹{r["Target"]}' if r.get("Target") else '—'
 
         bt_td = ''
         if is_backtest:
-            eod = r.get('EOD','—')
-            res = r.get('Result','—')
+            eod = r.get('EOD', '—')
+            res = r.get('Result', '—')
             rc  = ('#00C853' if '✅' in res else '#D50000' if '❌' in res else '#FF8F00')
             bt_td = (
-                f'<td style="padding:9px 12px;border:1px solid #ddd;">{eod if eod else "—"}</td>'
-                f'<td style="padding:9px 12px;border:1px solid #ddd;color:{rc};font-weight:bold;">{res}</td>'
+                td(eod if eod else '—') +
+                td(res, f'color:{rc};font-weight:bold;')
             )
 
-        def td(val, extra=''):
-            return f'<td style="padding:9px 12px;border:1px solid #ddd;{extra}">{val}</td>'
-
-        tm = r['TotalMove%']; mm = r['MorningMove%']; gp = r['Gap%']
-        tm_col = '#00C853' if tm > 0 else '#D50000'
-        mm_col = '#00C853' if mm > 0 else '#D50000'
-        gp_col = '#00C853' if gp > 0 else '#D50000'
-
-        entry_str  = f'₹{r["Entry"]}'  if r["Entry"]  is not None else '—'
-        sl_str     = f'₹{r["SL"]}'     if r["SL"]     is not None else '—'
-        target_str = f'₹{r["Target"]}' if r["Target"] is not None else '—'
+        diag_td = ''
+        if show_diag:
+            bc  = r.get('BullScore', 0)
+            brc = r.get('BearScore', 0)
+            bcol = '#00C853' if bc == 6 else ('#FF8F00' if bc >= 4 else '#999')
+            brcol= '#00C853' if brc== 6 else ('#FF8F00' if brc>= 4 else '#999')
+            # Show the closer side's reasons
+            if bc >= brc:
+                reasons = r.get('BullReasons', []) or ['✅ all 6 pass']
+                side = 'Bull'
+            else:
+                reasons = r.get('BearReasons', []) or ['✅ all 6 pass']
+                side = 'Bear'
+            reasons_str = '<br>'.join(reasons)
+            diag_td = (
+                td(f'<b style="color:{bcol}">{bc}/6</b>') +
+                td(f'<b style="color:{brcol}">{brc}/6</b>') +
+                td(f'<i style="font-size:10px;">{side}: {reasons_str}</i>',
+                   'max-width:280px;')
+            )
 
         rows.append(
             f'<tr style="background:{row_bg};color:{row_fg};">'
-            + td(i,          'font-weight:900;')
-            + td(sym,        'font-weight:900;font-size:14px;')
+            + td(i,               'font-weight:900;')
+            + td(sym,             'font-weight:900;font-size:14px;')
             + td(r['Signal'])
-            + td(f'<b style="color:{tm_col}">{tm:+.2f}%</b>', 'font-size:13px;')
-            + td(f'<span style="color:{mm_col}">{mm:+.2f}%</span>', 'font-size:13px;')
-            + td(f'<span style="color:{gp_col}">{gp:+.2f}%</span>', 'font-size:12px;')
+            + td(sc_str,          'font-size:13px;')
+            + td(tm_str,          'font-size:13px;')
             + td(f'₹{r["CurrPrice"]}')
             + td(vr_str)
-            + td(r2bar)
-            + td(vwap_s,     'font-size:12px;')
-            + td(f'<b>{entry_str}</b>',  'font-weight:bold;')
-            + td(sl_str,    'color:#D50000;font-weight:bold;')
-            + td(target_str,'color:#00796B;font-weight:bold;')
-            + td(r.get('Candles',''), 'font-size:11px;white-space:nowrap;')
-            + trend_td
-            + bt_td
+            + td(gr_str)
+            + td(bs_str)
+            + td(ter_str)
+            + td(mom_str)
+            + td(shd_str)
+            + td(entry_str)
+            + td(sl_str,          'color:#D50000;font-weight:bold;')
+            + td(target_str,      'color:#00C853;font-weight:bold;')
+            + td(f'<span style="font-size:11px;">{r.get("Candles","")}</span>')
+            + diag_td + bt_td
             + '</tr>'
         )
 
-    return f"""
-<div style="overflow-x:auto;margin-bottom:20px;">
-<table style="width:100%;border-collapse:collapse;font-size:12px;">
-<thead>
-  <tr style="background:{hdr_bg};color:white;font-size:12px;">{header}</tr>
-</thead>
-<tbody>{''.join(rows)}</tbody>
-</table>
-</div>"""
+    table = (
+        '<div style="overflow-x:auto;">'
+        '<table style="border-collapse:collapse;width:100%;font-size:12px;">'
+        f'<thead><tr>{header}</tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody>'
+        '</table></div>'
+    )
+    return table
+
+# =============================================================================
+# STOCK UNIVERSE
+# =============================================================================
+# NSE F&O stocks with active options chain (source: NSE website, July 2026)
+DEFAULT_STOCKS = [
+    "360ONE","ABB","APLAPOLLO","AUBANK","ADANIENSOL","ADANIENT",
+    "ADANIGREEN","ADANIPORTS","ADANIPOWER","ABCAPITAL","ALKEM",
+    "AMBER","AMBUJACEM","ANGELONE","APOLLOHOSP","ASHOKLEY",
+    "ASIANPAINT","ASTRAL","AUROPHARMA","DMART","AXISBANK","BSE",
+    "BAJAJ-AUTO","BAJFINANCE","BAJAJFINSV","BAJAJHLDNG",
+    "BANDHANBNK","BANKBARODA","BANKINDIA","BDL","BEL",
+    "BHARATFORG","BHEL","BPCL","BHARTIARTL","BIOCON",
+    "BLUESTARCO","BOSCHLTD","BRITANNIA","CGPOWER","CANBK",
+    "CDSL","CHOLAFIN","CIPLA","COALINDIA","COCHINSHIP",
+    "COFORGE","COLPAL","CAMS","CONCOR","CROMPTON",
+    "CUMMINSIND","DLF","DABUR","DALBHARAT","DELHIVERY",
+    "DIVISLAB","DIXON","DRREDDY","ETERNAL","EICHERMOT",
+    "EXIDEIND","FORCEMOT","NYKAA","FORTIS","GAIL",
+    "GVT&D","GMRAIRPORT","GLENMARK","GODFRYPHLP","GODREJCP",
+    "GODREJPROP","GRASIM","HCLTECH","HDFCAMC","HDFCBANK",
+    "HDFCLIFE","HAVELLS","HEROMOTOCO","HINDALCO","HAL",
+    "HINDPETRO","HINDUNILVR","HINDZINC","POWERINDIA","HYUNDAI",
+    "ICICIBANK","ICICIGI","ICICIPRULI","IDFCFIRSTB","ITC",
+    "INDIANB","IEX","IOC","IRFC","IREDA",
+    "INDUSTOWER","INDUSINDBK","NAUKRI","INFY","INOXWIND",
+    "INDIGO","JINDALSTEL","JSWENERGY","JSWSTEEL","JIOFIN",
+    "JUBLFOOD","KEI","KPITTECH","KALYANKJIL","KAYNES",
+    "KFINTECH","KOTAKBANK","LTF","LICHSGFIN","LTM",
+    "LT","LAURUSLABS","LICI","LODHA","LUPIN",
+    "M&M","MANAPPURAM","MANKIND","MARICO","MARUTI",
+    "MFSL","MAXHEALTH","MAZDOCK","MOTILALOFS","MPHASIS",
+    "MCX","MUTHOOTFIN","NBCC","NHPC","NMDC",
+    "NTPC","NATIONALUM","NESTLEIND","NAM-INDIA","NUVAMA",
+    "OBEROIRLTY","ONGC","OIL","PAYTM","OFSS",
+    "POLICYBZR","PGEL","PIIND","PNBHOUSING","PAGEIND",
+    "PATANJALI","PERSISTENT","PETRONET","PIDILITIND","POLYCAB",
+    "PFC","POWERGRID","PREMIERENE","PRESTIGE","PNB",
+    "RBLBANK","RECLTD","RADICO","RVNL","RELIANCE",
+    "SBICARD","SBILIFE","SHREECEM","SRF","MOTHERSON",
+    "SHRIRAMFIN","SIEMENS","SOLARINDS","SONACOMS","SBIN",
+    "SAIL","SUNPHARMA","SUPREMEIND","SUZLON","SWIGGY",
+    "TATACONSUM","TVSMOTOR","TCS","TATAELXSI","TMPV",
+    "TATAPOWER","TATASTEEL","TECHM","FEDERALBNK","INDHOTEL",
+    "PHOENIXLTD","TITAN","TORNTPHARM","TRENT","TIINDIA",
+    "UNOMINDA","UPL","ULTRACEMCO","UNIONBANK","UNITDSPR",
+    "VBL","VEDL","VMM","IDEA","VOLTAS",
+    "WAAREEENER","WIPRO","YESBANK","ZYDUSLIFE",
+]
 
 # =============================================================================
 # STREAMLIT UI
 # =============================================================================
 def main():
-    st.set_page_config(page_title="EOD Trend Scanner", layout="wide", page_icon="📈")
-    st.title("📈 EOD Trend Scanner")
-    st.caption(
-        "Run at 11:00 AM → only stocks with a clean, consistent trend since "
-        "9:15 AM appear in BUY / SHORT. No sliders to configure."
+    st.set_page_config(
+        page_title="NSE F&O Momentum Scanner v2.5",
+        page_icon="📈",
+        layout="wide",
     )
 
-    for k, v in dict(trade=None, connected=False,
-                     results=None, bt_stats=None,
-                     uid='', auth='', skey='').items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+    # ── Session state ─────────────────────────────────────────────────────────
+    for k, v in [('connected', False), ('trade', None),
+                 ('results', None), ('bt_stats', None)]:
+        st.session_state.setdefault(k, v)
 
-    try:
+    # Auto-load saved credentials — MUST run before setdefault('uid','')
+    # Bug fix: setdefault is a no-op if the key already exists.
+    # If we setdefault('uid','') first, the saved value never loads.
+    if 'uid' not in st.session_state:
+        loaded_uid, loaded_auth, loaded_skey = '', '', ''
         if os.path.exists(CREDS_FILE):
-            with open(CREDS_FILE) as f:
-                c = json.load(f)
-            st.session_state['uid']  = c.get('user_id','')
-            st.session_state['auth'] = c.get('auth_code','')
-            st.session_state['skey'] = c.get('secret_key','')
-    except Exception:
-        pass
+            try:
+                with open(CREDS_FILE) as f:
+                    c = json.load(f)
+                loaded_uid  = c.get('user_id',   '')
+                loaded_auth = c.get('auth_code',  '')
+                loaded_skey = c.get('secret_key', '')
+            except Exception:
+                pass
+        st.session_state['uid']  = loaded_uid
+        st.session_state['auth'] = loaded_auth
+        st.session_state['skey'] = loaded_skey
 
-    # ── LOGIN ─────────────────────────────────────────────────────────────
+    st.title("📈 NSE F&O Momentum Scanner v2")
+    st.caption("MRTQ Enhanced — Top Gainer Bullish / Top Loser Bearish | EOD Trend Continuation")
+
+    # ── LOGIN ─────────────────────────────────────────────────────────────────
     with st.expander("🔐 Alice Blue Login", expanded=not st.session_state['connected']):
         c1, c2, c3 = st.columns(3)
         uid  = c1.text_input("User ID",    value=st.session_state['uid'])
         auth = c2.text_input("Auth Code",  value=st.session_state['auth'])
         skey = c3.text_input("Secret Key", value=st.session_state['skey'], type="password")
 
-        b1, _, b2, b3 = st.columns([3,2,1,1])
+        b1, _, b2, b3 = st.columns([3, 2, 1, 1])
         ph = st.empty()
 
-        if b1.button("🔌 Connect", use_container_width=True):
+        if b1.button("🔌 Connect", width='stretch'):
             if not (uid and auth and skey):
                 ph.error("All three fields are required.")
             else:
@@ -752,11 +1711,14 @@ def main():
                         t = fn()
                         s = t.get_session_id()
                         if s and 'Not_ok' not in str(s):
-                            st.session_state.update(trade=t, connected=True)
-                            ph.success("✅ Connected!")
+                            st.session_state.update(
+                                trade=t, connected=True, uid=uid, auth=auth, skey=skey
+                            )
+                            ph.success("✅ Connected to Alice Blue!")
                             try:
-                                with open(CREDS_FILE,'w') as f:
-                                    json.dump(dict(user_id=uid,auth_code=auth,secret_key=skey),f)
+                                with open(CREDS_FILE, 'w') as f:
+                                    json.dump(dict(user_id=uid, auth_code=auth,
+                                                   secret_key=skey), f)
                             except Exception:
                                 pass
                             ok = True
@@ -764,51 +1726,61 @@ def main():
                     except Exception:
                         continue
                 if not ok:
-                    ph.error("❌ Authentication failed.")
+                    ph.error("❌ Authentication failed. Check your credentials.")
 
-        if b2.button("💾 Save", use_container_width=True):
+        if b2.button("💾 Save", width='stretch'):
             try:
-                with open(CREDS_FILE,'w') as f:
-                    json.dump(dict(user_id=uid,auth_code=auth,secret_key=skey),f)
+                with open(CREDS_FILE, 'w') as f:
+                    json.dump(dict(user_id=uid, auth_code=auth, secret_key=skey), f)
                 st.success("Saved!")
             except Exception as e:
                 st.error(str(e))
 
-        if b3.button("🗑️", use_container_width=True):
+        if b3.button("🗑️", width='stretch'):
             try:
-                os.remove(CREDS_FILE); st.info("Cleared.")
+                os.remove(CREDS_FILE); st.info("Credentials cleared.")
             except Exception:
                 pass
 
         if st.session_state['connected']:
             ph.success("✅ Alice Blue: Connected")
 
-    # ── HOW IT WORKS ──────────────────────────────────────────────────────
-    with st.expander("📖 How 'trending' is decided (no sliders — fixed logic)", expanded=False):
+    # ── STRATEGY EXPLANATION ──────────────────────────────────────────────────
+    with st.expander("📖 MRTQ v2 Strategy — What Changed and Why", expanded=False):
         st.markdown(f"""
-A stock appears in **BUY** or **SHORT** only if **ALL** of these are true:
+**MRTQ v2 keeps the same 4-condition structure but makes each condition smarter,
+then adds 2 new conditions and a composite EOD Score for better ranking.**
 
-| Check | Rule | Why |
+---
+
+| # | v1 Condition | v2 Improvement | Why It's Better |
+|---|---|---|---|
+| 1 | Move % from Prev Close | **KEPT** (unchanged) | Primary signal — biggest movers at 11AM stay strong |
+| 2 | Candle Direction % | **→ Body Strength Score** | Counts candle QUALITY (body/range ratio), not just colour. A 10%-body green candle is near-doji (indecision). A 90%-body green candle is strong conviction. |
+| 3 | Trend Persistence % | **→ Trend Efficiency Ratio** | Measures how STRAIGHT the move is: net_move ÷ total_path. TER=1.0 = perfect straight line. Choppy back-and-forth scores low even if mostly green. |
+| 4 | Relative Volume | **→ Same-Window RVOL** | Compares today's first-N-candles volume to the SAME N candles from past {RVOL_LOOKBACK} days. Eliminates morning-rush volume bias in the old time-fraction method. |
+| 5 | *(new)* | **Momentum State** | Second-half move ≥ {MIN_MOMENTUM}× first-half move. Rejects stocks that spiked at open and are now stalling — they rarely continue to EOD. |
+| 6 | *(new)* | **Shadow Quality** | Rejects stocks where opposing wicks exceed {MAX_SHADOW_RATIO}× avg body. Long upper wicks in bullish stocks = sellers rejecting highs = likely EOD reversal. |
+
+---
+
+**EOD Continuation Score (0–100) — ranking formula:**
+
+| Component | Weight | Rationale |
 |---|---|---|
-| **Direction** | Total Move % from yesterday's close is positive (BUY) or negative (SHORT) | Basic direction |
-| **Consistency** | Trend R² ≥ **{TREND_MIN_R2}** | The 9:15→cutoff price move is a fairly straight line, not random zig-zag |
-| **Magnitude** | \\|Total Move %\\| ≥ **{TREND_MIN_MOVE_PCT}%** | The move is real, not 0.05% noise |
-| **Slope direction** | Regression slope matches the move direction | Confirms the trend is still developing the same way at cutoff |
+| Move % magnitude | {W_MOVE} pts | Strong early movers tend to stay top gainers/losers |
+| Trend Efficiency Ratio | {W_TER} pts | Clean trends continue; choppy moves reverse |
+| Same-Window RVOL | {W_RVOL} pts | Institutional volume is the engine that sustains trends |
+| Candle Body Strength | {W_BODY} pts | Conviction candles signal committed buyers/sellers |
+| Momentum State | {W_MOMEN} pts | Sustained pressure = EOD continuation |
 
-**Total Move % = (Price at cutoff − Yesterday's Close) ÷ Yesterday's Close × 100**
+**Stocks are ranked by EOD Score, not just Move%.**
+Two stocks with the same Move% will be ranked differently if one has cleaner
+trend quality — giving you the highest-probability trade at Rank 1.
+        """)
 
-Stocks that fail any check still appear in the **"All Scanned Stocks"** expander at the
-bottom (sorted by Move %) so you can see everything — but only the trend-qualified
-stocks are in the main BUY/SHORT lists.
-
-**Entry / SL / Target** — based on the 10:45–10:59 AM candle:
-- BUY: Entry = candle HIGH, SL = candle LOW, Target = Entry + 2×Risk
-- SHORT: Entry = candle LOW, SL = candle HIGH, Target = Entry − 2×Risk
-""")
-
+    # ── SETTINGS ─────────────────────────────────────────────────────────────
     st.divider()
-
-    # ── CONFIG — only Mode + Cutoff ─────────────────────────────────────
     st.markdown("### ⚙️ Settings")
     c1, c2, c3 = st.columns(3)
 
@@ -819,7 +1791,9 @@ stocks are in the main BUY/SHORT lists.
     scan_date_input = None
     with c2:
         if not is_live:
-            scan_date_input = st.date_input("Historical Date", value=last_trading_day())
+            scan_date_input = st.date_input(
+                "Historical Date", value=last_trading_day()
+            )
         else:
             tz  = pytz.timezone('Asia/Kolkata')
             now = datetime.now(tz)
@@ -827,73 +1801,47 @@ stocks are in the main BUY/SHORT lists.
             if not is_trading_day(now.date()):
                 st.warning("📅 Market holiday today.")
             elif now.time() < dt_time(10, 30):
-                st.warning("⏰ Wait till 10:30 AM before scanning.")
+                st.warning("⏰ Wait until at least 10:30 AM before scanning.")
             else:
                 st.success("✅ Ready to scan!")
 
     with c3:
         cutoff_opt = st.radio(
-            "Data Cutoff", ["11:00 AM", "11:30 AM"], horizontal=True,
-            help="Data fetched ONLY up to this time, even if you run later."
+            "Data Cutoff",
+            ["11:00 AM  (8 candles)", "11:30 AM  (10 candles)"],
+            horizontal=True,
+            help=(
+                "Only 15-min candles completed before this time are used. "
+                "Entry candle = the last candle at cutoff. No look-ahead."
+            ),
         )
         cutoff_h = 11
-        cutoff_m = 0 if cutoff_opt == "11:00 AM" else 30
+        cutoff_m = 0 if "11:00" in cutoff_opt else 30
 
-    # ── STOCK LIST ────────────────────────────────────────────────────────
+    # ── STOCK LIST ────────────────────────────────────────────────────────────
     st.markdown("### 📋 Stocks to Scan")
-    fo_stocks = [
-        "360ONE","ABB","APLAPOLLO","AUBANK","ADANIENSOL","ADANIENT",
-        "ADANIGREEN","ADANIPORTS","ABCAPITAL","ALKEM","AMBER","AMBUJACEM",
-        "ANGELONE","APOLLOHOSP","ASHOKLEY","ASIANPAINT","ASTRAL",
-        "AUROPHARMA","DMART","AXISBANK","BSE","BAJAJ-AUTO","BAJFINANCE",
-        "BAJAJFINSV","BANDHANBNK","BANKBARODA","BANKINDIA","BDL","BEL",
-        "BHARATFORG","BHEL","BPCL","BHARTIARTL","BIOCON","BLUESTARCO",
-        "BOSCHLTD","BRITANNIA","CGPOWER","CANBK","CDSL","CHOLAFIN",
-        "CIPLA","COALINDIA","COFORGE","COLPAL","CAMS","CONCOR",
-        "CROMPTON","CUMMINSIND","CYIENT","DLF","DABUR","DALBHARAT",
-        "DELHIVERY","DIVISLAB","DIXON","DRREDDY","ETERNAL","EICHERMOT",
-        "EXIDEIND","NYKAA","FORTIS","GAIL","GMRAIRPORT","GLENMARK",
-        "GODREJCP","GODREJPROP","GRASIM","HCLTECH","HDFCAMC","HDFCBANK",
-        "HDFCLIFE","HFCL","HAVELLS","HEROMOTOCO","HINDALCO","HAL",
-        "HINDPETRO","HINDUNILVR","HINDZINC","POWERINDIA","HUDCO",
-        "ICICIBANK","ICICIGI","ICICIPRULI","IDFCFIRSTB","IIFL","ITC",
-        "INDIANB","IEX","IOC","IRCTC","IRFC","IREDA","IGL",
-        "INDUSTOWER","INDUSINDBK","NAUKRI","INFY","INOXWIND","INDIGO",
-        "JINDALSTEL","JSWENERGY","JSWSTEEL","JIOFIN","JUBLFOOD","KEI",
-        "KPITTECH","KALYANKJIL","KAYNES","KFINTECH","KOTAKBANK","LTF",
-        "LICHSGFIN","LTIM","LT","LAURUSLABS","LICI","LODHA","LUPIN",
-        "M&M","MANAPPURAM","MANKIND","MARICO","MARUTI","MFSL",
-        "MAXHEALTH","MAZDOCK","MPHASIS","MCX","MUTHOOTFIN","NBCC",
-        "NCC","NHPC","NMDC","NTPC","NATIONALUM","NESTLEIND","NUVAMA",
-        "OBEROIRLTY","ONGC","OIL","PAYTM","OFSS","POLICYBZR","PGEL",
-        "PIIND","PNBHOUSING","PAGEIND","PATANJALI","PERSISTENT",
-        "PETRONET","PIDILITIND","PPLPHARMA","POLYCAB","PFC","POWERGRID",
-        "PRESTIGE","PNB","RBLBANK","RECLTD","RVNL","RELIANCE",
-        "SBICARD","SBILIFE","SHREECEM","SRF","SAMMAANCAP","MOTHERSON",
-        "SHRIRAMFIN","SIEMENS","SOLARINDS","SONACOMS","SBIN","SAIL",
-        "SUNPHARMA","SUPREMEIND","SUZLON","SYNGENE","TATACONSUM",
-        "TITAGARH","TVSMOTOR","TCS","TATAELXSI","TATAPOWER","TATASTEEL",
-        "TATATECH","TECHM","FEDERALBNK","INDHOTEL","PHOENIXLTD","TITAN",
-        "TORNTPHARM","TORNTPOWER","TRENT","TIINDIA","UNOMINDA","UPL",
-        "ULTRACEMCO","UNIONBANK","UNITDSPR","VBL","VEDL","IDEA",
-        "VOLTAS","WIPRO","YESBANK","ZYDUSLIFE",
-        "HYUNDAI","SWIGGY","PREMIERENE",
-    ]
-
-    stocks_txt = st.text_area("Stocks (one per line)", value="\n".join(fo_stocks), height=80)
+    stocks_txt = st.text_area(
+        "Stocks (one per line, NSE symbols)",
+        value="\n".join(DEFAULT_STOCKS),
+        height=80,
+    )
     stocks = [s.strip().upper() for s in stocks_txt.split('\n') if s.strip()]
-    st.caption(f"**{len(stocks)}** stocks in scan universe.")
+    st.caption(
+        f"**{len(stocks)}** stocks in scan universe. "
+        f"Each stock fetches {FETCH_LOOKBACK_DAYS} calendar days of 1-min data → "
+        f"resampled to 15-min for all MRTQ v2 metrics."
+    )
 
     st.divider()
-
-    run_btn   = st.button("▶️ RUN SCAN", use_container_width=True, type="primary")
+    run_btn   = st.button("▶️ RUN SCAN", width='stretch', type="primary")
     result_ph = st.empty()
 
+    # ── RUN SCAN ──────────────────────────────────────────────────────────────
     if run_btn:
         if not st.session_state['connected'] or not st.session_state['trade']:
-            st.error("❌ Connect to Alice Blue first.")
+            st.error("❌ Connect to Alice Blue first (expand the Login section above).")
         else:
-            trade = st.session_state['trade']
+            trade       = st.session_state['trade']
             holiday_msg = None
 
             if is_live:
@@ -901,53 +1849,73 @@ stocks are in the main BUY/SHORT lists.
                 if is_trading_day(today):
                     scan_date = today
                 else:
-                    scan_date = last_trading_day(today)
+                    scan_date   = last_trading_day(today)
                     holiday_msg = (f"📅 Today is a holiday. "
                                    f"Scanning {scan_date.strftime('%d-%b-%Y')} instead.")
             else:
                 scan_date = scan_date_input
                 if not is_trading_day(scan_date):
                     holiday_msg = (f"⚠️ {scan_date.strftime('%d-%b-%Y')} "
-                                   f"may be a holiday — data could be limited.")
+                                   f"may be a holiday — data may be limited.")
 
             prog = st.progress(0)
             ptxt = st.empty()
 
-            def on_progress(done, total, sym):
-                pct = int(done / total * 100)
-                prog.progress(pct)
-                ptxt.text(f"⏳ {done}/{total}  ({pct}%)  ← {sym}")
+            _scan_t0 = [time.time()]   # mutable so the closure can read it
 
-            with st.spinner(f"Scanning {len(stocks)} stocks…"):
-                trend_bull, trend_bear, all_bull, all_bear, diag = run_scan(
+            def on_progress(done, total, sym):
+                if done == 0:
+                    # Master-load phase (before actual scan starts)
+                    prog.progress(0)
+                    ptxt.text(str(sym))
+                    _scan_t0[0] = time.time()   # reset timer when scan actually begins
+                else:
+                    pct = int(done / total * 100)
+                    prog.progress(pct)
+                    elapsed = time.time() - _scan_t0[0]
+                    if done > 2 and elapsed > 0:
+                        rate     = done / elapsed           # stocks/second
+                        remain   = (total - done) / rate    # seconds left
+                        eta_str  = (f"{int(remain)}s" if remain < 90
+                                    else f"{int(remain/60)}m {int(remain%60)}s")
+                        ptxt.text(
+                            f"⏳ {done}/{total}  ({pct}%)  "
+                            f"← {sym}   "
+                            f"· ETA {eta_str}"
+                        )
+                    else:
+                        ptxt.text(f"⏳ {done}/{total}  ({pct}%)  ← {sym}")
+
+            with st.spinner(f"Scanning {len(stocks)} stocks with MRTQ v2…"):
+                top_bull, top_bear, all_res, diag = run_scan(
                     stocks, scan_date, cutoff_h, cutoff_m,
                     trade, status_cb=on_progress
                 )
 
             prog.progress(100)
             ptxt.text(
-                f"✅ Done — {len(trend_bull)} trending BUY  |  "
-                f"{len(trend_bear)} trending SHORT  |  "
-                f"{len(all_bull)+len(all_bear)} total movers"
+                f"✅ Done — {len(top_bull)} Top Gainer Bullish  |  "
+                f"{len(top_bear)} Top Loser Bearish  |  "
+                f"{len(all_res)} stocks processed"
             )
 
             bt_stats = None
-            if not is_live and (trend_bull or trend_bear):
-                with st.spinner("Checking actual EOD results…"):
+            if not is_live and (top_bull or top_bear):
+                with st.spinner("Verifying EOD results…"):
                     c2_, l2_ = {}, threading.Lock()
-                    trend_bull, trend_bear, bt_stats = verify_backtest(
-                        trend_bull, trend_bear, scan_date, trade, c2_, l2_
+                    top_bull, top_bear, bt_stats = verify_backtest(
+                        top_bull, top_bear, scan_date, trade, c2_, l2_
                     )
 
-            st.session_state['results'] = (
-                trend_bull, trend_bear, all_bull, all_bear, diag,
+            st.session_state['results']  = (
+                top_bull, top_bear, all_res, diag,
                 scan_date, not is_live, holiday_msg, cutoff_opt
             )
             st.session_state['bt_stats'] = bt_stats
 
-    # ── SHOW RESULTS ──────────────────────────────────────────────────────
+    # ── SHOW RESULTS ──────────────────────────────────────────────────────────
     if st.session_state.get('results') is not None:
-        (trend_bull, trend_bear, all_bull, all_bear, diag,
+        (top_bull, top_bear, all_res, diag,
          scan_date, is_hist, holiday_msg, cutoff_opt) = st.session_state['results']
         bt_stats = st.session_state.get('bt_stats')
 
@@ -958,112 +1926,136 @@ stocks are in the main BUY/SHORT lists.
             n_fail = sum(1 for v in diag.values() if v.startswith('FAILED'))
             n_ok   = len(diag) - n_fail
 
-            st.markdown(f"## Results — {scan_date.strftime('%d %B %Y')}  |  Cutoff: {cutoff_opt}")
+            st.markdown(
+                f"## Results — {scan_date.strftime('%d %B %Y')}  |  "
+                f"Cutoff: {cutoff_opt}"
+            )
 
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("🟢 Trending BUY",   len(trend_bull))
-            m2.metric("🔴 Trending SHORT", len(trend_bear))
-            m3.metric("📈 All movers",     len(all_bull)+len(all_bear))
-            m4.metric("✅ Fetched OK",     f"{n_ok}/{n_ok+n_fail}")
+            m1.metric("🟢 Top Gainer Bullish", len(top_bull))
+            m2.metric("🔴 Top Loser Bearish",  len(top_bear))
+            m3.metric("📊 Scanned OK",         n_ok)
+            m4.metric("❌ Fetch Failed",       n_fail)
 
+            if n_ok + n_fail > 0 and n_fail / (n_ok + n_fail) > 0.15:
+                # Collect failure reasons from diag dict
+                fail_reasons = {}
+                fail_syms    = []
+                for sym, msg in diag.items():
+                    if str(msg).startswith("FAILED"):
+                        fail_syms.append(sym)
+                        stage = str(msg).split(":")[1].strip() if ":" in msg else "unknown"
+                        fail_reasons[stage] = fail_reasons.get(stage, 0) + 1
+                rstr = "  |  ".join(f"{s}={c}" for s,c in
+                                    sorted(fail_reasons.items(), key=lambda x:-x[1]))
+                st.warning(
+                    f"⚠️ **{n_fail} of {n_ok+n_fail} stocks failed** — "
+                    f"Stages: {rstr or 'unknown'}  ·  "
+                    f"Re-run immediately to use cached instruments. "
+                    f"Same stocks failing every run = add to SYMBOL_MAP."
+                )
+                if fail_syms:
+                    with st.expander(
+                        f"❌ {len(fail_syms)} failed symbols — click to see"
+                    ):
+                        st.code("\n".join(sorted(fail_syms)))
+
+            # ── Backtest summary ───────────────────────────────────────────────
             if bt_stats and bt_stats['total'] > 0:
                 st.divider()
-                st.markdown("### 🔬 Backtest Result")
+                st.markdown("### 🔬 Backtest Verification")
                 bc1,bc2,bc3,bc4,bc5,bc6 = st.columns(6)
-                bc1.metric("Trades",    bt_stats['total'])
-                bc2.metric("🟢 Buy Win", bt_stats['bw'])
-                bc3.metric("❌ Buy Loss",bt_stats['bl'])
-                bc4.metric("🟢 Sell Win",bt_stats['sw'])
+                bc1.metric("Trades",      bt_stats['total'])
+                bc2.metric("🟢 Buy Win",  bt_stats['bw'])
+                bc3.metric("❌ Buy Loss", bt_stats['bl'])
+                bc4.metric("🟢 Sell Win", bt_stats['sw'])
                 bc5.metric("❌ Sell Loss",bt_stats['sl'])
                 bc6.metric("🏆 Win Rate", f"{bt_stats['win_rate']}%")
 
             st.divider()
 
-            # ── TRENDING BUY ──
-            st.markdown(f"## 🟢 BULLISH TRENDING STOCKS — BUY  ({len(trend_bull)})")
+            # ── TOP GAINER BULLISH ─────────────────────────────────────────────
+            st.markdown(f"## 🟢 TOP GAINER BULLISH  ({len(top_bull)})")
             st.caption(
-                f"R² ≥ {TREND_MIN_R2} and move ≥ +{TREND_MIN_MOVE_PCT}% since 9:15 AM, sorted by move. "
-                "Enter on breakout of 10:45–10:59 candle HIGH. Exit 3:00 PM."
+                "All 6 MRTQ v2 conditions pass. "
+                "Sorted by EOD Continuation Score → Move % (Rank 1 = highest probability). "
+                "Entry: breakout above last candle HIGH. Exit ~3:00 PM."
             )
-            if trend_bull:
-                st.markdown(build_table(trend_bull, is_bull=True, is_backtest=is_hist),
-                            unsafe_allow_html=True)
+            if top_bull:
+                st.markdown(
+                    build_table(top_bull, is_bull=True, is_backtest=is_hist),
+                    unsafe_allow_html=True
+                )
             else:
                 st.info(
-                    "No bullish stock met the trend-consistency check today. "
-                    "Check **All Scanned Stocks** below to see how close any "
-                    "candidates were (their R² and Move% are shown there)."
+                    "No stock passed all 6 bullish conditions today. "
+                    "Open **All Scanned Stocks** below — each stock shows its X/6 "
+                    "score with exact reasons for the conditions that failed."
                 )
 
             st.divider()
 
-            # ── TRENDING SHORT ──
-            st.markdown(f"## 🔴 BEARISH TRENDING STOCKS — SHORT  ({len(trend_bear)})")
+            # ── TOP LOSER BEARISH ──────────────────────────────────────────────
+            st.markdown(f"## 🔴 TOP LOSER BEARISH  ({len(top_bear)})")
             st.caption(
-                f"R² ≥ {TREND_MIN_R2} and move ≤ -{TREND_MIN_MOVE_PCT}% since 9:15 AM, sorted by move. "
-                "Enter on breakdown of 10:45–10:59 candle LOW. Exit 3:00 PM."
+                "All 6 MRTQ v2 conditions pass (bearish direction). "
+                "Sorted by EOD Continuation Score → Move % (Rank 1 = highest probability). "
+                "Entry: breakdown below last candle LOW. Exit ~3:00 PM."
             )
-            if trend_bear:
-                st.markdown(build_table(trend_bear, is_bull=False, is_backtest=is_hist),
-                            unsafe_allow_html=True)
+            if top_bear:
+                st.markdown(
+                    build_table(top_bear, is_bull=False, is_backtest=is_hist),
+                    unsafe_allow_html=True
+                )
             else:
                 st.info(
-                    "No bearish stock met the trend-consistency check today. "
-                    "Check **All Scanned Stocks** below to see how close any "
-                    "candidates were (their R² and Move% are shown there)."
+                    "No stock passed all 6 bearish conditions today. "
+                    "Open **All Scanned Stocks** below for the X/6 breakdown."
                 )
 
             st.divider()
 
-            st.markdown("""
-### 📌 Trade Execution (Quick Reference)
+            # ── EXECUTION GUIDE ───────────────────────────────────────────────
+            st.markdown(f"""
+### 📌 Trade Execution
 
-| | BUY | SHORT |
+| | BUY (Bullish) | SHORT (Bearish) |
 |---|---|---|
-| **Candle** | 10:45–10:59 AM | Same |
-| **Entry** | Above candle HIGH | Below candle LOW |
-| **Stop Loss** | Candle LOW | Candle HIGH |
-| **Target** | 2× Risk extension | Same |
-| **Exit time** | 3:00 PM hard stop | Same |
+| **Entry Candle** | Last 15-min candle at cutoff | Same |
+| **Entry** | Breakout above candle **HIGH** | Breakdown below candle **LOW** |
+| **Stop Loss** | Candle **LOW** | Candle **HIGH** |
+| **Target** | Entry + {RR_RATIO}× Risk | Entry − {RR_RATIO}× Risk |
+| **Exit Time** | ~3:00 PM | ~3:00 PM |
+
+> **Rank 1 first.** The EOD Score ranks stocks by continuation probability.
+> If you can only take one trade, take Rank 1.
 """)
 
             st.divider()
 
-            # ── ALL SCANNED STOCKS (reference) ──
+            # ── ALL SCANNED STOCKS (diagnostics) ─────────────────────────────
+            all_sorted = sorted(all_res, key=lambda r: r['EODScore'], reverse=True)
             with st.expander(
-                f"📋 All Scanned Stocks — {len(all_bull)} up, {len(all_bear)} down "
-                f"(sorted by Move%, includes non-trending)",
-                expanded=False
+                f"📋 All Scanned Stocks — {len(all_res)} "
+                f"(X/6 condition breakdown, sorted by EOD Score)",
+                expanded=(len(top_bull) + len(top_bear) == 0)
             ):
-                st.markdown("**All stocks that moved UP (Move% > 0)**")
-                st.markdown(build_table(all_bull, is_bull=True, show_trend_badge=True),
-                            unsafe_allow_html=True)
-                st.markdown("**All stocks that moved DOWN (Move% < 0)**")
-                st.markdown(build_table(all_bear, is_bull=False, show_trend_badge=True),
-                            unsafe_allow_html=True)
+                st.markdown(
+                    build_table(all_sorted, is_bull=True, show_diag=True),
+                    unsafe_allow_html=True
+                )
 
-            # ── DIAGNOSTICS ──
+            # ── FETCH DIAGNOSTICS ─────────────────────────────────────────────
             with st.expander(
-                f"🔧 Scan Diagnostics — {n_ok} OK, {n_fail} Failed",
+                f"🔧 Fetch Diagnostics — {n_ok} OK, {n_fail} Failed",
                 expanded=(n_fail > 0)
             ):
-                diag_rows = [{'Symbol': s, 'Status': diag[s]} for s in sorted(diag.keys())]
-                df_diag = pd.DataFrame(diag_rows)
-
-                fails_only = st.checkbox("Show only failed stocks", value=(n_fail > 0))
+                diag_rows = [{'Symbol': s, 'Status': diag[s]} for s in sorted(diag)]
+                df_diag   = pd.DataFrame(diag_rows)
+                fails_only = st.checkbox("Show only failures", value=(n_fail > 0))
                 if fails_only:
                     df_diag = df_diag[df_diag['Status'].str.startswith('FAILED')]
-
-                st.dataframe(df_diag, use_container_width=True, height=400)
-
-                if n_fail > 0:
-                    st.markdown("""
-**Common reasons & fixes:**
-- `instrument not found on Alice Blue` → symbol name doesn't match Alice Blue's master.
-- `API returned empty list` → no data for that stock in this window.
-- `too few candles` → market may not have opened yet, or stock is illiquid pre-cutoff.
-- `no candles found for previous day` → previous trading day calc may be off for new listings.
-""")
+                st.dataframe(df_diag, width='stretch', height=400)
 
 
 if __name__ == "__main__":
