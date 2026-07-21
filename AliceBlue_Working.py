@@ -113,7 +113,11 @@ W_TMS    =  2   # weight: trend maturity   (NEW — penalise overextended moves)
 # Sum: 22+20+18+10+10+6+8+4+2 = 100
 
 # ── History / RVOL ───────────────────────────────────────────────────────────
-FETCH_LOOKBACK_DAYS = 8    # 8 calendar days covers 5 trading days for RVOL + 1 prev close
+FETCH_LOOKBACK_DAYS = 15   # MUST be ≥15 for Alice Blue to return same-day intraday data.
+                           # Alice Blue's historical API silently omits today's data when
+                           # the fetch window is < ~15 calendar days. This is a known API
+                           # quirk — the original v2 used 15 for exactly this reason.
+                           # Do NOT reduce below 12 or ~35 stocks will show 0 today-candles.
 RVOL_LOOKBACK       = 5    # trading days for same-window volume baseline
 
 # ── API reliability ───────────────────────────────────────────────────────────
@@ -1135,19 +1139,59 @@ def scan_one(sym, scan_date, cutoff_dt, trade, cache, cache_lock):
             return None, "FAILED: empty after resample to 15-min"
 
         # ── 3. PREVIOUS DAY CLOSE ─────────────────────────────────────────────
-        pdays = prev_trading_days(scan_date, 1)
-        if not pdays:
-            return None, "FAILED: no previous trading day found"
-        pday      = pdays[0]
-        df_prev   = df1[df1.index.date == pday]
-        if df_prev.empty:
-            return None, f"FAILED: no 1-min bars for prev day {pday}"
-        prev_close = float(df_prev['Close'].iloc[-1])
+        # Try up to 5 previous trading days — uses the first one with data.
+        # Handles stocks with data gaps (newly listed, circuit halt, etc.)
+        prev_close = None
+        prev_close = None
+        for _pd in prev_trading_days(scan_date, 5):
+            _df_prev = df1[df1.index.date == _pd]
+            if not _df_prev.empty:
+                _pc = float(_df_prev['Close'].iloc[-1])
+                if _pc > 0:
+                    prev_close = _pc
+                    prev_close = _pc
+                    break
+        if prev_close is None:
+            return None, "FAILED: no valid prev close in last 5 trading days"
+
         if prev_close <= 0:
             return None, "FAILED: prev close invalid"
 
         # ── 4. TODAY'S 15-MIN CANDLES ─────────────────────────────────────────
         df15_today = df15[df15.index.date == scan_date].copy()
+
+        # ── STRICT CUTOFF FILTER ─────────────────────────────────────────────
+        # CRITICAL FIX: Alice Blue's API often ignores to_datetime and returns
+        # ALL intraday data up to the current time — not just up to the cutoff.
+        # Without this filter:
+        #   Run at 11:03 AM → uses 8 candles (9:15–11:00)  ← correct
+        #   Run at  2:30 PM → uses 24 candles (9:15–14:30) ← WRONG
+        # This is why selecting "11:00 AM cutoff" gave different results
+        # depending on what time you ran the script.
+        #
+        # Fix: after resampling, drop any 15-min candle whose FULL period has
+        # not yet completed before the selected cutoff time.
+        # A candle at time T covers T → T+CANDLE_MIN.
+        # Include it when T <= cutoff_dt (i.e. it has STARTED by cutoff).
+        # "11:00 AM (8 candles)" = 8 candles that START by 11:00 AM.
+        # e.g. cutoff 11:00 AM:
+        #   candle at 10:45 → ends 11:00 → INCLUDED  ✅
+        #   candle at 11:00 → ends 11:15 → EXCLUDED  ❌
+        _idx = df15_today.index
+        if _idx.tzinfo is None:
+            _idx = _idx.tz_localize('Asia/Kolkata')
+        else:
+            _idx = _idx.tz_convert('Asia/Kolkata')
+        df15_today = df15_today[
+            # Strict filter: only fully-complete candles.
+            # A candle at T covers T → T+15 min; include only when T+15 ≤ cutoff_dt.
+            # Because cutoff_dt is +15 min from display label (e.g. "11:00 AM" label
+            # → cutoff_dt = 11:15), the 11:00 candle (ends 11:15 ≤ 11:15) IS included
+            # and is ALWAYS fully formed before being used.
+            # This makes Live mode == Historical mode for same date and cutoff.
+            (_idx + pd.Timedelta(minutes=CANDLE_MIN)) <= cutoff_dt
+        ]
+        del _idx   # clean up
         if len(df15_today) < MIN_CANDLES:
             return None, (
                 f"FAILED: only {len(df15_today)} × {CANDLE_MIN}-min candles today "
@@ -1656,7 +1700,7 @@ DEFAULT_STOCKS = [
 # =============================================================================
 def main():
     st.set_page_config(
-        page_title="NSE F&O Momentum Scanner v2.5",
+        page_title="NSE F&O Momentum Scanner v2",
         page_icon="📈",
         layout="wide",
     )
@@ -1815,8 +1859,35 @@ trend quality — giving you the highest-probability trade at Rank 1.
                 "Entry candle = the last candle at cutoff. No look-ahead."
             ),
         )
-        cutoff_h = 11
-        cutoff_m = 0 if "11:00" in cutoff_opt else 30
+        # Internal cutoff = displayed time + 15 min.
+        # This ensures the last named candle is FULLY complete before inclusion.
+        # "11:00 AM (8 candles)" → internal cutoff = 11:15 AM
+        #   → the 11:00–11:15 candle is only included after 11:15 AM (fully formed)
+        # "11:30 AM (10 candles)" → internal cutoff = 11:45 AM
+        # Both Live and Historical now use the same set of complete candles.
+        if "11:00" in cutoff_opt:
+            cutoff_h, cutoff_m = 11, 15   # internal: 11:15 AM
+        else:
+            cutoff_h, cutoff_m = 11, 45   # internal: 11:45 AM
+
+    # ── LIVE MODE SETTLEMENT WARNING ─────────────────────────────────────────
+    # Shown after both c2 and c3 so cutoff_h/cutoff_m are already defined.
+    if is_live:
+        try:
+            _tz  = pytz.timezone("Asia/Kolkata")
+            _now = datetime.now(_tz)
+            _internal = dt_time(cutoff_h, cutoff_m)
+            if _now.time() < _internal and is_trading_day(_now.date()):
+                _disp_m = (cutoff_m - 15) % 60
+                _disp_h = cutoff_h if cutoff_m >= 15 else cutoff_h - 1
+                st.warning(
+                    f"⏰ **Run after {_disp_h:02d}:{_disp_m:02d} AM** for the selected cutoff. "
+                    f"The last candle is still forming — "
+                    f"scanning now may give fewer candles than Historical mode. "
+                    f"Wait until **{cutoff_h:02d}:{cutoff_m:02d} AM** for Live = Historical."
+                )
+        except Exception:
+            pass
 
     # ── STOCK LIST ────────────────────────────────────────────────────────────
     st.markdown("### 📋 Stocks to Scan")
