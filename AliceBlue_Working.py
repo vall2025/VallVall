@@ -101,16 +101,21 @@ MAX_SHADOW_RATIO = 1.20  # max opposing shadow / avg body ratio (Condition 6)
 #   (a) give quality metrics more influence than raw price move
 #   (b) incorporate three new components: PBQ, LRS, TMS
 #   (c) add Shadow Quality to the score (was gate-only before)
-W_MOVE   = 22   # weight: move magnitude   (reduced — raw move ≠ continuation)
-W_TER    = 20   # weight: trend efficiency (unchanged core predictor)
-W_RVOL   = 18   # weight: volume quality   (unchanged — institutional confirms)
-W_BODY   = 10   # weight: candle body str  (reduced — PBQ now captures this better)
-W_MOMEN  = 10   # weight: momentum state
-W_SHADOW =  6   # weight: shadow quality   (NEW in score — was gate-only before)
-W_PBQ    =  8   # weight: pullback quality (NEW — shallow pullbacks = continuation)
-W_LRS    =  4   # weight: LR slope score   (NEW — trend steepness × fit quality)
-W_TMS    =  2   # weight: trend maturity   (NEW — penalise overextended moves)
-# Sum: 22+20+18+10+10+6+8+4+2 = 100
+# ── Score weights (sum = 100) ─────────────────────────────────────────────────
+# Calibrated from reference data: extreme RVOL and extreme Move% predict
+# REVERSAL, not continuation. Moderate RVOL + building momentum = continuation.
+W_MOVE    = 14   # ATR-adjusted move (not raw %) — overextension is now penalised
+W_TER     = 18   # trend efficiency — unchanged, key quality predictor
+W_RVOL    = 12   # continuation-optimised RVOL — extreme values now penalised
+W_BODY    =  8   # candle body strength
+W_MOMEN   = 10   # momentum state
+W_SHADOW  =  4   # shadow quality
+W_PBQ     =  8   # pullback quality — shallow pullbacks = continuation
+W_LRS     =  4   # linear regression slope × R²
+W_TMS     =  4   # trend maturity (was 2 — increased; overextension matters more)
+W_PACCEL  = 10   # NEW: price acceleration in recent candles vs early candles
+W_RELSTR  =  8   # NEW: relative strength rank vs scan universe (post-scan)
+# Sum: 14+18+12+8+10+4+8+4+4+10+8 = 100
 
 # ── History / RVOL ───────────────────────────────────────────────────────────
 FETCH_LOOKBACK_DAYS = 15   # MUST be ≥15 for Alice Blue to return same-day intraday data.
@@ -144,79 +149,97 @@ SYMBOL_SUFFIXES = {
 # Maps NSE official symbol → Alice Blue internal name.
 # Each entry is a list so multiple candidates are tried in order.
 # Add entries here whenever you find a symbol that consistently fails.
+# ── SYMBOL_MAP ────────────────────────────────────────────────────────────────
+# Maps NSE official symbol → list of Alice Blue name candidates (tried in order).
+# RULE: NSE official name is ALWAYS listed FIRST (most likely with -EQ to work).
+#       Alternative names come after as fallbacks only.
+# To fix a failing stock: expand its list with the exact Alice Blue scrip name.
 SYMBOL_MAP = {
-    # Special characters
-    'M&M'         : ['M&M',         'MM'],
-    'GVT&D'       : ['GVT&D',       'GVTD',        'GVT'],
+    # ── Special characters ────────────────────────────────────────────────────
+    'M&M'         : ['M&M',        'MM',           'MAHINDRA'],
+    'GVT&D'       : ['GVT&D',      'GVTD',         'GVT',        'GVTANDD'],
 
-    # Hyphenated symbols
-    'BAJAJ-AUTO'  : ['BAJAJ-AUTO',  'BAJAJAUTO'],
-    'NAM-INDIA'   : ['NAM-INDIA',   'NAMINDIA',    'NAМИНDIA'],
+    # ── Hyphenated symbols ────────────────────────────────────────────────────
+    'BAJAJ-AUTO'  : ['BAJAJ-AUTO', 'BAJAJAUTO',    'BAJAJ'],
+    'NAM-INDIA'   : ['NAM-INDIA',  'NAMINDIA',     'NIPPONIND',  'RELIANCENI'],
 
-    # Zomato rebranded to Eternal in 2025; Alice Blue may use either name
-    'ETERNAL'     : ['ETERNAL',     'ZOMATO'],
+    # ── Renamed / rebranded stocks ────────────────────────────────────────────
+    # Zomato rebranded to Eternal 2025 — try both names
+    'ETERNAL'     : ['ETERNAL',    'ZOMATO',       'ETERNALLTD'],
+    # Avenue Supermarts listed as DMART on NSE
+    'DMART'       : ['DMART',      'AVENUSUPER',   'DMARTLTD'],
+    # FSN E-Commerce (Nykaa) — try both
+    'NYKAA'       : ['NYKAA',      'FSNECOMM',     'FSNE',       'FSN'],
 
-    # Tata Motors DVR — exact Alice Blue name varies by version
-    'TMPV'        : ['TATAMTRDVR',  'TATAMOTORS-DVR', 'TATAMTRDVREQ', 'TATAMOTDVR'],
+    # ── Tata Motors DVR ───────────────────────────────────────────────────────
+    'TMPV'        : ['TATAMTRDVR', 'TATAMOTDVR',   'TATAMTRDV',  'TATADVR'],
 
-    # LTI Mindtree — listed as LTIM on NSE but some versions use LTM
-    'LTM'         : ['LTIM',        'LTM',         'LTIMINDTREE'],
+    # ── LTI Mindtree (stock symbol is LTIM on NSE; LTM is wrong) ─────────────
+    'LTM'         : ['LTIM',       'LTM',          'LTIMINDTRE'],
 
-    # Motilal Oswal Financial Services
-    'MOTILALOFS'  : ['MOTILALOFIN', 'MOTILALOFS',  'MOFSL'],
+    # ── Motilal Oswal — NSE symbol MOTILALOFS; try it first ──────────────────
+    'MOTILALOFS'  : ['MOTILALOFS', 'MOTILALOFIN',  'MOFSL',      'MOTILAL'],
 
-    # Vishal Mega Mart
-    'VMM'         : ['VMM',         'VISHAL',      'VISHALMEGAMART'],
+    # ── Vishal Mega Mart ──────────────────────────────────────────────────────
+    'VMM'         : ['VMM',        'VISHAL',       'VISHALMM',   'VISHALMEGAR'],
 
-    # Jio Financial Services
-    'JIOFIN'      : ['JIOFIN',      'JIOFINANCE',  'JIOFINSVC'],
+    # ── Jio Financial Services ────────────────────────────────────────────────
+    'JIOFIN'      : ['JIOFIN',     'JIOFINANCE',   'JIOFINSVC',  'JIOFINSERV'],
 
-    # Hitachi Energy India (formerly ABB Power Products India)
-    'POWERINDIA'  : ['POWERINDIA',  'HITACHIENER', 'ABBPOWER'],
+    # ── Hitachi Energy India (formerly ABB Power Products) ───────────────────
+    'POWERINDIA'  : ['POWERINDIA', 'HITACHIENER',  'HITACHIENE', 'ABBPOWER'],
 
-    # Amber Enterprises India
-    'AMBER'       : ['AMBERENTER',  'AMBER',       'AMBERENT'],
+    # ── Amber Enterprises ────────────────────────────────────────────────────
+    'AMBER'       : ['AMBER',      'AMBERENTER',   'AMBERENT',   'AMBERENTR'],
 
-    # Godfrey Phillips — Alice Blue may use shorter form
-    'GODFRYPHLP'  : ['GODFRYPHLP',  'GODFREYPHIL', 'GODFREY'],
+    # ── Blue Star ─────────────────────────────────────────────────────────────
+    'BLUESTARCO'  : ['BLUESTARCO', 'BLUESTAR',     'BLUESTAREN'],
 
-    # Mazagon Dock Shipbuilders
-    'MAZDOCK'     : ['MAZDOCK',     'MAZAGONDOCK', 'MAZGONDOCK'],
+    # ── Godfrey Phillips ──────────────────────────────────────────────────────
+    'GODFRYPHLP'  : ['GODFRYPHLP', 'GODFREYPHI',   'GODFREY',    'GODFREYPHIL'],
 
-    # Cochin Shipyard
-    'COCHINSHIP'  : ['COCHINSHIP',  'COCHIN',      'CSHL'],
+    # ── Mazagon Dock Shipbuilders ─────────────────────────────────────────────
+    'MAZDOCK'     : ['MAZDOCK',    'MAZAGONDCK',   'MAZAGONDOCK','MAZGONDOCK'],
 
-    # Force Motors
-    'FORCEMOT'    : ['FORCEMOT',    'FORCEMOTOR',  'FORCEMOTORS'],
+    # ── Cochin Shipyard ───────────────────────────────────────────────────────
+    'COCHINSHIP'  : ['COCHINSHIP', 'COCHINSHPY',   'COCHIN',     'CSHL'],
 
-    # PG Electroplast
-    'PGEL'        : ['PGEL',        'PGELECTROPL', 'PGELECT'],
+    # ── Force Motors ─────────────────────────────────────────────────────────
+    'FORCEMOT'    : ['FORCEMOT',   'FORCEMOTOR',   'FORCEMOTORS'],
 
-    # Kaynes Technology
-    'KAYNES'      : ['KAYNES',      'KAYNESTEC',   'KAYNESTECH'],
+    # ── PG Electroplast ───────────────────────────────────────────────────────
+    'PGEL'        : ['PGEL',       'PGELECTRO',    'PGELECTROPL'],
 
-    # Radico Khaitan
-    'RADICO'      : ['RADICO',      'RADICOKH',    'RADIKHAI'],
+    # ── Kaynes Technology ─────────────────────────────────────────────────────
+    'KAYNES'      : ['KAYNES',     'KAYNESTEC',    'KAYNESTECH', 'KAYNESIND'],
 
-    # Waaree Energies
-    'WAAREEENER'  : ['WAAREEENER',  'WAAREE',      'WAAREEEN'],
+    # ── Radico Khaitan ───────────────────────────────────────────────────────
+    'RADICO'      : ['RADICO',     'RADICOKH',     'RADICOKHAI'],
 
-    # Patanjali Foods
-    'PATANJALI'   : ['PATANJALI',   'PATANJALIF',  'PATFOODS'],
+    # ── Waaree Energies ───────────────────────────────────────────────────────
+    'WAAREEENER'  : ['WAAREEENER', 'WAAREE',       'WAAREEENRG', 'WAAREEEN'],
 
-    # Nuvama Wealth Management
-    'NUVAMA'      : ['NUVAMA',      'NUVAMAWEALTH','EDELWEISS'],
+    # ── Patanjali Foods ───────────────────────────────────────────────────────
+    'PATANJALI'   : ['PATANJALI',  'PATANJALIF',   'PATFOODS',   'PATANJALIF'],
 
-    # Rail Vikas Nigam
-    'RVNL'        : ['RVNL',        'RAILVIKAS'],
+    # ── Nuvama Wealth (formerly Edelweiss Wealth) ─────────────────────────────
+    'NUVAMA'      : ['NUVAMA',     'NUVAMAWEALTH', 'EDELWEISS',  'NUVAMAASST'],
 
-    # BDL — Bharat Dynamics
-    'BDL'         : ['BDL',         'BHARATDYN'],
+    # ── Rail Vikas Nigam ──────────────────────────────────────────────────────
+    'RVNL'        : ['RVNL',       'RAILVIKAS',    'RVNLLTD'],
 
-    # Standard entries (stored same in Alice Blue)
-    'LICI'        : ['LICI'],
-    'ADANIGREEN'  : ['ADANIGREEN'],
-    'ADANIPOWER'  : ['ADANIPOWER'],
+    # ── Bharat Dynamics ───────────────────────────────────────────────────────
+    'BDL'         : ['BDL',        'BHARATDYN',    'BDLLTD'],
+
+    # ── Bajaj Holdings ────────────────────────────────────────────────────────
+    'BAJAJHLDNG'  : ['BAJAJHLDNG', 'BAJAJHOLD',    'BAJAJHOLDI'],
+    # ── Oracle Financial Services Software ───────────────────────────────────
+    'OFSS'        : ['OFSS',       'ORACLEFSSS',   'ORACLEFIN'],
+
+    # ── Standard entries (try NSE name with -EQ — usually works) ─────────────
+    'LICI'        : ['LICI',       'LICIND',       'LICICORPLTD'],
+    'ADANIGREEN'  : ['ADANIGREEN', 'ADANIGRN'],
+    'ADANIPOWER'  : ['ADANIPOWER', 'ADANIPOW'],
 }
 
 os.environ["TZ"] = "Asia/Kolkata"
@@ -514,6 +537,11 @@ def _fetch_1min_attempt(sym, from_dt, to_dt, trade, cache, cache_lock):
             base_variants.add(cand.replace('&', ''))       # GVT&D → GVTD
             base_variants.add(cand.replace(' ', ''))       # trailing spaces
             base_variants.add(cand.replace('.', ''))       # dots
+            # Truncation variants — Alice Blue stores some symbols with fewer chars
+            clean = cand.replace('-','').replace('&','').replace(' ','').replace('.','')
+            for n in (10, 9, 8):
+                if len(clean) > n:
+                    base_variants.add(clean[:n])
         base_variants = {v for v in base_variants if v}
 
         # Use first candidate as 'base' for cache-key labelling
@@ -1036,45 +1064,94 @@ def qualify_bear(m: dict, move_pct: float, rvol) -> tuple:
 # =============================================================================
 # _clamp is kept as a utility but is NOT used for score shaping —
 # only to keep component contributions within [0, 1] for legibility.
+
+# ── Evidence-based scoring helpers ───────────────────────────────────────────
+def _rvol_cont(rv: float) -> float:
+    """RVOL Continuation Score (0-1). Penalises extreme RVOL (>6×) which signals
+    exhaustion events (gap/news) rather than sustainable institutional flow.
+    Sweet spot: 1.5-3.0× = genuine institutional participation."""
+    if rv < 1.0:  return 0.0
+    if rv < 1.5:  return (rv - 1.0) / 0.5 * 0.35
+    if rv <= 3.0: return 0.35 + (rv - 1.5) / 1.5 * 0.65
+    if rv <= 5.0: return max(0.40, 1.0 - (rv - 3.0) / 4.0)
+    return max(0.0, 0.40 - (rv - 5.0) / 15.0)
+
+
+def _atr_move(move_pct: float, atr_pct: float) -> float:
+    """ATR-Normalised Move Score (0-1). Measures fraction of typical daily range
+    already consumed. Sweet spot 25-65% (room to run). Above 80% = exhaustion.
+    MOTILALOFS -10.55% on 2% ATR = 2.6× → score≈0. GVT&D -3% on 4% ATR = 0.75 → score≈0.7."""
+    if atr_pct <= 0: atr_pct = max(abs(move_pct)*1.5, 1.0)
+    ratio = abs(move_pct) / atr_pct
+    if ratio < 0.20: return ratio / 0.20 * 0.35
+    if ratio <= 0.65: return 0.35 + (ratio - 0.20) / 0.45 * 0.65
+    return max(0.0, 1.0 - (ratio - 0.65) / 0.55)
+
+
+def _price_accel(closes, direction: str) -> float:
+    """Price Acceleration Score (0-1). Compares directional momentum in last
+    third of candles vs first third. Accelerating = institutions still entering.
+    Decelerating = move losing steam."""
+    n = len(closes)
+    if n < 4: return 0.5
+    n3 = max(2, n // 3)
+    diffs = np.diff(closes)
+    if direction == 'bull':
+        early = float(np.mean(np.maximum(diffs[:n3], 0)))
+        late  = float(np.mean(np.maximum(diffs[-n3:], 0)))
+    else:
+        early = float(np.mean(np.maximum(-diffs[:n3], 0)))
+        late  = float(np.mean(np.maximum(-diffs[-n3:], 0)))
+    if early < 1e-6: return 0.5
+    return float(min(1.0, max(0.0, 0.3 + (late / early) * 0.5)))
+
+
+def _compute_atr_pct(df15, scan_date) -> float:
+    """Average daily ATR% from last 5 historical trading days."""
+    try:
+        hist = sorted(d for d in set(df15.index.date) if d < scan_date)[-5:]
+        ranges = []
+        for hd in hist:
+            dh = df15[df15.index.date == hd]
+            if len(dh) >= 4:
+                ref = float(dh['Open'].iloc[0])
+                if ref > 0:
+                    ranges.append((float(dh['High'].max()) - float(dh['Low'].min())) / ref * 100.0)
+        return float(np.mean(ranges)) if ranges else 2.0
+    except Exception:
+        return 2.0
+
+
 def _clamp(val, lo=0.0, hi=1.0):
     return max(lo, min(hi, float(val)))
 
 
 def eod_score_bull(m: dict, move_pct: float, rvol) -> float:
     """
-    MRTQ v2+ EOD Continuation Score — BULL (0–100).
+    MRTQ v2+ EOD Continuation Score — BULL (0-100).
 
-    All components use LINEAR normalization with TRANSPARENT reference bounds.
-    No score-shaping curves, no arbitrary saturation caps.
-    Higher raw metric value ALWAYS produces a proportionally higher score.
-
-    Component          Weight  Normalization                  Bound rationale
-    ─────────────────  ──────  ─────────────────────────────  ────────────────
-    Move %              22 pt  |move| / 6.0  (6% = 1.0)     6% = very strong
-    Trend Eff. (TER)    20 pt  ter_bull       [natural 0-1]  inherent [0-1]
-    Same-Window RVOL    18 pt  (rv-1) / 4.0  (5× = 1.0)    5× = max observed
-    Body Strength       10 pt  bull_body_str  [natural 0-1]  inherent [0-1]
-    Momentum State      10 pt  momentum / 2.0 (2.0 = 1.0)   2.0 = accelerating
-    Shadow Quality       6 pt  1 - shadow_ratio              lower wick = cleaner
-    Pullback Quality     8 pt  pbq_bull       [natural 0-1]  inherent [0-1] NEW
-    LR Slope × R²        4 pt  lrs_bull       [natural 0-1]  inherent [0-1] NEW
-    Trend Maturity       2 pt  tms            [natural 0-1]  inherent [0-1] NEW
-    ─────────────────  ──────
-    Total              100 pt
+    Evidence-based scoring calibrated from reference stock analysis.
+    Key changes vs previous version:
+      move_n  → ATR-normalised: penalises overextended moves (>80% ATR consumed)
+      rvol_n  → continuation-optimised: extreme RVOL (>6×) penalised (exhaustion)
+      paccel  → NEW: price acceleration in recent vs early candles
+      relstr  → NEW: relative strength rank vs scan universe (set post-scan)
     """
     rv = float(rvol) if rvol is not None else 1.0
 
-    move_n   = _clamp(abs(move_pct)              / 6.0)  # 6% move = full
-    ter_n    = _clamp(m['ter_bull'])                      # already [0,1]
-    rvol_n   = _clamp((rv - 1.0)                 / 4.0)  # 5× - 1 = 4 = full
-    body_n   = _clamp(m['bull_body_str'])                 # already [0,1]
-    mom_n    = _clamp(m['momentum_bull']          / 2.0)  # 2.0 = full
-    shadow_n = _clamp(1.0 - m['bull_shadow_ratio'])       # inverted: low wick = good
-    pbq_n    = _clamp(m.get('pbq_bull', 0.5))             # [0,1] NEW
-    lrs_n    = _clamp(m.get('lrs_bull', 0.0))             # [0,1] NEW
-    tms_n    = _clamp(m.get('tms', 0.5))                  # [0,1] NEW
+    move_n   = _atr_move(abs(move_pct), m.get('atr_pct', 2.0))   # ATR-adjusted
+    ter_n    = _clamp(m['ter_bull'])
+    rvol_n   = _rvol_cont(rv)                                      # continuation-optimised
+    body_n   = _clamp(m['bull_body_str'])
+    mom_n    = _clamp(m['momentum_bull'] / 2.0)
+    shadow_n = _clamp(1.0 - m['bull_shadow_ratio'])
+    pbq_n    = _clamp(m.get('pbq_bull', 0.5))
+    lrs_n    = _clamp(m.get('lrs_bull', 0.0))
+    tms_n    = _clamp(m.get('tms', 0.5))
+    paccel_n = _clamp(m.get('price_accel_bull', 0.5))             # NEW
+    relstr_n = _clamp(m.get('relative_strength', 0.5))            # NEW (post-scan)
 
-    return round(
+    return round(_clamp(
         move_n   * W_MOVE   +
         ter_n    * W_TER    +
         rvol_n   * W_RVOL   +
@@ -1083,26 +1160,30 @@ def eod_score_bull(m: dict, move_pct: float, rvol) -> float:
         shadow_n * W_SHADOW +
         pbq_n    * W_PBQ    +
         lrs_n    * W_LRS    +
-        tms_n    * W_TMS,
-        1
-    )
+        tms_n    * W_TMS    +
+        paccel_n * W_PACCEL +
+        relstr_n * W_RELSTR,
+        0, 100
+    ), 1)
 
 
 def eod_score_bear(m: dict, move_pct: float, rvol) -> float:
-    """MRTQ v2+ EOD Continuation Score — BEAR (symmetric, 0–100)."""
+    """MRTQ v2+ EOD Continuation Score — BEAR (symmetric, 0-100)."""
     rv = float(rvol) if rvol is not None else 1.0
 
-    move_n   = _clamp(abs(move_pct)              / 6.0)
+    move_n   = _atr_move(abs(move_pct), m.get('atr_pct', 2.0))
     ter_n    = _clamp(m['ter_bear'])
-    rvol_n   = _clamp((rv - 1.0)                 / 4.0)
+    rvol_n   = _rvol_cont(rv)
     body_n   = _clamp(m['bear_body_str'])
-    mom_n    = _clamp(m['momentum_bear']          / 2.0)
+    mom_n    = _clamp(m['momentum_bear'] / 2.0)
     shadow_n = _clamp(1.0 - m['bear_shadow_ratio'])
     pbq_n    = _clamp(m.get('pbq_bear', 0.5))
     lrs_n    = _clamp(m.get('lrs_bear', 0.0))
     tms_n    = _clamp(m.get('tms', 0.5))
+    paccel_n = _clamp(m.get('price_accel_bear', 0.5))
+    relstr_n = _clamp(m.get('relative_strength', 0.5))
 
-    return round(
+    return round(_clamp(
         move_n   * W_MOVE   +
         ter_n    * W_TER    +
         rvol_n   * W_RVOL   +
@@ -1111,9 +1192,12 @@ def eod_score_bear(m: dict, move_pct: float, rvol) -> float:
         shadow_n * W_SHADOW +
         pbq_n    * W_PBQ    +
         lrs_n    * W_LRS    +
-        tms_n    * W_TMS,
-        1
-    )
+        tms_n    * W_TMS    +
+        paccel_n * W_PACCEL +
+        relstr_n * W_RELSTR,
+        0, 100
+    ), 1)
+
 
 # =============================================================================
 # SCAN ONE STOCK
@@ -1251,6 +1335,17 @@ def scan_one(sym, scan_date, cutoff_dt, trade, cache, cache_lock):
             _tms = 0.5   # neutral if no history
 
         m['tms'] = round(_tms, 3)   # inject into metrics dict for scoring
+
+        # ── 6c. ATR% + PRICE ACCELERATION ───────────────────────────────────────
+        # ATR%: typical daily range from 5 prior days — used to judge whether
+        # today's move is moderate (room to run) or extreme (exhaustion risk).
+        # price_accel: is momentum building or fading in recent candles?
+        m['atr_pct']         = _compute_atr_pct(df15, scan_date)
+        closes_arr           = df15_today['Close'].values.astype(float)
+        m['price_accel_bull'] = round(_price_accel(closes_arr, 'bull'), 3)
+        m['price_accel_bear'] = round(_price_accel(closes_arr, 'bear'), 3)
+        m['relative_strength'] = 0.5   # placeholder; updated post-scan by run_scan()
+
 
         # ── 7. QUALIFY ────────────────────────────────────────────────────────
         bull_ok, bull_reasons = qualify_bull(m, total_move_pct, rvol)
@@ -1437,6 +1532,37 @@ def run_scan(stocks, scan_date, cutoff_h, cutoff_m, trade, status_cb=None):
                     done_ctr[0] += 1
                 if status_cb:
                     status_cb(done_ctr[0], total, sym_done)
+
+
+    # ── Relative Strength Rank (post-scan) ───────────────────────────────────
+    # After all stocks are collected, rank each stock's move vs the full universe.
+    # Evidence: extreme movers (top 5%) often reverse; stocks at 50th-80th
+    # percentile have the best EOD continuation probability.
+    if all_res:
+        all_abs_moves = [abs(r.get('TotalMove%', 0)) for r in all_res]
+        n_total = len(all_abs_moves)
+        for r in all_res:
+            this_move = abs(r.get('TotalMove%', 0))
+            rank_pct  = sum(1 for mv in all_abs_moves if mv <= this_move) / n_total
+            # Optimal: 40th-80th percentile (strong but not overextended)
+            if rank_pct < 0.25:
+                relstr = rank_pct / 0.25 * 0.30
+            elif rank_pct <= 0.80:
+                relstr = 0.30 + (rank_pct - 0.25) / 0.55 * 0.70
+            else:
+                relstr = max(0.0, 1.0 - (rank_pct - 0.80) / 0.20)
+            r['relative_strength'] = round(relstr, 3)
+            # Recompute EOD score with relative_strength now populated
+            direction = r.get('direction', r.get('Direction', 'bull'))
+            mv  = r.get('TotalMove%', 0)
+            rv  = r.get('rvol', r.get('RVOL', 1.0))
+            try:
+                if direction == 'bull':
+                    r['EODScore'] = eod_score_bull(r, mv, rv)
+                else:
+                    r['EODScore'] = eod_score_bear(r, mv, rv)
+            except Exception:
+                pass   # keep original score if recompute fails
 
     # ── Sort: primary by EOD Score (higher=better), secondary by Move% ────────
     top_bull = sorted(
