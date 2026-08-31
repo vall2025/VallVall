@@ -88,13 +88,26 @@ CANDLE_MIN   = 15        # 15-min candles, anchored at 9:15 AM
 MIN_CANDLES  = 4         # minimum candles needed for any metric
 
 # ── MRTQ v2 qualifying thresholds (all conditions must pass) ─────────────────
-MIN_MOVE_PCT   = 0.5     # % move from prev close (Condition 1)
-MIN_GREEN_PCT  = 0.55    # min fraction of green/red candles (Condition 2)
-MIN_BODY_STR   = 0.35    # min avg body-to-range ratio of directional candles (Condition 2 upgrade)
-MIN_TER        = 0.45    # min Trend Efficiency Ratio (Condition 3 upgrade)
-MIN_RVOL       = 1.2     # min same-window RVOL (Condition 4 upgrade)
-MIN_MOMENTUM   = 0.20    # min momentum ratio — second half >= 20% of first half (Condition 5)
-MAX_SHADOW_RATIO = 1.20  # max opposing shadow / avg body ratio (Condition 6)
+# ── Qualification thresholds (evidence-based from reference-stock analysis) ──
+MIN_MOVE_PCT     = 0.5   # % move from prev close (Condition 1)
+MIN_GREEN_PCT    = 0.70  # 70%+ candles in direction — was 55%.
+                         # 5/8 green is too permissive; 6/8 green = much cleaner trend.
+                         # Most reference winners had 6-8/8 directional candles.
+MIN_BODY_STR     = 0.35  # min avg body-to-range ratio (Condition 2)
+MIN_TER          = 0.50  # min Trend Efficiency Ratio — raised from 0.45.
+MIN_RVOL         = 1.2   # min same-window RVOL (Condition 4)
+MAX_RVOL         = 8.0   # NEW: MAX RVOL gate — RVOL > 8× = exhaustion event.
+                         # MOTILALOFS 31.82× = news/gap flush, NOT a sustainable trend.
+                         # Stocks with extreme RVOL tend to reverse, not continue.
+MIN_MOMENTUM     = 0.20  # min momentum ratio (Condition 5)
+MAX_SHADOW_RATIO = 1.20  # max opposing shadow ratio (Condition 6)
+MAX_MOVE_ATR_RATIO = 0.90 # NEW: reject if move already consumed > 90% of typical ATR.
+                          # Overextended stocks have no room left to run.
+# NOTE: Organic Build Ratio is intentionally NOT a hard gate (tested at
+# threshold 0.30 and found it rejects a large share of totally normal,
+# healthy trending F&O stocks — gapping 1.5-3% at open and continuing to
+# grind is common on real trend days, not a red flag by itself). It
+# contributes to the score only, via W_ORGANIC.
 
 # ── EOD Score weights (must sum to 100) ──────────────────────────────────────
 # Weights redistributed to:
@@ -102,20 +115,28 @@ MAX_SHADOW_RATIO = 1.20  # max opposing shadow / avg body ratio (Condition 6)
 #   (b) incorporate three new components: PBQ, LRS, TMS
 #   (c) add Shadow Quality to the score (was gate-only before)
 # ── Score weights (sum = 100) ─────────────────────────────────────────────────
-# Calibrated from reference data: extreme RVOL and extreme Move% predict
-# REVERSAL, not continuation. Moderate RVOL + building momentum = continuation.
-W_MOVE    = 14   # ATR-adjusted move (not raw %) — overextension is now penalised
-W_TER     = 18   # trend efficiency — unchanged, key quality predictor
-W_RVOL    = 12   # continuation-optimised RVOL — extreme values now penalised
-W_BODY    =  8   # candle body strength
-W_MOMEN   = 10   # momentum state
-W_SHADOW  =  4   # shadow quality
+# v2.8 REBALANCE — goal shifted from "confirm the move that already happened"
+# to "predict the move that is about to keep happening". Raw Move%, Momentum
+# State and Price Accel are all backward-looking (they describe the candles
+# already printed); they're trimmed in favour of four NEW forward-leaning
+# signals (VWAP Trend, Late-Window Thrust, Staircase, Organic Build) that
+# specifically target continuation-vs-reversal, not "how strong was 9:15-11am".
+W_MOVE    =  8   # (was 14) ATR-adjusted move — trimmed: this IS "trend until now"
+W_TER     = 14   # (was 18) trend efficiency — still a strong quality predictor
+W_RVOL    = 10   # (was 12) continuation-optimised RVOL — extreme values penalised
+W_BODY    =  6   # (was  8) candle body strength
+W_MOMEN   =  6   # (was 10) momentum state — largely superseded by Late Thrust
+W_SHADOW  =  4   # shadow quality — unchanged
 W_PBQ     =  8   # pullback quality — shallow pullbacks = continuation
-W_LRS     =  4   # linear regression slope × R²
-W_TMS     =  4   # trend maturity (was 2 — increased; overextension matters more)
-W_PACCEL  = 10   # NEW: price acceleration in recent candles vs early candles
-W_RELSTR  =  8   # NEW: relative strength rank vs scan universe (post-scan)
-# Sum: 14+18+12+8+10+4+8+4+4+10+8 = 100
+W_LRS     =  4   # linear regression slope × R² — unchanged
+W_TMS     =  4   # trend maturity — unchanged
+W_PACCEL  =  8   # (was 10) price acceleration — overlaps w/ Late Thrust, trimmed
+W_RELSTR  =  6   # (was  8) relative strength rank vs scan universe (post-scan)
+W_VWAP    =  8   # NEW: VWAP Trend Confirmation — institutional trend behaviour
+W_THRUST  =  8   # NEW: Late-Window Thrust — recency-weighted acceleration
+W_STAIR   =  4   # NEW: Staircase Structure — literal higher-high/higher-low steps
+W_ORGANIC =  2   # NEW: Organic Build Ratio — gap-driven vs session-built move
+# Sum: 8+14+10+6+6+4+8+4+4+8+6+8+8+4+2 = 100
 
 # ── History / RVOL ───────────────────────────────────────────────────────────
 FETCH_LOOKBACK_DAYS = 15   # MUST be ≥15 for Alice Blue to return same-day intraday data.
@@ -918,6 +939,91 @@ def compute_mrtq_metrics(df15_today: pd.DataFrame) -> dict:
     lrs_bull  = min(max( slope_pct, 0.0) / REF_SLOPE, 1.0) * r2   # bull: rising
     lrs_bear  = min(max(-slope_pct, 0.0) / REF_SLOPE, 1.0) * r2   # bear: falling
 
+    # =========================================================================
+    # v2.8 NEW METRICS — target: "will it CONTINUE after cutoff", not
+    # "how strong was the move INTO cutoff". All four are computed from the
+    # same today-window candles used above; no new API calls needed.
+    # =========================================================================
+
+    # ── NEW: Staircase Structure Score ────────────────────────────────────────
+    # Literal "left-bottom to right-top, small pullbacks" check: the fraction
+    # of candles that make BOTH a higher high AND a higher low than the prior
+    # candle (bull), or both lower (bear). PBQ measures pullback DEPTH; this
+    # measures whether the structure is genuinely stair-stepping candle by
+    # candle, which is closer to what a manual chart reviewer sees at a glance.
+    def _staircase(bull: bool) -> float:
+        total = n - 1
+        if total <= 0:
+            return 0.5
+        steps = 0
+        for i in range(1, n):
+            if bull:
+                if highs[i] > highs[i-1] and lows[i] > lows[i-1]:
+                    steps += 1
+            else:
+                if highs[i] < highs[i-1] and lows[i] < lows[i-1]:
+                    steps += 1
+        return steps / total
+
+    staircase_bull = _staircase(True)
+    staircase_bear = _staircase(False)
+
+    # ── NEW: Late-Window Thrust ───────────────────────────────────────────────
+    # Momentum State (above) compares 1st half vs 2nd half — too coarse to
+    # tell "still thrusting right up to cutoff" from "thrusted mid-morning,
+    # now drifting". This compares the LAST 3 candles specifically (closest
+    # to the scan cutoff) against the session's average per-candle pace.
+    # ratio > 1 → still accelerating into cutoff (best continuation signal).
+    # ratio < 1 → fading into cutoff (already made its move, likely to stall).
+    def _thrust(bull: bool) -> float:
+        d = close_diffs if bull else -close_diffs
+        if len(d) < 4:
+            return 0.5
+        k        = min(3, len(d))
+        late_avg = float(np.mean(d[-k:]))
+        full_avg = float(np.mean(d))
+        avg_abs  = float(np.mean(np.abs(d)))
+        if avg_abs < floor:
+            return 0.5
+        # delta = how much stronger the late-window pace is than the whole
+        # session's pace, scaled by the stock's own candle-to-candle
+        # volatility (avg_abs). Scaling by volatility (not by full_avg
+        # itself) avoids a late/full RATIO blowing up when full_avg is near
+        # zero — which happens exactly for choppy/flat sessions, i.e. the
+        # sessions this metric most needs to correctly score as "not
+        # thrusting", not send to an unstable extreme.
+        delta = (late_avg - full_avg) / avg_abs
+        return _clamp(0.5 + delta * 0.5)   # delta=0→0.50, delta=+1→1.0, delta=-1→0.0
+
+    thrust_bull = _thrust(True)
+    thrust_bear = _thrust(False)
+
+    # ── NEW: VWAP Trend Confirmation ──────────────────────────────────────────
+    # "Institutional Trend Behaviour": genuine institutional trends hold on
+    # the correct side of the session VWAP and pull AWAY from it, rather than
+    # oscillating around it. Two parts: (a) % of candles closing on the
+    # favourable side of cumulative VWAP, (b) whether distance from VWAP is
+    # WIDENING (2nd half > 1st half) — widening = still attracting one-sided
+    # flow; converging = move running out of participants, mean-reversion risk.
+    _tp  = (highs + lows + closes) / 3.0
+    _vol = df15_today['Volume'].values.astype(float)
+    _vol = np.where(_vol > 0, _vol, 1.0)
+    _vwap = np.cumsum(_tp * _vol) / np.cumsum(_vol)
+
+    def _vwap_trend(bull: bool) -> float:
+        dist = (closes - _vwap) / np.maximum(_vwap, floor)
+        if not bull:
+            dist = -dist
+        side_pct = float(np.mean(dist > 0))
+        half = n // 2
+        if half == 0:
+            return _clamp(side_pct)
+        widening = float(np.mean(dist[half:])) > float(np.mean(dist[:half]))
+        return _clamp(0.65 * side_pct + 0.35 * (1.0 if widening else 0.3))
+
+    vwap_trend_bull = _vwap_trend(True)
+    vwap_trend_bear = _vwap_trend(False)
+
     return {
         'n_candles'       : n,
         # Condition 2
@@ -942,6 +1048,15 @@ def compute_mrtq_metrics(df15_today: pd.DataFrame) -> dict:
         # NEW: Linear Regression Slope × R² (0-1)
         'lrs_bull'        : round(lrs_bull, 3),
         'lrs_bear'        : round(lrs_bear, 3),
+        # v2.8 NEW: Staircase Structure (0-1)
+        'staircase_bull'  : round(staircase_bull, 3),
+        'staircase_bear'  : round(staircase_bear, 3),
+        # v2.8 NEW: Late-Window Thrust (0-1)
+        'thrust_bull'     : round(thrust_bull, 3),
+        'thrust_bear'     : round(thrust_bear, 3),
+        # v2.8 NEW: VWAP Trend Confirmation (0-1)
+        'vwap_trend_bull' : round(vwap_trend_bull, 3),
+        'vwap_trend_bear' : round(vwap_trend_bear, 3),
     }
 
 # =============================================================================
@@ -994,6 +1109,21 @@ def qualify_bull(m: dict, move_pct: float, rvol) -> tuple:
             f"RVOL {rvol:.2f}× < {MIN_RVOL}× (volume not confirming the move)"
         )
 
+    # 4b. MAX RVOL — exhaustion events disqualified
+    if rvol is not None and rvol > MAX_RVOL:
+        reasons.append(
+            f"RVOL {rvol:.2f}x > {MAX_RVOL}x: exhaustion event (gap/news flush). "
+            f"Stocks with extreme RVOL reverse — not continuation candidates."
+        )
+
+    # 4c. ATR overextension — move consumed too much of daily range
+    _atr = m.get('atr_pct', 0)
+    if _atr > 0 and abs(move_pct) / _atr > MAX_MOVE_ATR_RATIO:
+        reasons.append(
+            f"Move {move_pct:.1f}% = {abs(move_pct)/_atr:.1f}x daily ATR ({_atr:.1f}%). "
+            f"Overextended — no room left to run."
+        )
+
     # 5. Momentum
     if m['momentum_bull'] < MIN_MOMENTUM:
         reasons.append(
@@ -1041,6 +1171,21 @@ def qualify_bear(m: dict, move_pct: float, rvol) -> tuple:
     if rvol is not None and rvol < MIN_RVOL:
         reasons.append(
             f"RVOL {rvol:.2f}× < {MIN_RVOL}× (volume not confirming the move)"
+        )
+
+    # 4b. MAX RVOL — exhaustion events disqualified
+    if rvol is not None and rvol > MAX_RVOL:
+        reasons.append(
+            f"RVOL {rvol:.2f}x > {MAX_RVOL}x: exhaustion event. "
+            f"Extreme RVOL stocks bounce/reverse — not safe short candidates."
+        )
+
+    # 4c. ATR overextension gate
+    _atr = m.get('atr_pct', 0)
+    if _atr > 0 and abs(move_pct) / _atr > MAX_MOVE_ATR_RATIO:
+        reasons.append(
+            f"Move {move_pct:.1f}% = {abs(move_pct)/_atr:.1f}x daily ATR ({_atr:.1f}%). "
+            f"Overextended — high reversal risk."
         )
 
     if m['momentum_bear'] < MIN_MOMENTUM:
@@ -1150,6 +1295,10 @@ def eod_score_bull(m: dict, move_pct: float, rvol) -> float:
     tms_n    = _clamp(m.get('tms', 0.5))
     paccel_n = _clamp(m.get('price_accel_bull', 0.5))             # NEW
     relstr_n = _clamp(m.get('relative_strength', 0.5))            # NEW (post-scan)
+    vwap_n   = _clamp(m.get('vwap_trend_bull', 0.5))               # v2.8 NEW
+    thrust_n = _clamp(m.get('thrust_bull', 0.5))                   # v2.8 NEW
+    stair_n  = _clamp(m.get('staircase_bull', 0.5))                # v2.8 NEW
+    organ_n  = _clamp(m.get('organic_ratio', 0.5))                 # v2.8 NEW
 
     return round(_clamp(
         move_n   * W_MOVE   +
@@ -1162,7 +1311,11 @@ def eod_score_bull(m: dict, move_pct: float, rvol) -> float:
         lrs_n    * W_LRS    +
         tms_n    * W_TMS    +
         paccel_n * W_PACCEL +
-        relstr_n * W_RELSTR,
+        relstr_n * W_RELSTR +
+        vwap_n   * W_VWAP   +
+        thrust_n * W_THRUST +
+        stair_n  * W_STAIR  +
+        organ_n  * W_ORGANIC,
         0, 100
     ), 1)
 
@@ -1182,6 +1335,10 @@ def eod_score_bear(m: dict, move_pct: float, rvol) -> float:
     tms_n    = _clamp(m.get('tms', 0.5))
     paccel_n = _clamp(m.get('price_accel_bear', 0.5))
     relstr_n = _clamp(m.get('relative_strength', 0.5))
+    vwap_n   = _clamp(m.get('vwap_trend_bear', 0.5))                # v2.8 NEW
+    thrust_n = _clamp(m.get('thrust_bear', 0.5))                    # v2.8 NEW
+    stair_n  = _clamp(m.get('staircase_bear', 0.5))                 # v2.8 NEW
+    organ_n  = _clamp(m.get('organic_ratio', 0.5))                  # v2.8 NEW
 
     return round(_clamp(
         move_n   * W_MOVE   +
@@ -1194,7 +1351,11 @@ def eod_score_bear(m: dict, move_pct: float, rvol) -> float:
         lrs_n    * W_LRS    +
         tms_n    * W_TMS    +
         paccel_n * W_PACCEL +
-        relstr_n * W_RELSTR,
+        relstr_n * W_RELSTR +
+        vwap_n   * W_VWAP   +
+        thrust_n * W_THRUST +
+        stair_n  * W_STAIR  +
+        organ_n  * W_ORGANIC,
         0, 100
     ), 1)
 
@@ -1226,13 +1387,11 @@ def scan_one(sym, scan_date, cutoff_dt, trade, cache, cache_lock):
         # Try up to 5 previous trading days — uses the first one with data.
         # Handles stocks with data gaps (newly listed, circuit halt, etc.)
         prev_close = None
-        prev_close = None
         for _pd in prev_trading_days(scan_date, 5):
             _df_prev = df1[df1.index.date == _pd]
             if not _df_prev.empty:
                 _pc = float(_df_prev['Close'].iloc[-1])
                 if _pc > 0:
-                    prev_close = _pc
                     prev_close = _pc
                     break
         if prev_close is None:
@@ -1346,6 +1505,24 @@ def scan_one(sym, scan_date, cutoff_dt, trade, cache, cache_lock):
         m['price_accel_bear'] = round(_price_accel(closes_arr, 'bear'), 3)
         m['relative_strength'] = 0.5   # placeholder; updated post-scan by run_scan()
 
+        # ── 6d. ORGANIC BUILD RATIO (v2.8 NEW) ───────────────────────────────
+        # Splits today's total move into the OVERNIGHT GAP (prev close → 
+        # today's open) vs the ORGANIC INTRADAY MOVE (today's open → now).
+        # A move that already happened at the gap has "used up" its energy
+        # before the session even started — classic fade/reversal setup
+        # (e.g. gap-and-flatline). A move built organically DURING the
+        # session — accumulating candle by candle after a flat/small open —
+        # is far more likely to still be in progress at 11:00 AM.
+        # Signed math means this is direction-agnostic: works whether the
+        # stock is gapping up, gapping down, or opened flat.
+        _day_open = float(df15_today['Open'].iloc[0])
+        _gap      = _day_open - prev_close      # move that happened before 9:15
+        _organic  = curr_price - _day_open      # move that happened during the session
+        _total_mv = _gap + _organic
+        m['organic_ratio'] = (
+            round(_clamp(_organic / _total_mv), 3) if abs(_total_mv) > 1e-9 else 0.5
+        )
+
 
         # ── 7. QUALIFY ────────────────────────────────────────────────────────
         bull_ok, bull_reasons = qualify_bull(m, total_move_pct, rvol)
@@ -1361,14 +1538,18 @@ def scan_one(sym, scan_date, cutoff_dt, trade, cache, cache_lock):
         # ── 8. EOD CONTINUATION SCORE ─────────────────────────────────────────
         if qualified == 'BULL':
             score = eod_score_bull(m, total_move_pct, rvol)
+            score_direction = 'bull'
         elif qualified == 'BEAR':
             score = eod_score_bear(m, total_move_pct, rvol)
+            score_direction = 'bear'
         else:
             # Compute for diagnostics (show score even for non-qualifiers)
             if total_move_pct >= 0:
                 score = eod_score_bull(m, total_move_pct, rvol)
+                score_direction = 'bull'
             else:
                 score = eod_score_bear(m, total_move_pct, rvol)
+                score_direction = 'bear'
 
         # ── 9. ENTRY / SL / TARGET (last candle = entry candle at cutoff) ─────
         entry_cdl = df15_today.iloc[-1]
@@ -1452,6 +1633,22 @@ def scan_one(sym, scan_date, cutoff_dt, trade, cache, cache_lock):
             'BearReasons'    : bear_reasons,
             'BullScore'      : n_bull_cond,
             'BearScore'      : n_bear_cond,
+            # BUG FIX (v2.8.1): post-scan Relative Strength recompute in
+            # run_scan() was calling eod_score_bull/bear(r, ...) — passing
+            # THIS display dict (CamelCase keys like 'TER_Bull') instead of
+            # the raw metrics dict `m` (snake_case keys like 'ter_bull') that
+            # those functions actually read. Every recompute silently threw
+            # KeyError and was swallowed by a bare except, so Relative
+            # Strength was permanently stuck at its neutral 0.5 placeholder —
+            # it never actually contributed real ranking signal despite
+            # carrying 6 score points. It was ALSO going to always score
+            # using the BULL formula regardless of direction, because
+            # 'direction' was never set on this dict either (silent bug #2,
+            # would have surfaced once bug #1 was fixed). Both fixed by
+            # storing the raw metrics dict + the actual direction here, and
+            # updating run_scan() to use them.
+            'direction'      : score_direction,
+            '_metrics'       : m,
         }
 
         return result, f"OK ({total_move_pct:+.2f}%, {tag})"
@@ -1552,17 +1749,28 @@ def run_scan(stocks, scan_date, cutoff_h, cutoff_m, trade, status_cb=None):
             else:
                 relstr = max(0.0, 1.0 - (rank_pct - 0.80) / 0.20)
             r['relative_strength'] = round(relstr, 3)
-            # Recompute EOD score with relative_strength now populated
-            direction = r.get('direction', r.get('Direction', 'bull'))
+            # Recompute EOD score with relative_strength now populated.
+            # BUG FIX (v2.8.1): must recompute against the raw metrics dict
+            # (`m`, stored on r['_metrics']) — eod_score_bull/bear read
+            # snake_case keys like 'ter_bull' that only exist on `m`, not on
+            # the CamelCase display dict `r` itself. Previously this always
+            # KeyError'd and was silently swallowed, so relative_strength
+            # never actually changed the final score. Direction now also
+            # comes from r['direction'], set correctly at scan time, instead
+            # of defaulting to 'bull' for every stock (including bears).
+            m_raw = r.get('_metrics')
+            direction = r.get('direction', 'bull')
             mv  = r.get('TotalMove%', 0)
-            rv  = r.get('rvol', r.get('RVOL', 1.0))
-            try:
-                if direction == 'bull':
-                    r['EODScore'] = eod_score_bull(r, mv, rv)
-                else:
-                    r['EODScore'] = eod_score_bear(r, mv, rv)
-            except Exception:
-                pass   # keep original score if recompute fails
+            rv  = r.get('VolRatio', 1.0)
+            if m_raw is not None:
+                m_raw['relative_strength'] = round(relstr, 3)
+                try:
+                    if direction == 'bull':
+                        r['EODScore'] = eod_score_bull(m_raw, mv, rv)
+                    else:
+                        r['EODScore'] = eod_score_bear(m_raw, mv, rv)
+                except Exception:
+                    pass   # keep original score if recompute fails
 
     # ── Sort: primary by EOD Score (higher=better), secondary by Move% ────────
     top_bull = sorted(
