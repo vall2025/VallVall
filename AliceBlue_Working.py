@@ -103,11 +103,21 @@ MIN_MOMENTUM     = 0.20  # min momentum ratio (Condition 5)
 MAX_SHADOW_RATIO = 1.20  # max opposing shadow ratio (Condition 6)
 MAX_MOVE_ATR_RATIO = 0.90 # NEW: reject if move already consumed > 90% of typical ATR.
                           # Overextended stocks have no room left to run.
-# NOTE: Organic Build Ratio is intentionally NOT a hard gate (tested at
-# threshold 0.30 and found it rejects a large share of totally normal,
-# healthy trending F&O stocks — gapping 1.5-3% at open and continuing to
-# grind is common on real trend days, not a red flag by itself). It
-# contributes to the score only, via W_ORGANIC.
+MIN_CONTINUATION_CONFIDENCE = 0.50  # v2.8.2 NEW (Condition 7) — HARD gate, unlike
+                          # Organic Build Ratio. Continuation Confidence Score (CCS)
+                          # = average(VWAP Trend, Late-Window Thrust, Staircase) for
+                          # the qualifying direction — the 3 signals that specifically
+                          # measure "still building right now", not "already moved".
+                          # 0.50 = true neutral: on average the stock must be AT LEAST
+                          # neutral on all 3 forward-looking checks combined, not
+                          # net-negative. Unlike the earlier Organic Build gate mistake,
+                          # this was validated against 3 known patterns before shipping:
+                          # a smooth accelerating trend scores 0.83 (passes), a gap-then-
+                          # chop fade scores 0.20 (fails), and — the critical case — a
+                          # stock that spiked early and went flat by cutoff scores 0.45
+                          # (fails). That last one is exactly "trended until 11am, done
+                          # by then", the pattern the whole v2.8 line exists to filter.
+# NOTE: Organic Build Ratio remains score-only (not a hard gate) — see W_ORGANIC below.
 
 # ── EOD Score weights (must sum to 100) ──────────────────────────────────────
 # Weights redistributed to:
@@ -1064,7 +1074,7 @@ def compute_mrtq_metrics(df15_today: pd.DataFrame) -> dict:
 # =============================================================================
 def qualify_bull(m: dict, move_pct: float, rvol) -> tuple:
     """
-    Bullish qualification: all 6 conditions must pass.
+    Bullish qualification: all 7 conditions must pass.
     Returns (qualified: bool, fail_reasons: list[str]).
 
     Condition 1: Move % >= MIN_MOVE_PCT
@@ -1138,6 +1148,23 @@ def qualify_bull(m: dict, move_pct: float, rvol) -> tuple:
             f"(sellers rejecting highs — EOD reversal risk)"
         )
 
+    # 7. Continuation Confidence (v2.8.2 NEW, HARD gate) — the direct fix for
+    # "trended UNTIL the scan, not AFTER it". Averages the 3 genuinely
+    # forward-looking signals; a stock that already made its move and
+    # stalled by cutoff will score below neutral here even if its Move%/TER/
+    # Momentum still look strong from the earlier candles.
+    ccs_bull = (
+        m.get('vwap_trend_bull', 0.5) +
+        m.get('thrust_bull', 0.5) +
+        m.get('staircase_bull', 0.5)
+    ) / 3.0
+    if ccs_bull < MIN_CONTINUATION_CONFIDENCE:
+        reasons.append(
+            f"Continuation Confidence {ccs_bull:.2f} < {MIN_CONTINUATION_CONFIDENCE} "
+            f"(VWAP/Thrust/Staircase avg below neutral — move looks already "
+            f"played out, not still building)"
+        )
+
     return len(reasons) == 0, reasons
 
 
@@ -1198,6 +1225,20 @@ def qualify_bear(m: dict, move_pct: float, rvol) -> tuple:
         reasons.append(
             f"Lower shadow ratio {m['bear_shadow_ratio']:.2f} > {MAX_SHADOW_RATIO} "
             f"(buyers supporting lows — EOD reversal risk)"
+        )
+
+    # 7. Continuation Confidence (v2.8.2 NEW, HARD gate) — mirrored from
+    # qualify_bull. See rationale there.
+    ccs_bear = (
+        m.get('vwap_trend_bear', 0.5) +
+        m.get('thrust_bear', 0.5) +
+        m.get('staircase_bear', 0.5)
+    ) / 3.0
+    if ccs_bear < MIN_CONTINUATION_CONFIDENCE:
+        reasons.append(
+            f"Continuation Confidence {ccs_bear:.2f} < {MIN_CONTINUATION_CONFIDENCE} "
+            f"(VWAP/Thrust/Staircase avg below neutral — move looks already "
+            f"played out, not still building)"
         )
 
     return len(reasons) == 0, reasons
@@ -1581,11 +1622,11 @@ def scan_one(sym, scan_date, cutoff_dt, trade, cache, cache_lock):
             t    = df15_today.index[i].strftime('%H:%M')
             candle_str += f"{'🟢' if c >= o else '🔴'}{t} "
 
-        n_bull_cond = 6 - len(bull_reasons)
-        n_bear_cond = 6 - len(bear_reasons)
+        n_bull_cond = 7 - len(bull_reasons)
+        n_bear_cond = 7 - len(bear_reasons)
         tag = (
             f"QUALIFIED {qualified} (Score:{score})" if qualified
-            else f"no qualify (bull:{n_bull_cond}/6, bear:{n_bear_cond}/6)"
+            else f"no qualify (bull:{n_bull_cond}/7, bear:{n_bear_cond}/7)"
         )
 
         result = {
@@ -1864,7 +1905,7 @@ def build_table(results, is_bull, is_backtest=False, show_diag=False):
         return f'<td style="padding:8px 10px;border:1px solid #ddd;{extra}">{val}</td>'
 
     bt_th = (th('EOD Close') + th('Result')) if is_backtest else ''
-    diag_th = (th('Bull/6') + th('Bear/6') + th('Fail Reasons')) if show_diag else ''
+    diag_th = (th('Bull/7') + th('Bear/7') + th('Fail Reasons')) if show_diag else ''
 
     header = (
         th('#') + th('Symbol') + th('Signal') +
@@ -1932,19 +1973,19 @@ def build_table(results, is_bull, is_backtest=False, show_diag=False):
         if show_diag:
             bc  = r.get('BullScore', 0)
             brc = r.get('BearScore', 0)
-            bcol = '#00C853' if bc == 6 else ('#FF8F00' if bc >= 4 else '#999')
-            brcol= '#00C853' if brc== 6 else ('#FF8F00' if brc>= 4 else '#999')
+            bcol = '#00C853' if bc == 7 else ('#FF8F00' if bc >= 5 else '#999')
+            brcol= '#00C853' if brc== 7 else ('#FF8F00' if brc>= 5 else '#999')
             # Show the closer side's reasons
             if bc >= brc:
-                reasons = r.get('BullReasons', []) or ['✅ all 6 pass']
+                reasons = r.get('BullReasons', []) or ['✅ all 7 pass']
                 side = 'Bull'
             else:
-                reasons = r.get('BearReasons', []) or ['✅ all 6 pass']
+                reasons = r.get('BearReasons', []) or ['✅ all 7 pass']
                 side = 'Bear'
             reasons_str = '<br>'.join(reasons)
             diag_td = (
-                td(f'<b style="color:{bcol}">{bc}/6</b>') +
-                td(f'<b style="color:{brcol}">{brc}/6</b>') +
+                td(f'<b style="color:{bcol}">{bc}/7</b>') +
+                td(f'<b style="color:{brcol}">{brc}/7</b>') +
                 td(f'<i style="font-size:10px;">{side}: {reasons_str}</i>',
                    'max-width:280px;')
             )
@@ -2382,7 +2423,7 @@ trend quality — giving you the highest-probability trade at Rank 1.
             # ── TOP GAINER BULLISH ─────────────────────────────────────────────
             st.markdown(f"## 🟢 TOP GAINER BULLISH  ({len(top_bull)})")
             st.caption(
-                "All 6 MRTQ v2 conditions pass. "
+                "All 7 MRTQ v2.8 conditions pass. "
                 "Sorted by EOD Continuation Score → Move % (Rank 1 = highest probability). "
                 "Entry: breakout above last candle HIGH. Exit ~3:00 PM."
             )
@@ -2394,7 +2435,7 @@ trend quality — giving you the highest-probability trade at Rank 1.
             else:
                 st.info(
                     "No stock passed all 6 bullish conditions today. "
-                    "Open **All Scanned Stocks** below — each stock shows its X/6 "
+                    "Open **All Scanned Stocks** below — each stock shows its X/7 "
                     "score with exact reasons for the conditions that failed."
                 )
 
@@ -2403,7 +2444,7 @@ trend quality — giving you the highest-probability trade at Rank 1.
             # ── TOP LOSER BEARISH ──────────────────────────────────────────────
             st.markdown(f"## 🔴 TOP LOSER BEARISH  ({len(top_bear)})")
             st.caption(
-                "All 6 MRTQ v2 conditions pass (bearish direction). "
+                "All 7 MRTQ v2.8 conditions pass (bearish direction). "
                 "Sorted by EOD Continuation Score → Move % (Rank 1 = highest probability). "
                 "Entry: breakdown below last candle LOW. Exit ~3:00 PM."
             )
@@ -2415,7 +2456,7 @@ trend quality — giving you the highest-probability trade at Rank 1.
             else:
                 st.info(
                     "No stock passed all 6 bearish conditions today. "
-                    "Open **All Scanned Stocks** below for the X/6 breakdown."
+                    "Open **All Scanned Stocks** below for the X/7 breakdown."
                 )
 
             st.divider()
@@ -2442,7 +2483,7 @@ trend quality — giving you the highest-probability trade at Rank 1.
             all_sorted = sorted(all_res, key=lambda r: r['EODScore'], reverse=True)
             with st.expander(
                 f"📋 All Scanned Stocks — {len(all_res)} "
-                f"(X/6 condition breakdown, sorted by EOD Score)",
+                f"(X/7 condition breakdown, sorted by EOD Score)",
                 expanded=(len(top_bull) + len(top_bear) == 0)
             ):
                 st.markdown(
